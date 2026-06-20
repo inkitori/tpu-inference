@@ -240,6 +240,21 @@ def _rms_norm_jax(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarra
     return weight.astype(jnp.float32) * x
 
 
+# ---------------------------------------------------------------------------
+# Module-level MLA constants — single source of truth (both AttentionRef and
+# MLA read from here; editing one place propagates to both).
+# ---------------------------------------------------------------------------
+
+# q_a / kv_a layernorm epsilon — class default, NOT config.rms_norm_eps (1e-5).
+_MLA_NORM_EPS: float = 1e-6
+
+# Default softmax scale (mscale=1, no YaRN): sm_scale = qk_head_dim**-0.5.
+# qk_head_dim = qk_nope_head_dim + qk_rope_head_dim = 192 + 64 = 256.
+def _mla_sm_scale(qk_head_dim: int) -> float:
+    """Return qk_head_dim**-0.5 (default rope, mscale=1, no YaRN)."""
+    return float(qk_head_dim ** (-0.5))
+
+
 # Canonical MLA submodule param names (bare, relative to the layer prefix).
 _MLA_PARAM_NAMES = (
     "self_attn.q_a_proj.weight",
@@ -306,9 +321,10 @@ class GlmMoeDsaAttentionRef:
 
     # eps for q_a/kv_a layernorms is the GlmMoeDsaRMSNorm class default, NOT
     # config.rms_norm_eps (=1e-5).  Copying rms_norm_eps here is a silent bug.
-    NORM_EPS = 1e-6
+    # Default resolves to the single-sourced module constant _MLA_NORM_EPS = 1e-6.
+    NORM_EPS = _MLA_NORM_EPS
 
-    def __init__(self, config, *, norm_eps: float = NORM_EPS, rngs=None):
+    def __init__(self, config, *, norm_eps: float = _MLA_NORM_EPS, rngs=None):
         self.config = config
         # Explicit MLA dims — NEVER read config.head_dim (overwritten to 64 in
         # __post_init__); use the explicit fields.
@@ -321,8 +337,8 @@ class GlmMoeDsaAttentionRef:
         self.v_head_dim = config.v_head_dim               # 256
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 256
         # Default rope (mscale=1, no YaRN): sm_scale = qk_head_dim**-0.5.
-        self.sm_scale = self.qk_head_dim ** (-0.5)
-        # norm_eps injection knob (test affordance; default=1e-6 = NORM_EPS).
+        self.sm_scale = _mla_sm_scale(self.qk_head_dim)
+        # norm_eps injection knob (test affordance; default=1e-6 = _MLA_NORM_EPS).
         # Used by the eps-teeth test to prove the gate catches a wrong eps.
         # Production code never passes this — the default is the only safe value.
         self._norm_eps = norm_eps
@@ -371,10 +387,6 @@ class GlmMoeDsaAttentionRef:
         """
         self._w = {name: jnp.asarray(weights[name]).astype(jnp.float32)
                    for name in _MLA_PARAM_NAMES}
-
-    def export_weights(self) -> Dict[str, jnp.ndarray]:
-        """Return the loaded weight map (for ``assert_identical_weights``)."""
-        return dict(self._w)
 
     # -- forward -------------------------------------------------------------
     def __call__(self, hidden_states: jnp.ndarray,
@@ -495,14 +507,15 @@ class GlmMoeDsaMLA:
     ref is the absorption + kernel, nothing else.
     """
 
-    NORM_EPS = 1e-6   # q_a/kv_a layernorm eps (class default, NOT rms_norm_eps)
+    # q_a/kv_a layernorm eps — default resolves to module constant _MLA_NORM_EPS = 1e-6.
+    NORM_EPS = _MLA_NORM_EPS
 
     def __init__(self, config, *, mesh: Mesh,
                  dtype: jnp.dtype = jnp.bfloat16,
                  s_dtype: jnp.dtype = jnp.bfloat16,
                  p_same_dtype_as_v: bool = True,
                  two_step_flash_attention: bool = True,
-                 norm_eps: float = NORM_EPS,
+                 norm_eps: float = _MLA_NORM_EPS,
                  prefix: str = "self_attn"):
         self.config = config
         self.mesh = mesh
@@ -525,7 +538,7 @@ class GlmMoeDsaMLA:
         self.v_head_dim = config.v_head_dim              # 256
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 256
         # Default rope (mscale=1, no YaRN): sm_scale = qk_head_dim**-0.5.
-        self.sm_scale = self.qk_head_dim ** (-0.5)
+        self.sm_scale = _mla_sm_scale(self.qk_head_dim)
 
         # Sharding specs for the mla_attention shard_map (single-device safe;
         # MLP_TENSOR/ATTN_DATA collapse to replicated on make_glm_mesh(1)).
@@ -546,6 +559,9 @@ class GlmMoeDsaMLA:
         # set them via `bind_cache(...)` before invoking the layer in a stack.
         self._kv_cache = None
         self._md = None
+        # Initialized to None; set to the updated cache after each __call__.
+        # Reading before the first forward is safe (returns None).
+        self.last_kv_cache = None
 
     # -- weight management ---------------------------------------------------
     def load_weights(self, weights: Dict[str, jnp.ndarray]) -> None:
@@ -589,9 +605,6 @@ class GlmMoeDsaMLA:
         )
         self.k_up_proj.weight.value = k_ANH
         self.v_up_proj.weight.value = v_ANH
-
-    def export_weights(self) -> Dict[str, jnp.ndarray]:
-        return dict(self._w)
 
     # -- decoder-pluggable hooks ---------------------------------------------
     def bind_cache(self, kv_cache, md):
@@ -1183,7 +1196,10 @@ def greedy_generate_jax_ref(
     input_ids: jnp.ndarray,
     K: int,
 ) -> Tuple[jnp.ndarray, List[float]]:
-    """Greedy-generate ``K`` tokens using the fp32 jnp-ref forward path.
+    """Test/reference helper — not used by the production serving path.
+
+    Greedy-generate ``K`` tokens using the fp32 jnp-ref forward path
+    (Phase-1a decode-correctness reference).
 
     At each step the FULL forward is recomputed over a FIXED-SHAPE padded
     buffer (shape ``[1, T_prompt + K]``), which keeps the JAX computation
@@ -1395,7 +1411,10 @@ def convert_hf_weights(state_dict, hf_config):
 # ---------------------------------------------------------------------------
 
 def build_glm_vllm_config(hf_config, *, mesh=None):
-    """Build a duck-typed VllmConfig exposing ``model_config.hf_config``.
+    """Test/reference helper — not used by the production serving path.
+
+    Build a duck-typed VllmConfig exposing ``model_config.hf_config``
+    (test plumbing for a minimal VllmConfig; 18 test call sites use this).
 
     Only the fields the GLM scaffold reads are populated. ``hf_config`` is a
     real ``GlmMoeDsaConfig`` (e.g. from ``tiny_glm_moe_dsa_config()``).

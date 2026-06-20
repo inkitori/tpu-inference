@@ -87,6 +87,13 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
+    # NOTE: GlmMoeDsaForCausalLM is registered here for arch-string resolution
+    # but is NOT yet loadable via model_loader's serving path.  The serving
+    # contract calls model.load_weights(rng), but GLM's load_weights takes a
+    # Dict of pre-converted JAX weights.  Full VllmConfig / checkpoint loading
+    # is deferred to Phase 1b/1c; current loading is test-harness-driven via
+    # convert_hf_weights + load_weights(dict).  A serving attempt today would
+    # hit an ungraceful TypeError on the rng argument.
     _MODEL_REGISTRY["GlmMoeDsaForCausalLM"] = GlmMoeDsaForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
     _MODEL_REGISTRY["Llama4ForConditionalGeneration"] = LlamaGuard4ForCausalLM
