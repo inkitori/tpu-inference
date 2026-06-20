@@ -499,7 +499,11 @@ def mla_attention(
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        sm_scale: float | None = None) -> Tuple[jax.Array, jax.Array]:
+        sm_scale: float | None = None,
+        s_dtype: jnp.dtype = jnp.bfloat16,
+        p_same_dtype_as_v: bool = True,
+        two_step_flash_attention: bool = True
+) -> Tuple[jax.Array, jax.Array]:
     """
     Main shared interface for MLA attention.  Computes the sharded attention
     output and kv cache update.
@@ -522,6 +526,12 @@ def mla_attention(
         k_scale: scale to apply to k (if quantized)
         v_scale: scale to apply to v (if quantized)
         sm_scale: softmax scale
+        s_dtype: dtype for the Q.K dot product inside the kernel (bf16 shipped
+            default; fp32 for the kernel-algebra parity gate).
+        p_same_dtype_as_v: if True, cast the softmax probabilities to v's dtype
+            before P@V (shipped default; False for the fp32 algebra gate).
+        two_step_flash_attention: if True, compute the QK and AV stages in two
+            separate steps (kernel default; threaded through for completeness).
     """
     in_specs = (
         query_nth_sharding
@@ -576,6 +586,9 @@ def mla_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            s_dtype=s_dtype,
+            p_same_dtype_as_v=p_same_dtype_as_v,
+            two_step_flash_attention=two_step_flash_attention,
             transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE)
 
         return new_cache, out

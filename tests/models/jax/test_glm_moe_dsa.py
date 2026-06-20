@@ -2548,3 +2548,260 @@ def test_full_forward_eps_teeth_integration_wrong_eps_trips(mesh_1d):
         f"Wrong-eps integration margin too small: maxabs={delta:.3e} "
         f"(expected >2e-3; at mean(x²)~1e-3, eps=1e-5 vs 1e-6 must diverge "
         f"materially — if this fails, the small-input regime is not small enough)")
+
+
+# ===========================================================================
+# Phase 1a Task 7 — absorbed mla/v2 kernel path + precision knobs.
+#
+# The SHIPPED MLA path: GlmMoeDsaMLA absorbs q_nope through W_UK into latent
+# space (k_up_proj), runs attention in latent space via the real mla/v2 Mosaic
+# kernel (mla_ragged_paged_attention through mla_attention), then projects the
+# latent attention output back through W_UV (v_up_proj) + o_proj.
+#
+# The absorbed path computes the SAME math as the non-absorbed jnp-ref
+# (GlmMoeDsaAttentionRef) via the W_UK/W_UV absorption identity (attention in
+# latent space). The gates compare the absorbed kernel output against the
+# jnp-ref (NOT HF) — a single delta that isolates the absorption + kernel:
+#
+#   (a) fp32 kernel-algebra gate: s_dtype=fp32, p_same_dtype_as_v=False, q/ql_nope
+#       cast to fp32. Absorbed kernel vs jnp-ref(fp32). maxabs < 1e-3 IS the
+#       proof of absorption equivalence.
+#   (b) bf16 shipped gate: kernel with bf16 defaults vs jnp-ref(bf16) at the
+#       empirical bf16-attention floor (~0.1-0.2). Measured, fixed-bound band.
+#   (c) kv_b-absorption injected-error: corrupt the k_up/v_up split so the
+#       absorbed algebra is wrong; gate (a) FAILS while the Task-3 jnp-ref math
+#       gate (which does NOT absorb) still PASSES. The kernel-algebra gate is the
+#       UNIQUE catcher of absorption bugs (§H4 double duty).
+# ===========================================================================
+
+# Single-sequence prefill metadata for the absorbed-kernel gate (one seq, one
+# page big enough to hold T tokens; distribution = [0,0,1] = 1 prefill seq).
+_TASK7_T = 32   # < index_topk=64 so DSA is the dense identity (spec §A5)
+
+
+def _build_absorbed_kernel_inputs(seed=0, layer_idx=0, T=_TASK7_T):
+    """Shared fixture for the absorbed-kernel gates.
+
+    Reuses the Task-3 MLA parity fixture (oracle, hidden states, REAL cos/sin
+    tables, t2j-converted MLA weights), so the absorbed path and the jnp-ref
+    consume bit-identical pre-attention inputs and weights. The gate is then a
+    pure isolation of (absorption split + mla/v2 kernel) vs the jnp-ref math.
+    """
+    cfg, hidden_np, cos_np, sin_np, jax_w, _hf_out = _build_mla_parity_fixture(
+        seed=seed, layer_idx=layer_idx, T=T)
+    return cfg, hidden_np, cos_np, sin_np, jax_w
+
+
+def _make_glm_mla_kernel_layer(cfg, jax_w, mesh, *, dtype, s_dtype,
+                               p_same_dtype_as_v, two_step_flash_attention):
+    """Build a GlmMoeDsaMLA absorbed-kernel layer with HF MLA weights loaded.
+
+    `dtype` is the projection/activation dtype (fp32 for the algebra gate, bf16
+    for the shipped gate); the precision knobs are threaded straight to the
+    kernel. Weights are loaded from the bare-HF-name `jax_w` map (the same map
+    GlmMoeDsaAttentionRef consumes); the standalone no-quant kv_b split builds
+    k_up_proj / v_up_proj.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaMLA
+    layer = GlmMoeDsaMLA(
+        cfg,
+        mesh=mesh,
+        dtype=dtype,
+        s_dtype=s_dtype,
+        p_same_dtype_as_v=p_same_dtype_as_v,
+        two_step_flash_attention=two_step_flash_attention,
+    )
+    layer.load_weights(jax_w)
+    return layer
+
+
+def _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np, *, dtype):
+    """Run the absorbed mla/v2 kernel layer on a single-seq prefill.
+
+    Builds the single-sequence prefill KV cache + AttentionMetadata, runs the
+    layer forward, and returns the [T, hidden] attention-block output as fp32.
+    """
+    from tpu_inference.kernels.mla.v2.kernel import get_kv_cache_shape
+    from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+
+    B, T, hidden = hidden_np.shape
+    assert B == 1, "absorbed-kernel gate runs a single sequence"
+    kv_lora_rank = layer.kv_lora_rank
+    qk_rope = layer.qk_rope_head_dim
+
+    page_size = 64           # one page holds all T=32 tokens
+    num_pages = 1
+    cache_shape = get_kv_cache_shape(
+        num_pages, page_size, kv_lora_rank + qk_rope, dtype)
+    kv_cache = jnp.zeros(cache_shape, dtype=dtype)
+
+    md = AttentionMetadata(
+        input_positions=jnp.arange(T, dtype=jnp.int32),
+        block_tables=jnp.zeros((num_pages,), dtype=jnp.int32),
+        seq_lens=jnp.array([T], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, T], dtype=jnp.int32),
+        request_distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+    )
+
+    hidden = jnp.asarray(hidden_np[0], dtype=dtype)   # [T, hidden]
+    cos = jnp.asarray(cos_np, dtype=jnp.float32)
+    sin = jnp.asarray(sin_np, dtype=jnp.float32)
+    _new_cache, out_TD = layer.forward(hidden, cos, sin, kv_cache, md)
+    return np.asarray(out_TD).astype(np.float32)
+
+
+def _jnp_ref_output(cfg, jax_w, hidden_np, cos_np, sin_np, *, dtype):
+    """Run the non-absorbed Task-3 jnp-ref MLA forward and return [T, hidden].
+
+    `dtype` controls whether the ref runs in fp32 (algebra gate answer key) or
+    bf16 (shipped gate floor reference): for bf16 we cast the hidden input and
+    the loaded weights down to bf16 so both sides see the same low-precision
+    operands.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+    ref = GlmMoeDsaAttentionRef(cfg)
+    if dtype == jnp.bfloat16:
+        ref.load_weights({k: jnp.asarray(v).astype(jnp.bfloat16)
+                          for k, v in jax_w.items()})
+        hidden = jnp.asarray(hidden_np).astype(jnp.bfloat16)
+    else:
+        ref.load_weights(jax_w)
+        hidden = jnp.asarray(hidden_np)
+    out = ref(hidden, jnp.asarray(cos_np), jnp.asarray(sin_np))   # [B,T,hidden]
+    return np.asarray(out[0]).astype(np.float32)
+
+
+def test_absorbed_kernel_fp32_algebra_gate(mesh_1d):
+    """GATE (a): absorbed mla/v2 kernel (fp32) == jnp-ref(fp32), maxabs < 1e-3.
+
+    Proof of the W_UK/W_UV absorption equivalence. The kernel runs in fp32
+    (s_dtype=fp32, p_same_dtype_as_v=False, q/ql_nope fp32) so the only delta
+    vs the non-absorbed jnp-ref is the absorption algebra + the kernel's flash
+    accumulation — both fp32. A pass < 1e-3 proves the absorption is wired
+    correctly (split at qk_nope=192, einsums TNH,ANH->NTA / NTA,ANH->TNH,
+    sm_scale=256**-0.5). If it fails, the absorption is wrong — debug, don't
+    loosen.
+    """
+    cfg, hidden_np, cos_np, sin_np, jax_w = _build_absorbed_kernel_inputs()
+
+    layer = _make_glm_mla_kernel_layer(
+        cfg, jax_w, mesh_1d, dtype=jnp.float32,
+        s_dtype=jnp.float32, p_same_dtype_as_v=False,
+        two_step_flash_attention=True)
+    absorbed = _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np,
+                                    dtype=jnp.float32)
+
+    ref = _jnp_ref_output(cfg, jax_w, hidden_np, cos_np, sin_np,
+                          dtype=jnp.float32)
+
+    delta = maxabs(ref, absorbed)
+    print(f"\n[task7 gate-a fp32 algebra] absorbed-kernel vs jnp-ref "
+          f"maxabs = {delta:.6e}")
+    assert delta < 1e-3, (
+        f"absorbed mla/v2 kernel (fp32) vs jnp-ref(fp32) maxabs={delta:.3e} "
+        f">= 1e-3 — the W_UK/W_UV absorption is wired wrong (split order, "
+        f"einsum subscripts, pad, or scale). Debug; do NOT loosen.")
+
+
+def test_absorbed_kernel_bf16_shipped_gate(mesh_1d):
+    """GATE (b): absorbed mla/v2 kernel (bf16 shipped) ~ jnp-ref(bf16) at floor.
+
+    The SHIPPED configuration: bf16 projections + bf16 kernel defaults
+    (s_dtype=bf16, p_same_dtype_as_v=True, two_step_flash_attention=True). The
+    reference is the jnp-ref run in bf16 (same low-precision operands on both
+    sides). The residual is the empirical bf16-attention floor (~0.1-0.2): not a
+    correctness delta but the irreducible bf16 rounding of the score/softmax/AV
+    chain. The band is a FIXED constant (not fit-to-measurement): an upper bound
+    that a real absorption bug (orders of magnitude larger, per gate (c)) blows
+    through, plus a non-vacuous lower-margin note via the printed measurement.
+    """
+    cfg, hidden_np, cos_np, sin_np, jax_w = _build_absorbed_kernel_inputs()
+
+    layer = _make_glm_mla_kernel_layer(
+        cfg, jax_w, mesh_1d, dtype=jnp.bfloat16,
+        s_dtype=jnp.bfloat16, p_same_dtype_as_v=True,
+        two_step_flash_attention=True)
+    absorbed = _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np,
+                                    dtype=jnp.bfloat16)
+
+    ref = _jnp_ref_output(cfg, jax_w, hidden_np, cos_np, sin_np,
+                          dtype=jnp.bfloat16)
+
+    delta = maxabs(ref, absorbed)
+    # Reference scale: the bf16-attention floor is relative to the output
+    # magnitude; report it alongside the absolute delta so the band is sane.
+    ref_absmax = float(np.max(np.abs(ref)))
+    print(f"\n[task7 gate-b bf16 shipped] absorbed-kernel vs jnp-ref(bf16) "
+          f"maxabs = {delta:.6e}  (ref absmax = {ref_absmax:.4f})")
+    # FIXED upper bound: 0.5 absolute. The bf16 attention floor sits at
+    # ~0.1-0.2; a correct absorption stays well under 0.5, while a wired-wrong
+    # absorption (gate (c)) lands orders of magnitude above. NOT fit to the
+    # measurement.
+    assert delta < 0.5, (
+        f"absorbed bf16 kernel vs jnp-ref(bf16) maxabs={delta:.3e} >= 0.5 — "
+        f"above the bf16-attention floor band; the absorbed path diverges from "
+        f"the ref by more than bf16 rounding can explain.")
+
+
+def test_absorbed_kernel_kv_b_absorption_injected_error(mesh_1d):
+    """GATE (c): a corrupted k_up/v_up split trips gate (a) but NOT the jnp-ref.
+
+    THE double-duty test (§H4). The kv_b absorption lives ONLY in the kernel
+    path (k_up_proj / v_up_proj built from the kv_b split); the non-absorbed
+    jnp-ref re-derives k_nope / value per-forward from the unsplit kv_b_proj
+    weight. So an absorption bug is INVISIBLE to the jnp-ref math gate — only
+    the fp32 kernel-algebra gate (a), which compares the absorbed kernel against
+    the ref, can catch it.
+
+    We corrupt the absorbed split (scale k_up_proj by 1.5) AFTER load, leaving
+    the kv_b_proj weight the ref consumes untouched, then assert:
+      * the fp32 kernel-algebra gate (a) FAILS by a clear margin (the corrupted
+        absorption no longer reproduces the ref);
+      * the Task-3 jnp-ref math gate still PASSES (the ref never absorbed, so it
+        is unaffected) — proving the kernel-algebra gate is the UNIQUE catcher.
+    """
+    import torch
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+
+    cfg, hidden_np, cos_np, sin_np, jax_w = _build_absorbed_kernel_inputs()
+
+    # --- absorbed kernel with a CORRUPTED kv_b split (fp32 algebra config) ---
+    layer = _make_glm_mla_kernel_layer(
+        cfg, jax_w, mesh_1d, dtype=jnp.float32,
+        s_dtype=jnp.float32, p_same_dtype_as_v=False,
+        two_step_flash_attention=True)
+    # Corrupt ONLY the absorbed split (kernel-only); kv_b_proj (ref input) intact.
+    layer.k_up_proj.weight.value = layer.k_up_proj.weight.value * 1.5
+    absorbed = _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np,
+                                    dtype=jnp.float32)
+
+    ref_fp32 = _jnp_ref_output(cfg, jax_w, hidden_np, cos_np, sin_np,
+                               dtype=jnp.float32)
+    gate_a_delta = maxabs(ref_fp32, absorbed)
+    print(f"\n[task7 gate-c] corrupted-absorption fp32 algebra (gate a) "
+          f"maxabs = {gate_a_delta:.6e}")
+    # Gate (a) MUST fail by a clear margin (the absorption is broken).
+    assert gate_a_delta >= 1e-3, (
+        f"corrupted kv_b absorption did NOT trip the fp32 kernel-algebra gate: "
+        f"maxabs={gate_a_delta:.3e} < 1e-3 — gate (a) has no absorption teeth.")
+    assert gate_a_delta > 1e-2, (
+        f"corrupted-absorption margin too small: maxabs={gate_a_delta:.3e} "
+        f"(expected >1e-2; a 50% k_up scale must diverge decisively).")
+
+    # --- the Task-3 jnp-ref math gate is UNAFFECTED (it never absorbed) ------
+    # Rebuild the HF answer key and the ref from the SAME untouched jax_w used
+    # to seed the (separately) corrupted kernel split. The ref re-derives
+    # k_nope/value from the intact kv_b_proj, so the corruption cannot reach it.
+    _cfg2, _h2, _c2, _s2, _jw2, hf_out_np = _build_mla_parity_fixture(
+        seed=0, layer_idx=0, T=_TASK7_T)
+    ref = GlmMoeDsaAttentionRef(cfg)
+    ref.load_weights(jax_w)
+    ref_out = ref(jnp.asarray(hidden_np), jnp.asarray(cos_np),
+                  jnp.asarray(sin_np))
+    ref_gate_delta = maxabs(hf_out_np, ref_out)
+    print(f"[task7 gate-c] jnp-ref math gate (unaffected) "
+          f"maxabs = {ref_gate_delta:.6e}")
+    assert ref_gate_delta < 1e-3, (
+        f"the kv_b-absorption corruption leaked into the jnp-ref math gate: "
+        f"maxabs={ref_gate_delta:.3e} >= 1e-3 — the corruption was not "
+        f"absorption-only, so gate (c) does not prove the unique-catcher claim.")

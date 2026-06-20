@@ -453,6 +453,277 @@ class GlmMoeDsaAttentionRef:
 
 
 # ===========================================================================
+# Phase 1a Task 7 — absorbed mla/v2 kernel MLA (the SHIPPED attention path).
+#
+# GlmMoeDsaMLA computes the SAME math as the non-absorbed GlmMoeDsaAttentionRef
+# via the W_UK/W_UV absorption identity (attention in latent space), but routes
+# the score/AV matmuls through the real mla/v2 Mosaic kernel
+# (mla_ragged_paged_attention, via mla_attention). It shares the exact pre-
+# attention math (RMSNorm eps=1e-6, interleaved RoPE, NOPE-first) and weight
+# layout with the jnp-ref, so the fp32 kernel-algebra parity gate is a single
+# delta isolating (absorption split + kernel) vs the ref math.
+#
+# Absorption (latent space, lkv_dim = kv_lora_rank = 512):
+#   q_nope[T,N,192]  --k_up_proj("TNH,ANH->NTA")-->  q_NTA[N,T,512]
+#   kernel scores = q_NTA . kv_c[S,512]^T  +  q_pe[T,N,64] . k_pe[S,64]^T
+#   kernel out    = P . kv_c[S,512]        ->  out_NTA[N,T,512]
+#   out_NTA --v_up_proj("NTA,ANH->TNH")--> out_TNH[T,N,256] --reshape--> o_proj
+#
+# The standalone no-quant kv_b split reshapes kv_b_proj [A, N*(192+256)] ->
+# [A,N,448] -> jnp.split at qk_nope_head_dim=192 -> the two up-proj einsum
+# kernels. NO quantize/dequantize (MLAEinsum.load_weights asserts a quant
+# config; we deliberately do NOT reuse it).
+#
+# The kernel hard-asserts r_dim%128==0 / lkv_dim%128==0; lkv_dim=512 is already
+# aligned, and qk_rope_head_dim=64 is padded 64->128 INSIDE the kernel
+# (prepare_q_inputs / prepare_kv_inputs), so the caller passes the actual r_dim
+# arrays. sm_scale = qk_head_dim**-0.5 = 256**-0.5 (default rope, mscale=1).
+# ===========================================================================
+
+
+class GlmMoeDsaMLA:
+    """Absorbed MLA via the mla/v2 Mosaic kernel — the shipped GLM attention path.
+
+    Drop-in for ``GlmMoeDsaAttentionRef`` as the decoder's pluggable ``self_attn``
+    slot (``__call__(hidden, cos, sin)``), but additionally exposes
+    :meth:`forward` which threads the per-request KV cache + attention metadata
+    and the kernel precision knobs (``s_dtype``, ``p_same_dtype_as_v``,
+    ``two_step_flash_attention``) straight into ``mla_attention``.
+
+    Pre-attention math is byte-for-byte the jnp-ref's (shared ``_rms_norm_jax`` +
+    ``apply_rope_interleaved_jax`` + NOPE-first split) so any parity delta vs the
+    ref is the absorption + kernel, nothing else.
+    """
+
+    NORM_EPS = 1e-6   # q_a/kv_a layernorm eps (class default, NOT rms_norm_eps)
+
+    def __init__(self, config, *, mesh: Mesh,
+                 dtype: jnp.dtype = jnp.bfloat16,
+                 s_dtype: jnp.dtype = jnp.bfloat16,
+                 p_same_dtype_as_v: bool = True,
+                 two_step_flash_attention: bool = True,
+                 norm_eps: float = NORM_EPS,
+                 prefix: str = "self_attn"):
+        self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
+        self.prefix = prefix
+        # Kernel precision knobs (shipped defaults = bf16; the fp32 algebra gate
+        # overrides to s_dtype=fp32 / p_same_dtype_as_v=False).
+        self.s_dtype = s_dtype
+        self.p_same_dtype_as_v = p_same_dtype_as_v
+        self.two_step_flash_attention = two_step_flash_attention
+        self._norm_eps = norm_eps
+
+        # Explicit MLA dims — NEVER read config.head_dim (overwritten to 64).
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank          # 512 (lkv_dim, 128-aligned)
+        self.qk_nope_head_dim = config.qk_nope_head_dim  # 192
+        self.qk_rope_head_dim = config.qk_rope_head_dim  # 64 (r_dim, padded->128 by kernel)
+        self.v_head_dim = config.v_head_dim              # 256
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 256
+        # Default rope (mscale=1, no YaRN): sm_scale = qk_head_dim**-0.5.
+        self.sm_scale = self.qk_head_dim ** (-0.5)
+
+        # Sharding specs for the mla_attention shard_map (single-device safe;
+        # MLP_TENSOR/ATTN_DATA collapse to replicated on make_glm_mesh(1)).
+        from tpu_inference.layers.common.sharding import ShardingAxisName
+        from jax.sharding import PartitionSpec as P
+        self._query_nth = P(None, ShardingAxisName.MLP_TENSOR, None)
+        self._query_tnh = P(ShardingAxisName.ATTN_DATA, None, None)
+        self._keyvalue_skh = P(ShardingAxisName.ATTN_DATA, None)
+        self._attn_o_nth = P(None, ShardingAxisName.MLP_TENSOR, None)
+
+        # Linear weights (bare-HF-name -> fp32/dtype array), set by load_weights.
+        self._w: Dict[str, jnp.ndarray] = {}
+        # Absorbed up-projection einsum kernels (built in load_weights).
+        self.k_up_proj = None   # weight (A, N, qk_nope_head_dim)
+        self.v_up_proj = None   # weight (A, N, v_head_dim)
+
+        # Decoder-pluggable forward (`__call__(hidden, cos, sin)`) reads these;
+        # set them via `bind_cache(...)` before invoking the layer in a stack.
+        self._kv_cache = None
+        self._md = None
+
+    # -- weight management ---------------------------------------------------
+    def load_weights(self, weights: Dict[str, jnp.ndarray]) -> None:
+        """Load bare-HF-name, t2j-converted MLA weights and build the no-quant split.
+
+        Stores the linear/norm weights (cast to ``self.dtype``) and builds the
+        standalone, unquantized ``k_up_proj`` / ``v_up_proj`` einsum kernels from
+        ``kv_b_proj`` (reshape [A, N*448] -> [A,N,448] -> split at 192). NO
+        quantize/dequantize — ``MLAEinsum.load_weights`` is deliberately NOT
+        reused (it asserts a quant config).
+        """
+        from tpu_inference.layers.jax.linear import JaxEinsum
+
+        self._w = {name: jnp.asarray(weights[name]).astype(self.dtype)
+                   for name in _MLA_PARAM_NAMES}
+
+        A = self.kv_lora_rank
+        N = self.num_heads
+        qk_nope = self.qk_nope_head_dim
+        v_head = self.v_head_dim
+        kv_b = self._w["self_attn.kv_b_proj.weight"]    # [A, N*(qk_nope+v_head)]
+        if kv_b.shape != (A, N * (qk_nope + v_head)):
+            raise ValueError(
+                f"kv_b_proj has shape {kv_b.shape}, expected "
+                f"{(A, N * (qk_nope + v_head))}")
+        kv_b = kv_b.reshape(A, N, qk_nope + v_head)     # [A, N, 448]
+        k_ANH, v_ANH = jnp.split(kv_b, [qk_nope], axis=-1)  # [A,N,192], [A,N,256]
+
+        # Standalone NO-QUANT JaxEinsums; set kernels directly (no quant path).
+        self.k_up_proj = JaxEinsum(
+            einsum_str="TNH,ANH->NTA",
+            kernel_shape=(A, N, qk_nope),
+            rngs=nnx.Rngs(0),
+            prefix=self.prefix + ".k_up_proj",
+        )
+        self.v_up_proj = JaxEinsum(
+            einsum_str="NTA,ANH->TNH",
+            kernel_shape=(A, N, v_head),
+            rngs=nnx.Rngs(0),
+            prefix=self.prefix + ".v_up_proj",
+        )
+        self.k_up_proj.weight.value = k_ANH
+        self.v_up_proj.weight.value = v_ANH
+
+    def export_weights(self) -> Dict[str, jnp.ndarray]:
+        return dict(self._w)
+
+    # -- decoder-pluggable hooks ---------------------------------------------
+    def bind_cache(self, kv_cache, md):
+        """Bind the per-request KV cache + metadata for ``__call__`` (decoder use)."""
+        self._kv_cache = kv_cache
+        self._md = md
+
+    def __call__(self, hidden, cos, sin):
+        """Decoder slot: run the absorbed kernel using the bound cache/metadata.
+
+        Returns ONLY the [B, T, hidden] attention-block output (the decoder adds
+        the residual). The updated KV cache is exposed via :attr:`last_kv_cache`.
+        """
+        if self._kv_cache is None or self._md is None:
+            raise RuntimeError(
+                "GlmMoeDsaMLA.__call__ needs a bound KV cache + metadata; call "
+                "bind_cache(kv_cache, md) first (or use forward(...) directly).")
+        x = hidden
+        squeeze = False
+        if x.ndim == 3:
+            assert x.shape[0] == 1, "absorbed kernel path runs one sequence"
+            x = x[0]
+            squeeze = True
+        new_cache, out_TD = self.forward(x, cos, sin, self._kv_cache, self._md)
+        self.last_kv_cache = new_cache
+        self._kv_cache = new_cache
+        return out_TD[None, :, :] if squeeze else out_TD
+
+    # -- forward -------------------------------------------------------------
+    def forward(self, hidden_TD, cos, sin, kv_cache, md):
+        """Absorbed MLA forward through the mla/v2 kernel.
+
+        Args:
+            hidden_TD: [T, hidden] input (cast to self.dtype).
+            cos, sin:  RoPE tables [T, qk_rope_head_dim] (interleaved convention,
+                       same as the jnp-ref / apply_rope_interleaved_jax).
+            kv_cache:  paged MLA KV cache (see get_kv_cache_shape).
+            md:        AttentionMetadata (seq_lens, block_tables, query_start_loc,
+                       request_distribution, input_positions).
+
+        Returns:
+            (new_kv_cache, out_TD) where out_TD is [T, hidden].
+        """
+        from tpu_inference.layers.common.attention_interface import \
+            mla_attention
+
+        # fp32 algebra gate: genuine-fp32 matmuls on BOTH sides. On TPU the
+        # default fp32 matmul is the bf16x3 "high" pass (~5e-3 off true fp32),
+        # which alone blows the 1e-3 gate; "highest" forces the full-fp32 pass.
+        # (For bf16 this is a no-op on the bf16 operands.)
+        if self.dtype == jnp.float32:
+            ctx = jax.default_matmul_precision("highest")
+        else:
+            import contextlib
+            ctx = contextlib.nullcontext()
+        with ctx:
+            return self._forward(hidden_TD, cos, sin, kv_cache, md,
+                                 mla_attention)
+
+    def _forward(self, hidden_TD, cos, sin, kv_cache, md, mla_attention):
+        x = jnp.asarray(hidden_TD, self.dtype)
+        T = x.shape[0]
+        N = self.num_heads
+        w = self._w
+
+        # --- query path: q_a -> q_a_layernorm(eps=1e-6) -> q_b -> split ------
+        q_resid = x @ w["self_attn.q_a_proj.weight"]            # [T, q_lora]
+        q_resid = _rms_norm_jax(q_resid, w["self_attn.q_a_layernorm.weight"],
+                                self._norm_eps).astype(self.dtype)
+        q = q_resid @ w["self_attn.q_b_proj.weight"]            # [T, N*256]
+        q = q.reshape(T, N, self.qk_head_dim)                   # [T, N, 256]
+        q_nope_TNH = q[..., :self.qk_nope_head_dim]             # [T, N, 192]
+        q_rope_TNH = q[..., self.qk_nope_head_dim:]             # [T, N, 64]
+
+        # --- kv path: kv_a_proj_with_mqa -> split -> kv_a_layernorm(latent) --
+        compressed = x @ w["self_attn.kv_a_proj_with_mqa.weight"]  # [T, 512+64]
+        latent = compressed[..., :self.kv_lora_rank]              # [T, 512]
+        k_rope_SH = compressed[..., self.kv_lora_rank:]          # [T, 64]
+        latent = _rms_norm_jax(latent, w["self_attn.kv_a_layernorm.weight"],
+                               self._norm_eps).astype(self.dtype)  # kv_c (latent)
+
+        # --- interleaved RoPE on the rope slices (shared k_rope) -------------
+        # apply_rope_interleaved_jax expects [B, n_heads, T, head_dim].
+        q_rope_b = q_rope_TNH.transpose(1, 0, 2)[None]          # [1, N, T, 64]
+        k_rope_b = k_rope_SH[None, None]                        # [1, 1, T, 64]
+        q_rope_b, k_rope_b = apply_rope_interleaved_jax(
+            q_rope_b, k_rope_b, cos, sin)
+        # back to kernel layouts: q_rope [T, N, 64]; k_rope [T, 64] (shared head).
+        q_rope_TNH = q_rope_b[0].transpose(1, 0, 2)            # [T, N, 64]
+        k_rope_SH = k_rope_b[0, 0]                              # [T, 64]
+
+        # --- absorb q_nope into latent space: q_NTA = k_up_proj(q_nope) ------
+        # einsum "TNH,ANH->NTA": [T,N,192] x [A,N,192] -> [N,T,512] (head-major).
+        ql_nope_NTA = self.k_up_proj(q_nope_TNH)               # [N, T, 512]
+
+        # fp32 kernel-output path is gated on q dtype; cast q + the latent KV to
+        # self.dtype so all kernel operands agree (fp32 for the algebra gate).
+        ql_nope_NTA = ql_nope_NTA.astype(self.dtype)
+        q_rope_TNH = q_rope_TNH.astype(self.dtype)
+        kv_c_SA = latent.astype(self.dtype)                    # [T, 512]
+        k_rope_SH = k_rope_SH.astype(self.dtype)
+
+        # --- attention in latent space via the mla/v2 kernel ----------------
+        new_kv_cache, out_NTA = mla_attention(
+            ql_nope_NTA,
+            q_rope_TNH,
+            kv_c_SA,
+            k_rope_SH,
+            kv_cache,
+            md,
+            self.mesh,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            query_nth_sharding=self._query_nth,
+            query_tnh_sharding=self._query_tnh,
+            keyvalue_skh_sharding=self._keyvalue_skh,
+            attn_o_nth_sharding=self._attn_o_nth,
+            sm_scale=self.sm_scale,
+            s_dtype=self.s_dtype,
+            p_same_dtype_as_v=self.p_same_dtype_as_v,
+            two_step_flash_attention=self.two_step_flash_attention,
+        )
+
+        # --- project latent attention output back: v_up_proj then o_proj ----
+        # out_NTA is head-major [N, T, 512]; v_up_proj "NTA,ANH->TNH".
+        out_TNH = self.v_up_proj(out_NTA)                      # [T, N, 256]
+        out_TR = out_TNH.reshape(T, N * self.v_head_dim)       # [T, N*256]
+        out_TD = out_TR.astype(self.dtype) @ w["self_attn.o_proj.weight"]
+        return new_kv_cache, out_TD
+
+
+# ===========================================================================
 # Phase 1a Task 4 — GLM model scaffold (config-driven from hf_config).
 #
 # Mirrors the DeepSeek NNX structure (deepseek_v3.py) but reads ALL dims from
