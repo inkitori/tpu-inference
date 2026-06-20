@@ -1960,3 +1960,307 @@ def test_load_weights_accepts_indexer_keys_in_expected_skip_set(mesh_1d):
                 full = f"model.layers.{i}.{r}"
                 assert full not in loaded, (
                     f"indexer key {full!r} unexpectedly in loaded set")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 6 — Full dense-backbone forward MATH gate.
+#
+# The END-TO-END assembly gate.  Tasks 3/4/5 validated every submodule and the
+# converter in isolation; Task 6 wires the WHOLE model and gates its logits
+# against the full HF-eager oracle:
+#
+#   (1) fp32 MATH gate: full HF eager forward (fp32) vs full JAX jnp-ref forward
+#       (fp32, under default_matmul_precision("highest")) on tiny config seed=0,
+#       seq=32 < index_topk=64 (DSA is the dense identity, §A5).  maxabs < 1e-3.
+#       assert_identical_weights FIRST so the result reflects the two
+#       implementations, not a silent weight mismatch.  A failure here (with the
+#       submodules passing) points at the ASSEMBLY — residual structure,
+#       position_ids threading, norm placement, layer schedule, shared cos/sin.
+#   (2) bf16 shipped floor: run the JAX forward in bf16; MEASURE the maxabs
+#       deviation from the fp32 JAX result and the top-1 argmax agreement vs HF.
+#       Expected floor band ~5e-2…2e-1.  argmax >= 0.95 is a BACKSTOP, not the
+#       verdict (§H11a: random-weight tiny configs can have near-flat logits, so
+#       bf16 can flip argmax legitimately — the diagnosis distinguishes
+#       flat-logits from a real bug via the top-1/top-2 gap).
+#   (3) injected 1% error trips the fp32 gate: perturb one loaded weight by 1%
+#       in the JAX forward and assert the < 1e-3 gate FAILS by a clear margin.
+# ---------------------------------------------------------------------------
+
+
+def _build_full_forward_fixture(mesh, seed=0, T=TINY_SEQ_DENSE,
+                                input_seed=2024):
+    """Shared fixture for the Task-6 full-forward gates.
+
+    Builds the HF oracle (tiny config, seed, randomize_buffers=True so the
+    e_score_correction_bias selection path is non-trivial), runs its full eager
+    forward (fp32) to get the oracle logits, and converts its state_dict into a
+    GlmMoeDsaForCausalLM via the in-module converter + load_weights.
+
+    ``mesh`` is the AMBIENT mesh established by the ``mesh_1d`` test fixture
+    (already entered via ``jax.set_mesh`` in the fixture body) — we reuse it
+    rather than nesting a second mesh context.
+
+    Returns:
+        (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights, hf_model)
+    where ``ids_jax`` is [1, T] int32, ``positions_jax`` is [T] int32, and
+    ``hf_logits_np`` is the fp32 host [1, T, vocab] HF oracle logits.
+
+    T=32 < index_topk=64 keeps the indexer dense-equivalent (the indexer-less
+    jnp ref == the full HF model).
+    """
+    import torch
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config,
+                                                      convert_hf_weights)
+    cfg = tiny_glm_moe_dsa_config()
+    assert T < cfg.index_topk, f"T={T} must be < index_topk={cfg.index_topk}"
+
+    hf_model = build_hf_oracle(cfg=cfg, seed=seed, randomize_buffers=True)
+
+    rng = np.random.default_rng(input_seed)
+    ids_np = rng.integers(0, cfg.vocab_size, size=(1, T)).astype(np.int32)
+    with torch.no_grad():
+        hf_logits = hf_model(input_ids=torch.as_tensor(ids_np),
+                             use_cache=False).logits  # [1, T, vocab]
+    hf_logits_np = hf_logits.detach().float().cpu().numpy()
+
+    sd = hf_model.state_dict()
+    jax_weights, _skipped = convert_hf_weights(sd, cfg)
+
+    model = GlmMoeDsaForCausalLM(build_glm_vllm_config(cfg, mesh=mesh),
+                                 jax.random.PRNGKey(0), mesh)
+    model.load_weights(jax_weights)
+
+    ids_jax = jnp.asarray(ids_np)
+    positions_jax = jnp.arange(T, dtype=jnp.int32)
+    return (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+            hf_model)
+
+
+def _hf_ground_truth_jax_weights(hf_model, cfg):
+    """Independently rebuild the JAX weight map directly from the raw HF tensors.
+
+    This is the INDEPENDENT ground-truth side for assert_identical_weights: it
+    applies the documented HF->JAX transpose/split rules to the raw torch
+    state_dict WITHOUT going through the model's own converter, so the identity
+    assertion catches a converter (convert_hf_weights / load_weights) bug rather
+    than comparing the converter against itself.
+
+    Returns ``{mapped_jax_name: fp32 numpy array}`` for every NON-skipped key
+    (linears transposed, embed untransposed, lm_head transposed, fused
+    gate_up_proj split into gate/up halves; indexer + MTP keys dropped).
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import _is_expected_skip_key
+    indexer_types = list(cfg.indexer_types)
+    nhl = cfg.num_hidden_layers
+    F = cfg.moe_intermediate_size
+    out = {}
+    for name, tensor in hf_model.state_dict().items():
+        if _is_expected_skip_key(name, indexer_types, nhl):
+            continue
+        arr = tensor.detach().float().cpu().numpy()
+        if name.endswith("gate_up_proj"):
+            # fused [E, 2F, D] -> gate (first half) / up (second half)
+            out[name.replace("gate_up_proj", "gate_proj")] = arr[:, :F, :]
+            out[name.replace("gate_up_proj", "up_proj")] = arr[:, F:, :]
+        elif arr.ndim == 2 and "embed_tokens" not in name:
+            out[name] = arr.T
+        else:
+            out[name] = arr
+    return out
+
+
+def test_full_forward_fp32_math_gate(mesh_1d):
+    """FULL GLM forward (jnp-ref MLA) == HF eager forward, logits maxabs < 1e-3.
+
+    THE end-to-end assembly gate (spec §H / Task-6 brief): full HF eager forward
+    (fp32) vs full JAX jnp-ref forward (fp32, under
+    default_matmul_precision("highest")), tiny config seed=0, seq=32 <
+    index_topk=64 (DSA dense identity, §A5).
+
+    assert_identical_weights runs FIRST: the converter's mapped output
+    ``jax_weights`` (exactly what load_weights consumes) is compared against an
+    INDEPENDENT raw-HF->JAX ground-truth rebuild (raw torch tensors + the
+    documented transpose/split rules, NOT routed through the converter), so a
+    converter transpose/split/drop bug trips BEFORE the forward parity runs and
+    the parity result reflects the two model implementations, not a silent weight
+    mismatch. (That every mapped key is consumed into the right model param is
+    Task 5's golden test, not duplicated here.) The DSA indexer is the dense
+    identity at T<index_topk, so the indexer-less jnp ref must equal the full HF
+    model.
+    """
+    (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+     hf_model) = _build_full_forward_fixture(mesh_1d, seed=0, T=TINY_SEQ_DENSE)
+
+    # --- assert_identical_weights FIRST -------------------------------------
+    # atol=1e-9 absorbs only the fp64 checksum reduction-ORDER noise (the JAX
+    # `.T` and numpy `.T` paths accumulate `np.sum` in different orders; worst
+    # observed ~4.5e-13). The underlying weight VALUES are bit-identical
+    # (elementwise maxabs == 0.0), and 1e-9 is ~10 orders below any real weight
+    # bug — a 1% weight error shifts these checksums by O(10).
+    ground_truth = _hf_ground_truth_jax_weights(hf_model, cfg)
+    loaded_jax = {k: np.asarray(v) for k, v in jax_weights.items()}
+    assert_identical_weights(loaded_jax, ground_truth, atol=1e-9)
+    # Strengthen: the values themselves must be bit-identical, key-for-key.
+    assert set(loaded_jax) == set(ground_truth)
+    for k in ground_truth:
+        assert float(np.max(np.abs(
+            loaded_jax[k].astype(np.float64)
+            - ground_truth[k].astype(np.float64)))) == 0.0, (
+            f"converter weight {k!r} differs elementwise from raw-HF ground "
+            f"truth (transpose/split/drop bug)")
+
+    # --- DSA dense regime sanity: seq < index_topk so the indexer is identity.
+    assert ids_jax.shape[1] < cfg.index_topk, (
+        "full-forward fp32 gate must run in the DSA dense-equivalent regime")
+
+    # --- full JAX jnp-ref forward (fp32, highest matmul precision) -----------
+    with jax.default_matmul_precision("highest"):
+        _, hidden, _, _ = model([], ids_jax, positions_jax)
+        jax_logits = model.compute_logits(hidden)
+    jax_logits_np = np.asarray(jax_logits).astype(np.float32)
+
+    assert jax_logits_np.shape == hf_logits_np.shape, (
+        f"logits shape mismatch: jax={jax_logits_np.shape} "
+        f"hf={hf_logits_np.shape}")
+    assert np.isfinite(jax_logits_np).all(), "JAX logits are not finite"
+
+    delta = maxabs(hf_logits_np, jax_logits_np)
+    assert delta < 1e-3, (
+        f"full-forward fp32 logits maxabs={delta:.3e} >= 1e-3 (MATH gate). "
+        f"Submodules pass in isolation (Tasks 3/4) -> this is an ASSEMBLY bug "
+        f"(residual structure, position threading, norm placement, layer "
+        f"schedule, or shared cos/sin). Do NOT loosen the tolerance.")
+
+
+def test_full_forward_bf16_shipped_floor(mesh_1d):
+    """bf16 shipped floor: MEASURE the bf16 deviation + top-1 argmax agreement.
+
+    The "shipped" precision is TPU's DEFAULT matmul precision — bf16 passes for
+    the fp32 matmuls — i.e. the SAME forward WITHOUT
+    `default_matmul_precision("highest")` (the very setting the fp32 math gate
+    needs to stay < 1e-3; Task 3 learned that without it TPU fp32 matmul drops to
+    ~5e-3). So we run the full forward twice on identical fp32 weights —
+    once under "highest" (the reference) and once at the default precision (the
+    shipped path) — and MEASURE:
+      (a) the maxabs logit deviation shipped-vs-reference (the bf16 floor);
+      (b) the top-1 argmax agreement vs the HF oracle.
+
+    argmax >= 0.95 is a BACKSTOP, not the verdict (§H11a): with random-weight
+    tiny configs the next-token logits can be near-flat over the vocab, so bf16
+    noise may flip argmax legitimately WITHOUT a bug. We MEASURE and REPORT the
+    argmax agreement and the median top-1/top-2 logit gap; if argmax agreement
+    is low, the gap diagnoses flat-logits (expected) vs a real bf16 divergence.
+
+    NOTE on the band: the spec's nominal floor is ~5e-2…2e-1, calibrated for the
+    deeper/wider production stack. The tiny config is only 4 layers, so far less
+    bf16 error accumulates — the MEASURED deviation lands BELOW the nominal lower
+    bound. That is reported truthfully (it is the depth, not a bug); the
+    assertion band is set from the measured reality, not forced to the nominal.
+    """
+    (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+     hf_model) = _build_full_forward_fixture(mesh_1d, seed=0, T=TINY_SEQ_DENSE)
+
+    # --- fp32 reference logits (highest matmul precision) -------------------
+    with jax.default_matmul_precision("highest"):
+        _, hidden_ref, _, _ = model([], ids_jax, positions_jax)
+        jax_logits_ref = model.compute_logits(hidden_ref)
+    jax_logits_ref_np = np.asarray(jax_logits_ref).astype(np.float32)
+
+    # --- shipped-precision logits (TPU default = bf16 matmul passes) --------
+    # Identical weights, identical inputs; the ONLY difference is matmul
+    # precision. This is the genuine "run the JAX forward in bf16" measurement.
+    _, hidden_ship, _, _ = model([], ids_jax, positions_jax)
+    jax_logits_ship = model.compute_logits(hidden_ship)
+    jax_logits_ship_np = np.asarray(jax_logits_ship).astype(np.float32)
+
+    # --- (a) bf16/shipped deviation from the fp32 reference -----------------
+    bf16_dev = maxabs(jax_logits_ref_np, jax_logits_ship_np)
+    assert np.isfinite(jax_logits_ship_np).all(), "shipped logits not finite"
+    # Lower bound: bf16 MUST degrade vs the fp32-highest reference (else the
+    # "highest" knob did nothing and the measurement is meaningless). Upper
+    # bound: it must not blow up far past the nominal band.
+    assert bf16_dev > 1e-3, (
+        f"shipped(bf16-pass) deviation maxabs={bf16_dev:.3e} <= 1e-3 — bf16 "
+        f"did not measurably degrade vs fp32-highest (matmul-precision knob "
+        f"had no effect?); the floor measurement is not meaningful.")
+    assert bf16_dev < 5e-1, (
+        f"shipped(bf16-pass) deviation maxabs={bf16_dev:.3e} >= 5e-1 (blew "
+        f"well past the nominal floor band ~5e-2…2e-1 — suspect a real bf16 "
+        f"divergence bug, not precision noise).")
+
+    # --- (b) top-1 argmax agreement vs HF -----------------------------------
+    hf_top1 = np.argmax(hf_logits_np[0], axis=-1)            # [T]
+    ship_top1 = np.argmax(jax_logits_ship_np[0], axis=-1)    # [T]
+    ref_top1 = np.argmax(jax_logits_ref_np[0], axis=-1)
+    argmax_agree_ship_hf = float(np.mean(hf_top1 == ship_top1))
+    argmax_agree_ref_hf = float(np.mean(hf_top1 == ref_top1))
+
+    # --- flat-logits diagnosis: top-1/top-2 gap per position ----------------
+    sorted_ref = np.sort(jax_logits_ref_np[0], axis=-1)      # ascending
+    top1_top2_gap = sorted_ref[:, -1] - sorted_ref[:, -2]    # [T]
+    median_gap = float(np.median(top1_top2_gap))
+    min_gap = float(np.min(top1_top2_gap))
+
+    # REPORT (captured in pytest -s / the report). These prints ARE the
+    # deliverable measurement, per the brief ("MEASURE and REPORT").
+    print(f"\n[bf16 floor] shipped(bf16-pass)-vs-fp32 logits maxabs deviation "
+          f"= {bf16_dev:.4e}  (nominal spec band ~5e-2…2e-1; this tiny 4-layer "
+          f"config accumulates less, so it reads lower — depth, not a bug)")
+    print(f"[bf16 floor] top-1 argmax agreement shipped-vs-HF = "
+          f"{argmax_agree_ship_hf:.3f}")
+    print(f"[bf16 floor] top-1 argmax agreement fp32-vs-HF    = "
+          f"{argmax_agree_ref_hf:.3f}  (clean upper bound)")
+    print(f"[bf16 floor] top1/top2 fp32 logit gap: median={median_gap:.4e} "
+          f"min={min_gap:.4e}")
+
+    # The fp32 JAX path MUST agree with HF on argmax essentially perfectly (the
+    # < 1e-3 math gate guarantees it). This is the true correctness verdict; if
+    # it holds, any shipped argmax shortfall is precision noise, not a bug.
+    assert argmax_agree_ref_hf >= 0.99, (
+        f"fp32 JAX argmax agreement vs HF = {argmax_agree_ref_hf:.3f} < 0.99 — "
+        f"the fp32 path itself disagrees with HF on the top token; this is a "
+        f"real correctness bug, not bf16 noise (see the fp32 math gate).")
+
+    # argmax BACKSTOP: report; only ESCALATE to a failure if it is low AND the
+    # logits are NOT flat (i.e. a genuine bf16 divergence, not §H11a
+    # flat-random-logits). On this fixture argmax agreement is 1.0 (the logits
+    # are peaked: median gap ~0.10 >> bf16 dev ~0.01), so the backstop passes
+    # cleanly — but the guard below is the correct general policy.
+    if argmax_agree_ship_hf < 0.95:
+        peaked = median_gap > 10.0 * bf16_dev
+        assert not peaked, (
+            f"shipped argmax agreement {argmax_agree_ship_hf:.3f} < 0.95 on "
+            f"PEAKED logits (median top1/top2 gap {median_gap:.3e} >> bf16 dev "
+            f"{bf16_dev:.3e}) — this is a REAL bf16 divergence, not flat-logits "
+            f"noise.")
+        # Otherwise: flat-logits regime (§H11a). Documented, not a bug.
+
+
+def test_full_forward_injected_error_trips_fp32_gate(mesh_1d):
+    """A 1% perturbation of one loaded weight FAILS the fp32 < 1e-3 gate.
+
+    Proves the full-forward fp32 math gate has teeth end-to-end: the CLEAN
+    parity is far below 1e-3, so a real 1% bug in a single projection weight
+    (here the lm_head) must propagate to logits maxabs >> 1e-3. Perturbing the
+    lm_head scales the whole logit tensor by ~1%, a decisive, unambiguous
+    failure of the gate.
+    """
+    (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+     hf_model) = _build_full_forward_fixture(mesh_1d, seed=0, T=TINY_SEQ_DENSE)
+
+    # Inject a 1% error into the lm_head weight AFTER a clean load.
+    model.lm_head.weight.value = model.lm_head.weight.value * 1.01
+
+    with jax.default_matmul_precision("highest"):
+        _, hidden, _, _ = model([], ids_jax, positions_jax)
+        jax_logits = model.compute_logits(hidden)
+    jax_logits_np = np.asarray(jax_logits).astype(np.float32)
+
+    delta = maxabs(hf_logits_np, jax_logits_np)
+    assert delta >= 1e-3, (
+        f"injected 1% lm_head error did NOT trip the fp32 gate: "
+        f"maxabs={delta:.3e} < 1e-3 (gate has no teeth)")
+    # And it must trip by a clear margin, not knife-edge.
+    assert delta > 1e-2, (
+        f"injected-error margin too small: maxabs={delta:.3e} (expected >1e-2)")
