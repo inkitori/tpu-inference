@@ -853,15 +853,54 @@ class DeepseekV2Moe(JaxModule):
                  scoring_func,
                  rng,
                  prefix: str = "",
-                 enable_return_routed_experts: bool = False):
+                 enable_return_routed_experts: bool = False,
+                 # Optional kwargs — each defaults to the current module global or
+                 # router literal so that existing call-sites are byte-identical.
+                 num_local_experts: int = None,
+                 hidden_size: int = None,
+                 moe_intermediate_size: int = None,
+                 num_experts_per_tok: int = None,
+                 n_group: int = None,
+                 topk_groups: int = None,
+                 norm_topk_prob: bool = None,
+                 routed_scaling_factor: float = None,
+                 num_shared_experts: int = None,
+                 hidden_act: str = None,
+                 expert_axis_name=None):
+        import sys as _sys
+        _m = _sys.modules[__name__]
+
+        # Resolve each optional kwarg to the module global when not supplied.
+        if num_local_experts is None:
+            num_local_experts = _m.num_local_experts
+        if hidden_size is None:
+            hidden_size = _m.hidden_size
+        if moe_intermediate_size is None:
+            moe_intermediate_size = _m.moe_intermediate_size
+        if num_experts_per_tok is None:
+            num_experts_per_tok = _m.num_experts_per_token
+        if n_group is None:
+            n_group = _m.n_group
+        if topk_groups is None:
+            topk_groups = 4
+        if norm_topk_prob is None:
+            norm_topk_prob = True
+        if routed_scaling_factor is None:
+            routed_scaling_factor = _m.routed_scaling_factor
+        if num_shared_experts is None:
+            num_shared_experts = _m.num_shared_experts
+        if hidden_act is None:
+            hidden_act = _m.hidden_act
+        if expert_axis_name is None:
+            expert_axis_name = _m.expert_axis_name
 
         self.gate = DeepSeekV3Router(
             hidden_size=hidden_size,
             num_experts=num_local_experts,
-            num_experts_per_tok=num_experts_per_token,
+            num_experts_per_tok=num_experts_per_tok,
             n_groups=n_group,
-            topk_groups=4,
-            norm_topk_prob=True,
+            topk_groups=topk_groups,
+            norm_topk_prob=norm_topk_prob,
             rngs=rng,
             routed_scaling_factor=routed_scaling_factor,
             dtype=dtype,
@@ -909,7 +948,7 @@ class DeepseekV2Moe(JaxModule):
             num_expert_parallelism=num_expert_parallelism,
             hidden_size=hidden_size,
             intermediate_size_moe=moe_intermediate_size,
-            num_experts_per_tok=num_experts_per_token,
+            num_experts_per_tok=num_experts_per_tok,
             mesh=mesh,
             hidden_act=hidden_act,
             rngs=rng,
