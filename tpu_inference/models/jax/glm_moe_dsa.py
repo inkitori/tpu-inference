@@ -28,9 +28,11 @@ class), including near-1M positions with rope_theta=8_000_000.
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, Tuple
 
+import jax
 import numpy as np
+from jax import lax as jax_lax
 from jax import numpy as jnp
 
 
@@ -211,3 +213,201 @@ def apply_rope_rotate_half_jax(
     q_embed = q * cos + _rotate_half_jax(q) * sin
     k_embed = k * cos + _rotate_half_jax(k) * sin
     return q_embed, k_embed
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm (pure-jnp fp32) — matches GlmMoeDsaRMSNorm
+# ---------------------------------------------------------------------------
+
+def _rms_norm_jax(x: jnp.ndarray, weight: jnp.ndarray, eps: float) -> jnp.ndarray:
+    """RMSNorm: x / sqrt(mean(x²) + eps) * weight  (no mean-subtract, no bias).
+
+    Matches ``GlmMoeDsaRMSNorm.forward`` (modeling_glm_moe_dsa.py:57-62), which
+    upcasts to fp32, computes the variance as ``x.pow(2).mean(-1)``, scales by
+    ``rsqrt(var + eps)``, then multiplies by ``weight``.  All arithmetic here is
+    fp32.
+
+    Args:
+        x: input, shape ``[..., dim]`` (fp32).
+        weight: per-feature scale, shape ``[dim]`` (fp32).
+        eps: variance epsilon (1e-6 for q_a/kv_a layernorms; see class docstring).
+    """
+    x = x.astype(jnp.float32)
+    variance = jnp.mean(x * x, axis=-1, keepdims=True)
+    x = x * jax_lax.rsqrt(variance + eps)
+    return weight.astype(jnp.float32) * x
+
+
+# Canonical MLA submodule param names (bare, relative to the layer prefix).
+_MLA_PARAM_NAMES = (
+    "self_attn.q_a_proj.weight",
+    "self_attn.q_a_layernorm.weight",
+    "self_attn.q_b_proj.weight",
+    "self_attn.kv_a_proj_with_mqa.weight",
+    "self_attn.kv_a_layernorm.weight",
+    "self_attn.kv_b_proj.weight",
+    "self_attn.o_proj.weight",
+)
+
+
+# ---------------------------------------------------------------------------
+# Non-absorbed pure-jnp fp32 MLA reference  (the math answer key — Task 3)
+# ---------------------------------------------------------------------------
+
+class GlmMoeDsaAttentionRef:
+    """Non-absorbed, explicit-`kv_b`-split, all-fp32 MLA forward — the math oracle.
+
+    This is the pure-``jnp`` reference (NOT the shipped absorbed kernel path).
+    It reproduces ``GlmMoeDsaAttention.forward`` (modeling_glm_moe_dsa.py:409)
+    exactly in fp32, with the indexer omitted: at ``seq < index_topk`` the DSA
+    indexer selects all causal keys, so a single MLA block reduces to dense
+    causal MLA (spec §A5).  Later tasks consume this as the answer key:
+    Task 6 (full-model math oracle) and Task 7 (kernel-algebra gate compares the
+    absorbed kernel against THIS).
+
+    Forward (all fp32, NOPE-first concat):
+
+        q_resid = q_a_layernorm(q_a_proj(x))            # RMSNorm eps=1e-6
+        q       = q_b_proj(q_resid) -> [B,T,N,256]
+        q_nope, q_rope = split(q, [192, 64])
+
+        compressed = kv_a_proj_with_mqa(x)              # [B,T,512+64]
+        latent, k_rope = split(compressed, [512, 64])
+        kv      = kv_b_proj(kv_a_layernorm(latent))     # RMSNorm eps=1e-6 on latent ONLY
+                  -> [B,T,N,448]
+        k_nope, v = split(kv, [192, 256])
+
+        q_rope, k_rope = interleaved-RoPE(q_rope, k_rope)   # k_rope shared across heads
+        q = concat([q_nope, q_rope]); k = concat([k_nope, k_rope])   # NOPE-first
+        attn = softmax(q·kᵀ * sm_scale + causal_mask) ; sm_scale = 256**-0.5
+        out  = (attn·v) -> reshape -> o_proj
+
+    Critical correctness points (one wrong value = a silent gate failure):
+      * q_a/kv_a layernorm eps = **1e-6** (class default; NOT rms_norm_eps=1e-5).
+      * ``kv_a_layernorm`` applies to the 512-latent ONLY, not the rope part.
+      * NOPE-first concat for both q and k.
+      * ``sm_scale = qk_head_dim**-0.5 = 256**-0.5`` (default rope: mscale=1, no YaRN).
+      * NON-ABSORBED: explicit per-forward ``kv_b`` split ``[qk_nope|v_head_dim]``;
+        ``kv_b`` is NOT absorbed (absorption is Task 7).
+
+    Weights (loaded via :meth:`load_weights`, keyed by bare HF MLA names, already
+    run through ``t2j_weights`` so linear kernels are ``[in, out]``):
+        ``self_attn.q_a_proj.weight``           [hidden, q_lora_rank]
+        ``self_attn.q_a_layernorm.weight``      [q_lora_rank]
+        ``self_attn.q_b_proj.weight``           [q_lora_rank, N*qk_head_dim]
+        ``self_attn.kv_a_proj_with_mqa.weight`` [hidden, kv_lora_rank+qk_rope]
+        ``self_attn.kv_a_layernorm.weight``     [kv_lora_rank]
+        ``self_attn.kv_b_proj.weight``          [kv_lora_rank, N*(qk_nope+v)]
+        ``self_attn.o_proj.weight``             [N*v_head_dim, hidden]
+    ``attention_bias=False`` for GLM, so no projection has a bias term.
+    """
+
+    # eps for q_a/kv_a layernorms is the GlmMoeDsaRMSNorm class default, NOT
+    # config.rms_norm_eps (=1e-5).  Copying rms_norm_eps here is a silent bug.
+    NORM_EPS = 1e-6
+
+    def __init__(self, config):
+        self.config = config
+        # Explicit MLA dims — NEVER read config.head_dim (overwritten to 64 in
+        # __post_init__); use the explicit fields.
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim   # 192
+        self.qk_rope_head_dim = config.qk_rope_head_dim   # 64
+        self.v_head_dim = config.v_head_dim               # 256
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 256
+        # Default rope (mscale=1, no YaRN): sm_scale = qk_head_dim**-0.5.
+        self.sm_scale = self.qk_head_dim ** (-0.5)
+        self._w: Dict[str, jnp.ndarray] = {}
+
+    # -- weight management ---------------------------------------------------
+    def load_weights(self, weights: Dict[str, jnp.ndarray]) -> None:
+        """Load JAX MLA weights (bare HF names, ``t2j_weights``-converted, fp32).
+
+        Stores fp32 copies of every weight in :data:`_MLA_PARAM_NAMES`.  The
+        kernels are ``[in, out]`` (already transposed by ``t2j_weights``); norm
+        weights are 1-D.  Missing keys raise ``KeyError``.
+        """
+        self._w = {name: jnp.asarray(weights[name]).astype(jnp.float32)
+                   for name in _MLA_PARAM_NAMES}
+
+    def export_weights(self) -> Dict[str, jnp.ndarray]:
+        """Return the loaded weight map (for ``assert_identical_weights``)."""
+        return dict(self._w)
+
+    # -- forward -------------------------------------------------------------
+    def __call__(self, hidden_states: jnp.ndarray,
+                 cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
+        """Run the non-absorbed fp32 MLA forward (causal). Returns ``[B, T, hidden]``.
+
+        Args:
+            hidden_states: ``[B, T, hidden]`` (cast to fp32 internally).
+            cos, sin: RoPE tables for the rope slice, ``[T, qk_rope_head_dim]``
+                (or batched ``[B, T, qk_rope_head_dim]``).  Same convention as
+                :func:`apply_rope_interleaved_jax`.
+
+        Every matmul/einsum runs under ``default_matmul_precision("highest")``:
+            this is the *answer key*, so it must be true-fp32.  On TPU, JAX's
+            default fp32 matmul uses the bf16x3/"high" pass which diverges from
+            torch's genuine fp32 by ~5e-3 — enough to blow the 1e-3 math gate.
+            HIGHEST forces the full-fp32 pass (matches torch to ~1e-6).
+        """
+        with jax.default_matmul_precision("highest"):
+            return self._forward(hidden_states, cos, sin)
+
+    def _forward(self, hidden_states, cos, sin):
+        w = self._w
+        x = hidden_states.astype(jnp.float32)
+        B, T, _ = x.shape
+        N = self.num_heads
+
+        # --- query path: q_a -> q_a_layernorm(eps=1e-6) -> q_b -> split ------
+        q_resid = x @ w["self_attn.q_a_proj.weight"]            # [B,T,q_lora]
+        q_resid = _rms_norm_jax(q_resid, w["self_attn.q_a_layernorm.weight"],
+                                self.NORM_EPS)
+        q = q_resid @ w["self_attn.q_b_proj.weight"]            # [B,T,N*256]
+        q = q.reshape(B, T, N, self.qk_head_dim).transpose(0, 2, 1, 3)  # [B,N,T,256]
+        q_nope = q[..., : self.qk_nope_head_dim]                # [B,N,T,192]
+        q_rope = q[..., self.qk_nope_head_dim:]                 # [B,N,T,64]
+
+        # --- kv path: kv_a_proj_with_mqa -> split -> kv_a_layernorm(latent) --
+        compressed = x @ w["self_attn.kv_a_proj_with_mqa.weight"]  # [B,T,512+64]
+        latent = compressed[..., : self.kv_lora_rank]             # [B,T,512]
+        k_rope = compressed[..., self.kv_lora_rank:]              # [B,T,64]
+        # kv_a_layernorm (eps=1e-6) on the 512-latent ONLY, NOT the rope part.
+        latent = _rms_norm_jax(latent, w["self_attn.kv_a_layernorm.weight"],
+                               self.NORM_EPS)
+        kv = latent @ w["self_attn.kv_b_proj.weight"]            # [B,T,N*448]
+        kv = kv.reshape(B, T, N, self.qk_nope_head_dim + self.v_head_dim)
+        kv = kv.transpose(0, 2, 1, 3)                            # [B,N,T,448]
+        k_nope = kv[..., : self.qk_nope_head_dim]                # [B,N,T,192]
+        value = kv[..., self.qk_nope_head_dim:]                  # [B,N,T,256]
+
+        # --- RoPE on the rope slices (k_rope is shared across heads) ---------
+        # k_rope: [B,T,64] -> [B,1,T,64] (single shared head, like HF k_rot).
+        k_rope = k_rope.reshape(B, 1, T, self.qk_rope_head_dim)
+        q_rope, k_rope = apply_rope_interleaved_jax(q_rope, k_rope, cos, sin)
+        # broadcast the shared k_rope across all heads
+        k_rope = jnp.broadcast_to(k_rope, (B, N, T, self.qk_rope_head_dim))
+
+        # --- NOPE-first concat ---------------------------------------------
+        query_states = jnp.concatenate([q_nope, q_rope], axis=-1)  # [B,N,T,256]
+        key_states = jnp.concatenate([k_nope, k_rope], axis=-1)    # [B,N,T,256]
+
+        # --- scaled-dot-product attention, causal --------------------------
+        scores = jnp.einsum("bnqd,bnkd->bnqk", query_states, key_states)
+        scores = scores * self.sm_scale
+        # additive causal mask: -inf above the diagonal
+        neg = jnp.finfo(jnp.float32).min
+        causal = jnp.triu(jnp.full((T, T), neg, dtype=jnp.float32), k=1)
+        scores = scores + causal[None, None, :, :]
+        # softmax in fp32 (matches eager_attention_forward dtype=float32)
+        attn = jax.nn.softmax(scores, axis=-1)
+        out = jnp.einsum("bnqk,bnkd->bnqd", attn, value)          # [B,N,T,256]
+
+        # --- merge heads -> o_proj -----------------------------------------
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, N * self.v_head_dim)
+        out = out @ w["self_attn.o_proj.weight"]                  # [B,T,hidden]
+        return out

@@ -639,3 +639,165 @@ def test_rope_mla_interleaved_parity_near_1m():
         f"MLA interleaved q maxabs={delta_q:.2e} >= 1e-6 (near-1M positions)")
     assert delta_k < 1e-6, (
         f"MLA interleaved k maxabs={delta_k:.2e} >= 1e-6 (near-1M positions)")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 3 — Non-absorbed pure-jnp fp32 MLA reference (the math oracle).
+#
+# Gates GlmMoeDsaAttentionRef (explicit per-forward kv_b split, NO absorption,
+# all-fp32) against the HF eager oracle at the single-MLA-submodule level on a
+# random hidden-state input at seq=32 < index_topk=64, where the DSA indexer is
+# the dense identity (spec §A5) so HF self_attn == dense causal MLA.
+#
+# TDD: tests written BEFORE the GlmMoeDsaAttentionRef implementation so each is
+# witnessed failing first. Tolerance: 1e-3 (fp32 MATH gate, §H3/§H5).
+#
+# Isolation strategy: the SAME random hidden_states [B,T,hidden] is fed to (a)
+# one HF MLA attention block (self_attn.forward, indexer active but identity at
+# T<topk) and (b) GlmMoeDsaAttentionRef, with IDENTICAL weights (verified by
+# assert_identical_weights BEFORE comparing outputs). cos/sin are taken from the
+# REAL GlmMoeDsaRotaryEmbedding module and passed to BOTH sides, isolating the
+# attention algebra from RoPE-table construction (Task 2 already gates the table
+# bit-for-bit at 1e-6).
+# ---------------------------------------------------------------------------
+
+# MLA submodule weight names (unfused HF names, relative to the layer prefix).
+_MLA_WEIGHT_NAMES = (
+    "self_attn.q_a_proj.weight",
+    "self_attn.q_a_layernorm.weight",
+    "self_attn.q_b_proj.weight",
+    "self_attn.kv_a_proj_with_mqa.weight",
+    "self_attn.kv_a_layernorm.weight",
+    "self_attn.kv_b_proj.weight",
+    "self_attn.o_proj.weight",
+)
+
+
+def _extract_mla_jax_weights(model, layer_idx):
+    """Convert ONE layer's MLA submodule weights to JAX via t2j_weights.
+
+    Returns a dict keyed by the bare MLA names in _MLA_WEIGHT_NAMES.
+    """
+    prefix = f"model.layers.{layer_idx}."
+    sd = model.state_dict()
+    sub = {}
+    for bare in _MLA_WEIGHT_NAMES:
+        full = prefix + bare
+        sub[full] = sd[full]
+    conv = t2j_weights(sub)
+    return {bare: conv[prefix + bare] for bare in _MLA_WEIGHT_NAMES}
+
+
+def _hf_mla_block_output(model, layer_idx, hidden_states_t, cos_t, sin_t):
+    """Run ONE HF MLA attention block's forward in fp32 and return its output.
+
+    Builds an additive causal mask [B,1,T,T] and position_ids=arange(T). At
+    T<index_topk the indexer is active but selects all causal keys, so the
+    output equals dense causal MLA (spec §A5).
+    """
+    import torch
+    B, T, _ = hidden_states_t.shape
+    attn = model.model.layers[layer_idx].self_attn
+    # additive causal mask: 0 on/below diagonal, -inf above (fp32 min)
+    neg = torch.finfo(torch.float32).min
+    causal = torch.triu(torch.full((T, T), neg, dtype=torch.float32), diagonal=1)
+    attn_mask = causal[None, None, :, :].expand(B, 1, T, T).contiguous()
+    position_ids = torch.arange(T, dtype=torch.long)[None, :].expand(B, T)
+    with torch.no_grad():
+        out, _, _ = attn(
+            hidden_states=hidden_states_t,
+            position_embeddings=(cos_t, sin_t),
+            attention_mask=attn_mask,
+            past_key_values=None,
+            position_ids=position_ids,
+            prev_topk_indices=None,
+        )
+    return out  # [B, T, hidden]
+
+
+def _build_mla_parity_fixture(seed=0, layer_idx=0, T=32):
+    """Shared fixture: build oracle, random hidden states, cos/sin, weights.
+
+    Returns (cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np) all fp32 host
+    numpy / jnp arrays. layer_idx=0 is a "full" indexer layer; T=32<index_topk=64
+    keeps the indexer dense-equivalent.
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        GlmMoeDsaRotaryEmbedding
+
+    cfg = tiny_glm_moe_dsa_config()
+    assert T < cfg.index_topk, f"T={T} must be < index_topk={cfg.index_topk}"
+    model = build_hf_oracle(cfg=cfg, seed=seed)
+
+    B, hidden = 1, cfg.hidden_size
+    rng = np.random.default_rng(1234)
+    hidden_np = rng.standard_normal((B, T, hidden)).astype(np.float32)
+    hidden_t = torch.as_tensor(hidden_np, dtype=torch.float32)
+
+    # Real rotary module cos/sin (head_dim=qk_rope_head_dim=64), passed to BOTH sides.
+    rotary = GlmMoeDsaRotaryEmbedding(cfg)
+    pos = torch.arange(T, dtype=torch.long)[None, :]  # [1, T]
+    with torch.no_grad():
+        cos_t, sin_t = rotary.forward(hidden_t, pos)   # [1, T, 64]
+    cos_np = cos_t[0].numpy().astype(np.float32)        # [T, 64]
+    sin_np = sin_t[0].numpy().astype(np.float32)
+
+    hf_out = _hf_mla_block_output(model, layer_idx, hidden_t, cos_t, sin_t)
+    hf_out_np = hf_out.detach().numpy().astype(np.float32)
+
+    jax_w = _extract_mla_jax_weights(model, layer_idx)
+    return cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np
+
+
+def test_mla_ref_math_gate():
+    """GlmMoeDsaAttentionRef (non-absorbed fp32) == HF eager MLA block, maxabs<1e-3.
+
+    Single-MLA-submodule parity at seq=32 < index_topk=64 (DSA dense identity,
+    §A5). assert_identical_weights BEFORE comparing outputs so the result
+    reflects the two implementations, not a weight mismatch.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+
+    cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np = _build_mla_parity_fixture()
+
+    ref = GlmMoeDsaAttentionRef(cfg)
+    ref.load_weights(jax_w)
+
+    # Sanity: the loaded weights round-trip identically through the converter.
+    assert_identical_weights(jax_w, ref.export_weights())
+
+    out = ref(jnp.asarray(hidden_np),
+              jnp.asarray(cos_np), jnp.asarray(sin_np))
+    delta = maxabs(hf_out_np, out)
+    assert delta < 1e-3, (
+        f"MLA ref vs HF eager maxabs={delta:.3e} >= 1e-3 (fp32 MATH gate)")
+
+
+def test_mla_ref_injected_error_trips_gate():
+    """A 1% projection-weight perturbation must FAIL the 1e-3 gate by a clear margin.
+
+    Proves the fp32 math gate has teeth: the CLEAN parity is ~5e-7 (≈2000x below
+    the 1e-3 gate), so a real 1% bug must be caught.  Perturbing o_proj by 1%
+    yields maxabs ≈ 1.6e-2 — >15x the gate, a decisive failure.  (A 1% sm_scale
+    perturbation also trips it at ≈2.5e-3; the weight perturbation is the more
+    representative "real bug" and gives a clearer margin.)  §H3.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+
+    cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np = _build_mla_parity_fixture()
+
+    ref = GlmMoeDsaAttentionRef(cfg)
+    ref.load_weights(jax_w)
+    # Inject a 1% error into the output projection weight.
+    ref._w["self_attn.o_proj.weight"] = ref._w["self_attn.o_proj.weight"] * 1.01
+
+    out = ref(jnp.asarray(hidden_np),
+              jnp.asarray(cos_np), jnp.asarray(sin_np))
+    delta = maxabs(hf_out_np, out)
+    assert delta >= 1e-3, (
+        f"injected 1% o_proj error did NOT trip the gate: maxabs={delta:.3e} "
+        f"< 1e-3 (gate has no teeth)")
+    # And it must trip by a clear margin (well above the fp32 tolerance).
+    assert delta > 1e-2, (
+        f"injected error margin too small: maxabs={delta:.3e} (expected >1e-2)")
