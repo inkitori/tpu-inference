@@ -194,6 +194,100 @@ def assert_identical_weights(a, b, *, atol=0.0):
                 f"weight {k!r} {stat} differs: {x} vs {y} (atol={atol})")
 
 
+# --- medium-config constants (spec §B11) -------------------------------------
+MEDIUM_PAGE_SIZE = 128
+MEDIUM_SEQ_DENSE = 2040   # <= index_topk=2048: DSA == dense (spec §B11)
+MEDIUM_SEQ_SPARSE = 3000  # > index_topk=2048: true sparsity regime
+
+# Medium config: real per-layer dims, reduced depth/experts (spec §B11).
+# hidden=6144 matches production; CPU-eager-feasible with layers=6.
+_MEDIUM_CONFIG_KWARGS = dict(
+    hidden_size=6144,
+    num_hidden_layers=6,
+    num_attention_heads=64,
+    num_key_value_heads=64,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
+    qk_nope_head_dim=192,
+    v_head_dim=256,
+    index_head_dim=128,
+    index_n_heads=32,
+    index_topk=2048,
+    index_topk_freq=4,          # kwargs-only: drives indexer_types in __post_init__
+    index_skip_topk_offset=3,   # (not persisted as an attribute)
+    n_routed_experts=16,
+    num_experts_per_tok=8,
+    moe_intermediate_size=512,
+    vocab_size=2048,
+    rope_type="default",        # plain RoPE, no YaRN
+)
+
+
+def medium_glm_moe_dsa_config(**overrides):
+    """Build the §B11 medium `GlmMoeDsaConfig` (real per-layer dims, reduced depth)."""
+    from transformers import GlmMoeDsaConfig
+    kwargs = dict(_MEDIUM_CONFIG_KWARGS)
+    kwargs.update(overrides)
+    return GlmMoeDsaConfig(**kwargs)
+
+
+def build_hf_decode_oracle(input_ids, decode_ids, *, cfg=None, seed=0,
+                           randomize_buffers=False):
+    """Run HF-eager stepped decode; return per-step last-token logits.
+
+    Prefills `input_ids` (shape `[1, prompt_len]`), then steps through each
+    token in `decode_ids` (shape `[1, decode_steps]`) one at a time, threading
+    a growing `DynamicCache`. Returns a list of `[1, vocab_size]` fp32 tensors
+    (one per decode step).
+
+    The decode cursor flows via `position_ids` offset by
+    `past_key_values.get_seq_length()` — there is no `cache_position` kwarg in
+    this model. `DynamicCache` is constructed with `config=model.config` so it
+    auto-wires per-layer cache types (DSA layers get `DynamicIndexedLayer`).
+    """
+    import torch
+    from transformers.cache_utils import DynamicCache
+
+    if cfg is None:
+        cfg = tiny_glm_moe_dsa_config()
+    model = build_hf_oracle(cfg=cfg, seed=seed,
+                            randomize_buffers=randomize_buffers)
+    model.eval()
+
+    with torch.no_grad():
+        # --- prefill ---
+        cache = DynamicCache(config=model.config)
+        prompt_len = input_ids.shape[1]
+        position_ids = torch.arange(prompt_len, dtype=torch.long).unsqueeze(0)
+        out = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+        )
+        cache = out.past_key_values
+
+        # --- decode steps ---
+        per_step_logits = []
+        decode_steps = decode_ids.shape[1]
+        for step in range(decode_steps):
+            past_len = cache.get_seq_length()
+            tok = decode_ids[:, step : step + 1]           # (1, 1)
+            pos = torch.tensor([[past_len]], dtype=torch.long)
+            out = model(
+                input_ids=tok,
+                position_ids=pos,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            # last-token logits, fp32
+            last_logits = out.logits[:, -1, :].to(torch.float32)
+            per_step_logits.append(last_logits)
+            cache = out.past_key_values
+
+    return per_step_logits
+
+
 def make_glm_mesh(num_devices=None, axis_shapes=None, *, devices=None):
     """Build a `Mesh` over N devices on the canonical 6-axis layout.
 

@@ -28,8 +28,8 @@ from jax.sharding import PartitionSpec as P
 
 from tests.models.jax.glm_moe_dsa_harness import (
     TINY_SEQ_DENSE, TINY_SEQ_SPARSE, assert_identical_weights, build_hf_oracle,
-    make_glm_mesh, maxabs, tiny_glm_moe_dsa_config, t2j_weights,
-    weight_checksum)
+    build_hf_decode_oracle, make_glm_mesh, maxabs, medium_glm_moe_dsa_config,
+    tiny_glm_moe_dsa_config, t2j_weights, weight_checksum)
 
 
 # --- mesh fixtures (spec §6 Phase 0: 1-device + multi-device, no single- -----
@@ -255,3 +255,65 @@ def test_mesh_nd_sharded_roundtrip(mesh_nd):
     x = jax.device_put(ref, NamedSharding(mesh_nd, P("model")))
     y = np.asarray(x * 2.0)
     np.testing.assert_array_equal(y, ref * 2.0)
+
+
+# --- (ADD) incremental HF decode oracle gate (spec phase-0.md §ADD gate 1) ---
+def test_decode_oracle_matches_full_forward():
+    """Stepped decode last-token logits == fresh full-forward at each length.
+
+    This is the prefill-only hole gate (phase-0.md §ADD): stepping one token
+    at a time through a growing DynamicCache must yield the same last-token
+    logits (fp32) as a fresh full forward over the identical token prefix, at
+    multiple cumulative lengths. Tolerance fp32 <1e-4.
+    """
+    import torch
+    cfg = tiny_glm_moe_dsa_config()
+    torch.manual_seed(42)
+    # Prefill a short prompt then decode a few steps.
+    prompt_len = 3
+    decode_steps = 4
+    total = prompt_len + decode_steps
+    all_ids = torch.randint(0, cfg.vocab_size, (1, total), generator=torch.Generator().manual_seed(7))
+
+    # --- stepped decode ---
+    stepped_logits = build_hf_decode_oracle(
+        input_ids=all_ids[:, :prompt_len],
+        decode_ids=all_ids[:, prompt_len:],
+    )
+    # stepped_logits: list of (1, vocab) tensors, one per decode token
+
+    # --- fresh full forward at each cumulative length ---
+    model = build_hf_oracle(cfg=cfg, seed=0, randomize_buffers=False)
+    model.eval()
+    for step_idx in range(decode_steps):
+        cum_len = prompt_len + step_idx + 1
+        prefix_ids = all_ids[:, :cum_len]
+        with torch.no_grad():
+            full_logits = model(input_ids=prefix_ids, use_cache=False).logits
+        # last-token slice
+        full_last = full_logits[:, -1, :]       # (1, vocab)
+        step_last = stepped_logits[step_idx]    # (1, vocab)
+        delta = maxabs(step_last, full_last)
+        assert delta < 1e-4, (
+            f"decode step {step_idx} (cum_len={cum_len}): "
+            f"stepped vs full-forward maxabs={delta:.6e} >= 1e-4"
+        )
+
+
+# --- (ADD) medium config gate (spec phase-0.md §ADD gate 2) ------------------
+def test_medium_config_forward_is_finite():
+    """Medium config (§B11) instantiates and runs an HF-eager forward on CPU.
+
+    Keeps the sequence short (4 tokens) so the hidden=6144 forward stays fast.
+    Asserts finite logits of shape (1, seq, vocab_size).
+    """
+    import torch
+    cfg = medium_glm_moe_dsa_config()
+    model = build_hf_oracle(cfg=cfg, seed=0, randomize_buffers=False)
+    seq = 4
+    torch.manual_seed(99)
+    ids = torch.randint(0, cfg.vocab_size, (1, seq))
+    with torch.no_grad():
+        logits = model(input_ids=ids, use_cache=False).logits
+    assert tuple(logits.shape) == (1, seq, cfg.vocab_size)
+    assert torch.isfinite(logits).all(), "medium config forward produced non-finite logits"
