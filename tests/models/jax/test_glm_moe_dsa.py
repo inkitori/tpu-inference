@@ -1537,3 +1537,330 @@ def test_glm_registered_in_model_loader():
 
     arch = model_loader._get_model_architecture(_Cfg())
     assert arch is GlmMoeDsaForCausalLM
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 5 — Weight-mapping GOLDEN test + GLM converter.
+#
+# Proves the HF state_dict -> JAX param conversion is EXACT and TOTAL:
+#   (1) every JAX param is populated from HF (no leftover random-init):
+#       checksum every param at fresh-random-init, then after load assert
+#       EVERY checksum CHANGED.  Covers nnx Params AND the MLA-ref `_w` dicts
+#       (the attention weights live in `self_attn._w`, invisible to nnx.state).
+#   (2) every HF key is consumed OR explicitly skipped (no silent drops);
+#   (3) fused mlp.experts.gate_up_proj [E,2F,D] splits into gate(first half)/
+#       up(second half) — checked against a manual numpy split;
+#   (4) indexer names gate on indexer_types[i]: present on "full" layers
+#       (0,1,2) -> explicitly SKIPPED in Phase 1a (no indexer module yet);
+#       absent on the "shared" layer (3);
+#   (5) layers.78-style MTP layer dropped (injected synthetic key);
+#   (6) transpose rules: linears [out,in]->[in,out], embed NOT, lm_head .T.
+#
+# The converter under test is `convert_hf_weights(state_dict, hf_config)` ->
+# (jax_weights, skipped).  It MUST agree with the harness `t2j_weights` on the
+# names + values of every mapped (non-skipped) key (Tasks 3/6/7 rely on
+# t2j_weights), reusing the same `t2j` (utils.py:78).
+# ---------------------------------------------------------------------------
+
+# Exact relative indexer param names a "full" layer contributes (HF
+# GlmMoeDsaIndexer: wq_b/wk/weights_proj Linears + a k_norm LayerNorm that has
+# BOTH weight and bias).  Verified live against transformers 5.12.1.
+_INDEXER_REL_NAMES = (
+    "self_attn.indexer.wq_b.weight",
+    "self_attn.indexer.wk.weight",
+    "self_attn.indexer.weights_proj.weight",
+    "self_attn.indexer.k_norm.weight",
+    "self_attn.indexer.k_norm.bias",
+)
+
+
+def _all_param_checksums(model):
+    """Reorder-immune checksum of EVERY learnable array in the GLM scaffold.
+
+    Covers two storage classes:
+      * nnx ``Param`` leaves (embed, norms, dense FFN, MoE router/experts/shared,
+        lm_head) — enumerated via ``nnx.state(model, nnx.Param)``;
+      * the MLA reference attention weights, which ``GlmMoeDsaAttentionRef``
+        stores in a plain ``self._w`` dict (NOT nnx Params, so invisible to
+        ``nnx.state``) — enumerated per layer as ``layers.{i}.{bare}``.
+
+    Returns ``{logical_name: weight_checksum(array)}``.
+    """
+    from flax import nnx as _nnx
+    sums = {}
+    state = _nnx.state(model, _nnx.Param)
+    for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+        name = ".".join(str(getattr(k, "key", k)) for k in path)
+        sums[name] = weight_checksum(leaf)
+    # MLA attention weights live in each layer's self_attn._w dict.
+    for i, layer in enumerate(model.model.layers):
+        w = getattr(layer.self_attn, "_w", {})
+        for bare, arr in w.items():
+            sums[f"model.layers.{i}.{bare}"] = weight_checksum(arr)
+    return sums
+
+
+def _stamp_all_params_with_sentinel(model, value=7.0):
+    """Overwrite EVERY learnable array (nnx Params + MLA `_w`) with a sentinel.
+
+    Makes the no-leftover-init check robust: the GLM norm modules (and HF norm
+    weights) init to all-ones, so a norm that loads ones-from-ones leaves its
+    checksum UNCHANGED and would falsely read as "not populated".  By stamping
+    every array to a distinctive non-trivial value first, ANY array that
+    load_weights actually populates changes its checksum (HF weights != the
+    sentinel), while a genuinely-unloaded array stays at the sentinel.  This
+    turns "checksum changed" into a true witness of population.
+    """
+    from flax import nnx as _nnx
+    state = _nnx.state(model, _nnx.Param)
+    sentinel = jax.tree.map(
+        lambda a: jnp.full(jnp.shape(a), value, dtype=a.dtype), state)
+    _nnx.update(model, sentinel)
+    for layer in model.model.layers:
+        w = getattr(layer.self_attn, "_w", {})
+        for bare in list(w.keys()):
+            w[bare] = jnp.full(w[bare].shape, value, dtype=w[bare].dtype)
+
+
+def test_convert_hf_weights_agrees_with_t2j_on_mapped_keys():
+    """convert_hf_weights' mapped output == harness t2j_weights (names+values).
+
+    Tasks 3/6/7 consume the param map via t2j_weights; the in-module converter
+    must agree EXACTLY on every mapped (non-skipped) key — same names, same
+    values (it reuses the same `t2j`).  The only difference is that
+    convert_hf_weights ALSO returns the explicit `skipped` set (indexer + MTP),
+    which t2j_weights leaves in its output.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import convert_hf_weights
+    cfg = tiny_glm_moe_dsa_config()
+    model_hf = build_hf_oracle(cfg=cfg, seed=0, randomize_buffers=True)
+    sd = model_hf.state_dict()
+
+    jax_weights, skipped = convert_hf_weights(sd, cfg)
+    t2j_out = t2j_weights(sd)
+
+    # Every mapped key exists in t2j_weights with an identical value.
+    for k, v in jax_weights.items():
+        assert k in t2j_out, f"convert_hf_weights produced extra key {k!r}"
+        assert weight_checksum(v) == weight_checksum(t2j_out[k]), (
+            f"convert_hf_weights value for {k!r} differs from t2j_weights")
+    # The keys t2j_weights has but the converter does NOT map are exactly the
+    # skipped ones (indexer params — t2j_weights has no skip semantics).
+    only_in_t2j = set(t2j_out) - set(jax_weights)
+    assert only_in_t2j == set(skipped), (
+        f"mapped/skipped partition disagrees with t2j_weights: "
+        f"only_in_t2j={sorted(only_in_t2j)} skipped={sorted(skipped)}")
+
+
+def test_convert_hf_weights_indexer_gated_on_indexer_types():
+    """Indexer params: present on 'full' layers -> SKIPPED; absent on 'shared'.
+
+    Phase 1a has NO indexer module (Phase 2).  The converter must RECOGNIZE the
+    indexer params on full layers and route them to `skipped` (gated on
+    indexer_types[i] != 'shared') — NOT silently leave them unconsumed and NOT
+    KeyError.  The shared layer contributes no indexer params at all.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import convert_hf_weights
+    cfg = tiny_glm_moe_dsa_config()
+    assert list(cfg.indexer_types) == ["full", "full", "full", "shared"]
+    sd = build_hf_oracle(cfg=cfg, seed=0).state_dict()
+
+    jax_weights, skipped = convert_hf_weights(sd, cfg)
+
+    for i, kind in enumerate(cfg.indexer_types):
+        rel_present = [f"model.layers.{i}.{r}" for r in _INDEXER_REL_NAMES]
+        if kind == "shared":
+            # No indexer params on disk for a shared layer.
+            for full in rel_present:
+                assert full not in sd, (
+                    f"shared layer {i} unexpectedly has indexer key {full!r}")
+        else:  # full
+            for full in rel_present:
+                # present on disk...
+                assert full in sd, (
+                    f"full layer {i} missing expected indexer key {full!r}")
+                # ...recognized + explicitly skipped (gated)...
+                assert full in skipped, (
+                    f"indexer key {full!r} on full layer {i} was not "
+                    f"explicitly skipped (silent-drop / gating bug)")
+                # ...and NOT mapped into a JAX param (no indexer module in 1a).
+                assert full not in jax_weights, (
+                    f"indexer key {full!r} should not map to a JAX param in "
+                    f"Phase 1a")
+
+
+def test_convert_hf_weights_drops_mtp_layer():
+    """A layers.78-style MTP layer is genuinely DROPPED (proven with a real key).
+
+    Tiny config has 4 layers (0..3), so no natural MTP layer.  Inject synthetic
+    `model.layers.78.*` keys (mirroring the real checkpoint's MTP block, which
+    HF discards via _keys_to_ignore_on_load_unexpected=[r"model\\.layers\\.78.*"])
+    and assert the converter routes EVERY one of them to `skipped`, never to a
+    JAX param and never as a KeyError.
+    """
+    import torch
+    from tpu_inference.models.jax.glm_moe_dsa import convert_hf_weights
+    cfg = tiny_glm_moe_dsa_config()
+    sd = build_hf_oracle(cfg=cfg, seed=0).state_dict()
+    H, V = cfg.hidden_size, cfg.vocab_size
+
+    mtp_keys = {
+        "model.layers.78.input_layernorm.weight": torch.ones(H),
+        "model.layers.78.self_attn.q_a_proj.weight": torch.zeros(cfg.q_lora_rank, H),
+        "model.layers.78.mlp.gate_proj.weight": torch.zeros(cfg.intermediate_size, H),
+        "model.layers.78.embed_tokens.weight": torch.zeros(V, H),
+    }
+    sd_with_mtp = dict(sd)
+    sd_with_mtp.update(mtp_keys)
+
+    jax_weights, skipped = convert_hf_weights(sd_with_mtp, cfg)
+
+    for k in mtp_keys:
+        assert k in skipped, f"MTP key {k!r} was not dropped (skipped)"
+        # No mapped JAX param may carry a layers.78 name.
+        assert not any("layers.78" in jk for jk in jax_weights), (
+            "an MTP (layers.78) key leaked into the mapped JAX weights")
+
+
+def test_convert_hf_weights_gate_up_split_halves_exact():
+    """Fused gate_up_proj [E,2F,D] -> gate=first half, up=second half (exact).
+
+    HF GlmMoeDsaNaiveMoe does `gate, up = linear(x, gate_up[e]).chunk(2, -1)`,
+    i.e. along the doubled 2F axis the FIRST F rows are the gate projection and
+    the SECOND F rows are the up projection.  Compare the converter's split
+    against a manual numpy split of the raw fused tensor.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import convert_hf_weights
+    cfg = tiny_glm_moe_dsa_config()
+    sd = build_hf_oracle(cfg=cfg, seed=0).state_dict()
+    F = cfg.moe_intermediate_size
+    p = "model.layers.3.mlp.experts."        # layer 3 is the sparse layer
+
+    fused = sd[p + "gate_up_proj"].detach().float().cpu().numpy()  # [E,2F,D]
+    E, two_F, D = fused.shape
+    assert two_F == 2 * F
+    manual_gate = fused[:, :F, :]            # first half -> gate
+    manual_up = fused[:, F:, :]              # second half -> up
+
+    jax_weights, _ = convert_hf_weights(sd, cfg)
+    assert p + "gate_up_proj" not in jax_weights, "fused key must be split away"
+    got_gate = np.asarray(jax_weights[p + "gate_proj"])
+    got_up = np.asarray(jax_weights[p + "up_proj"])
+    np.testing.assert_array_equal(got_gate, manual_gate)
+    np.testing.assert_array_equal(got_up, manual_up)
+    # Order matters: gate must NOT equal the up (second) half.
+    assert not np.array_equal(got_gate, manual_up), (
+        "gate/up halves swapped — wrong chunk order")
+
+
+def test_convert_hf_weights_transpose_rules():
+    """Linears transposed [out,in]->[in,out]; embed NOT; lm_head transposed.
+
+    Checks the documented HF->JAX transpose contract on representative params
+    against the raw torch tensors.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import convert_hf_weights
+    cfg = tiny_glm_moe_dsa_config()
+    sd = build_hf_oracle(cfg=cfg, seed=0).state_dict()
+    jax_weights, _ = convert_hf_weights(sd, cfg)
+
+    def raw(name):
+        return sd[name].detach().float().cpu().numpy()
+
+    # Linear: q_a_proj [out,in] -> [in,out]
+    qa = "model.layers.0.self_attn.q_a_proj.weight"
+    np.testing.assert_array_equal(np.asarray(jax_weights[qa]), raw(qa).T)
+    assert np.asarray(jax_weights[qa]).shape == raw(qa).shape[::-1]
+
+    # embed_tokens: lookup table, NOT transposed.
+    emb = "model.embed_tokens.weight"
+    np.testing.assert_array_equal(np.asarray(jax_weights[emb]), raw(emb))
+    assert np.asarray(jax_weights[emb]).shape == raw(emb).shape
+
+    # lm_head: transposed (UNTIED — separate tensor from embed).
+    lm = "lm_head.weight"
+    np.testing.assert_array_equal(np.asarray(jax_weights[lm]), raw(lm).T)
+    assert not np.array_equal(np.asarray(jax_weights[lm]).shape,
+                              np.asarray(jax_weights[emb]).shape) or \
+        np.asarray(jax_weights[lm]).shape == raw(lm).shape[::-1]
+
+
+def test_glm_weight_map_golden(mesh_1d):
+    """GOLDEN: HF state_dict -> JAX conversion is EXACT and TOTAL.
+
+    The strongest check in Task 5:
+      * fresh-init checksum snapshot of EVERY param (nnx Params + MLA `_w`);
+      * convert (raw HF -> jax_weights + explicit `skipped`);
+      * load_weights consumes every mapped key with no KeyError;
+      * EVERY param's checksum CHANGED (no leftover random-init);
+      * EVERY HF key is either consumed (mapped+loaded) or explicitly skipped
+        (indexer params) — no silent drops;
+      * indexer params are in `skipped`, the MTP-skip mechanism is exercised.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config,
+                                                      convert_hf_weights)
+    cfg = tiny_glm_moe_dsa_config()
+    model_hf = build_hf_oracle(cfg=cfg, seed=0, randomize_buffers=True)
+    sd = model_hf.state_dict()
+
+    vllm_config = build_glm_vllm_config(cfg, mesh=mesh_1d)
+    model = GlmMoeDsaForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh_1d)
+
+    # (a) Stamp every learnable array with a distinctive sentinel, then
+    #     snapshot.  The GLM norms init to all-ones (so does HF), so a
+    #     ones-from-ones norm load would leave the checksum unchanged and read
+    #     as a false "not populated"; stamping first makes "checksum changed"
+    #     a true witness that the array was populated from the HF weights.
+    _stamp_all_params_with_sentinel(model, value=7.0)
+    before = _all_param_checksums(model)
+    assert len(before) > 0
+
+    # (b) Convert + load.
+    jax_weights, skipped = convert_hf_weights(sd, cfg)
+    loaded = model.load_weights(jax_weights)
+
+    # (c) NO leftover random-init: every param's checksum must have CHANGED.
+    after = _all_param_checksums(model)
+    assert set(before) == set(after), "param set changed across load"
+    unchanged = [n for n in before if before[n] == after[n]]
+    assert not unchanged, (
+        f"{len(unchanged)} param(s) left at random-init (not populated from "
+        f"HF): {sorted(unchanged)[:10]}")
+
+    # (d) Every mapped JAX key was actually loaded (no KeyError, no dropped map).
+    assert set(jax_weights) == set(loaded), (
+        f"mapped-but-not-loaded={sorted(set(jax_weights) - set(loaded))}, "
+        f"loaded-but-not-mapped={sorted(set(loaded) - set(jax_weights))}")
+
+    # (e) Every HF key is consumed OR explicitly skipped (no silent drops).
+    #     loaded keys are the converter's MAPPED names; the converter's skip set
+    #     names the HF (pre-conversion) keys it dropped.  Together they must
+    #     account for every HF key, modulo the gate_up_proj fusion (one HF
+    #     fused key -> two mapped keys).
+    hf_keys = set(sd)
+    # Reconstruct which HF keys are accounted for by the mapped names.
+    accounted = set(skipped)
+    for hk in hf_keys:
+        if hk in skipped:
+            continue
+        if hk.endswith("gate_up_proj"):
+            base = hk[: -len("gate_up_proj")]
+            assert (base + "gate_proj") in loaded and (base + "up_proj") in loaded
+            accounted.add(hk)
+        else:
+            assert hk in loaded, (
+                f"HF key {hk!r} was neither loaded nor explicitly skipped "
+                f"(silent drop)")
+            accounted.add(hk)
+    assert accounted == hf_keys, (
+        f"unaccounted HF keys: {sorted(hf_keys - accounted)}")
+
+    # (f) Indexer params are the skipped set (gated on indexer_types).
+    for i, kind in enumerate(cfg.indexer_types):
+        for r in _INDEXER_REL_NAMES:
+            full = f"model.layers.{i}.{r}"
+            if kind == "full":
+                assert full in skipped
+            else:
+                assert full not in skipped and full not in sd

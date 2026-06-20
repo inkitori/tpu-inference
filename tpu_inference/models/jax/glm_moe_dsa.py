@@ -837,6 +837,102 @@ class GlmMoeDsaForCausalLM(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
+# HF state_dict -> JAX weight converter (the Task-5 weight-map contract).
+#
+# Builds on the shared ``t2j`` (utils.py) — NEVER shadows it — and applies the
+# GLM transpose/split rules (identical to the harness ``t2j_weights`` on every
+# MAPPED key), PLUS the two explicit-skip rules Phase 1a needs:
+#   * indexer params (``self_attn.indexer.*``) are RECOGNIZED and routed to the
+#     ``skipped`` set, gated on ``indexer_types[i] != "shared"`` (present on
+#     "full" layers, absent on "shared"). Phase 1a has no indexer module yet
+#     (that is Phase 2), so they must NOT silently fall through unconsumed.
+#   * MTP / nextn layers (``model.layers.{i}`` with ``i >= num_hidden_layers``,
+#     e.g. the real checkpoint's ``layers.78``) are dropped to ``skipped``,
+#     mirroring HF ``_keys_to_ignore_on_load_unexpected=[r"model\.layers\.78.*"]``
+#     and the DeepSeek ``skip_substrs`` MTP pattern (deepseek_v3.py:1485-1495).
+# ---------------------------------------------------------------------------
+
+# Relative indexer param names a "full" layer contributes (GlmMoeDsaIndexer:
+# wq_b/wk/weights_proj Linears + a k_norm LayerNorm with weight AND bias).
+_INDEXER_SUBSTR = ".self_attn.indexer."
+
+
+def _layer_index_of(name: str) -> Optional[int]:
+    """Return the decoder layer index in ``model.layers.{i}.`` (or None)."""
+    parts = name.split(".")
+    for j in range(len(parts) - 1):
+        if parts[j] == "layers" and parts[j + 1].isdigit():
+            return int(parts[j + 1])
+    return None
+
+
+def convert_hf_weights(state_dict, hf_config):
+    """Convert an HF ``GlmMoeDsa`` ``state_dict`` to JAX weights + a skip set.
+
+    Returns ``(jax_weights, skipped)``:
+      * ``jax_weights`` — ``{name: jnp.ndarray}`` for every MAPPED param, with
+        the documented transpose/split rules: every 2-D linear transposed
+        ``[out,in]->[in,out]`` (``x @ kernel`` wants ``[in,out]``) EXCEPT
+        ``embed_tokens`` (a lookup table); ``lm_head`` transposes like any
+        linear (UNTIED); the fused experts ``gate_up_proj [E,2F,D]`` is split
+        along the doubled (``-2``) axis into ``gate_proj`` (first half ``[:F]``)
+        / ``up_proj`` (second half ``[F:]``); 1-D params (norms, biases) pass
+        through. These names + values are IDENTICAL to the harness
+        ``t2j_weights`` on every mapped key (both reuse the same ``t2j``).
+      * ``skipped`` — the set of HF (pre-conversion) keys EXPLICITLY dropped:
+        indexer params on "full" layers (gated on ``indexer_types[i]``) and any
+        MTP/nextn layer (``layers.{i}`` with ``i >= num_hidden_layers``).
+
+    Raises ``ValueError`` if an indexer param is found on a "shared" layer
+    (would mean the ``indexer_types`` gate disagrees with the checkpoint).
+    """
+    from tpu_inference.utils import t2j
+
+    indexer_types = list(getattr(hf_config, "indexer_types", []) or [])
+    num_hidden_layers = int(hf_config.num_hidden_layers)
+
+    jax_weights: Dict[str, jnp.ndarray] = {}
+    skipped: set = set()
+
+    for name, tensor in state_dict.items():
+        layer_idx = _layer_index_of(name)
+
+        # --- MTP / nextn drop: any decoder layer beyond the built stack -----
+        if layer_idx is not None and layer_idx >= num_hidden_layers:
+            skipped.add(name)
+            continue
+
+        # --- indexer drop, gated on indexer_types[i] (Phase 1a: no module) --
+        if _INDEXER_SUBSTR in name:
+            kind = (indexer_types[layer_idx]
+                    if layer_idx is not None and layer_idx < len(indexer_types)
+                    else None)
+            if kind == "shared":
+                # A "shared" layer must NOT carry indexer params on disk.
+                raise ValueError(
+                    f"indexer param {name!r} found on a 'shared' layer "
+                    f"(indexer_types[{layer_idx}]=='shared'); the indexer-type "
+                    f"gate disagrees with the checkpoint")
+            # present on a "full" layer -> explicitly skip (recognized).
+            skipped.add(name)
+            continue
+
+        # --- mapped param: transpose / fused-split rules (reuse t2j) ---------
+        arr = t2j(tensor)
+        if name.endswith("gate_up_proj") or name.endswith("gate_up_proj.weight"):
+            axis = -2 if arr.ndim == 3 else 0
+            gate, up = jnp.split(arr, 2, axis=axis)
+            jax_weights[name.replace("gate_up_proj", "gate_proj")] = gate
+            jax_weights[name.replace("gate_up_proj", "up_proj")] = up
+        elif arr.ndim == 2 and "embed_tokens" not in name:
+            jax_weights[name] = arr.T
+        else:
+            jax_weights[name] = arr
+
+    return jax_weights, skipped
+
+
+# ---------------------------------------------------------------------------
 # Test affordance: a minimal VllmConfig whose model_config.hf_config is a real
 # GlmMoeDsaConfig. Lets the scaffold tests build the model without standing up
 # the full vLLM engine. (Production load goes through the real VllmConfig.)
