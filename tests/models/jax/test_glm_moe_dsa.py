@@ -268,7 +268,6 @@ def test_decode_oracle_matches_full_forward():
     """
     import torch
     cfg = tiny_glm_moe_dsa_config()
-    torch.manual_seed(42)
     # Prefill a short prompt then decode a few steps.
     prompt_len = 3
     decode_steps = 4
@@ -276,14 +275,21 @@ def test_decode_oracle_matches_full_forward():
     all_ids = torch.randint(0, cfg.vocab_size, (1, total), generator=torch.Generator().manual_seed(7))
 
     # --- stepped decode ---
+    # Use randomize_buffers=True with seed=0 so e_score_correction_bias is
+    # non-zero and the bias-affected router path is genuinely exercised.
     stepped_logits = build_hf_decode_oracle(
         input_ids=all_ids[:, :prompt_len],
         decode_ids=all_ids[:, prompt_len:],
+        seed=0,
+        randomize_buffers=True,
     )
     # stepped_logits: list of (1, vocab) tensors, one per decode token
 
     # --- fresh full forward at each cumulative length ---
-    model = build_hf_oracle(cfg=cfg, seed=0, randomize_buffers=False)
+    # Must use IDENTICAL seed + randomize_buffers so weights AND buffers match
+    # the decode oracle; equivalence holds (delta ~1e-6) but now exercises the
+    # non-zero bias path (spec §H1 deterministic buffer init requirement).
+    model = build_hf_oracle(cfg=cfg, seed=0, randomize_buffers=True)
     model.eval()
     for step_idx in range(decode_steps):
         cum_len = prompt_len + step_idx + 1

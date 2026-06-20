@@ -203,3 +203,6 @@ shellcheck*/
 csrc/moe/marlin_moe_wna16/kernel_*
 
 !/support_matrices/**
+
+# Superpowers orchestrator scratch (briefs/reports/ledger — stay on disk, not tracked)
+.superpowers/
