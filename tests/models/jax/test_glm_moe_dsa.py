@@ -323,3 +323,244 @@ def test_medium_config_forward_is_finite():
         logits = model(input_ids=ids, use_cache=False).logits
     assert tuple(logits.shape) == (1, seq, cfg.vocab_size)
     assert torch.isfinite(logits).all(), "medium config forward produced non-finite logits"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 2 — RoPE bit-for-bit parity (MLA interleaved + indexer
+# rotate-half), including near-1M positions.
+#
+# TDD: tests written BEFORE the implementation in glm_moe_dsa.py so that
+# each test is witnessed failing first.
+#
+# Convention summary (matches HF oracle in modeling_glm_moe_dsa.py):
+#   • Both HF paths share the same GlmMoeDsaRotaryEmbedding.forward():
+#       inv_freq = 1 / (theta ** (arange(0,d,2,int64→fp32) / d))   # d=head_dim=64
+#       freqs = (inv_freq[None,:,None] @ position_ids[:,None,:]).T  # [B,T,d/2]
+#       emb = cat(freqs, freqs, -1)                                  # [B,T,d]
+#       cos/sin = emb.cos/sin() * attention_scaling  (=1 for default)
+#   • apply_rotary_pos_emb_interleave: cos/sin sliced to first half [B,T,d/2]
+#       q1,q2 = q[...,0::2], q[...,1::2]
+#       q_embed = cat([q1*cos - q2*sin, q2*cos + q1*sin], -1)
+#   • apply_rotary_pos_emb (rotate-half): cos/sin kept full-width [B,T,d]
+#       rotate_half(x) = cat([-x[...,d//2:], x[...,:d//2]], -1)
+#       q_embed = q*cos + rotate_half(q)*sin
+#
+# The JAX implementations (in tpu_inference/models/jax/glm_moe_dsa.py):
+#   • build_rope_cos_sin_np(positions, rope_theta, head_dim) -> (cos, sin) numpy
+#       cos/sin shape: [T, head_dim]  (full-width, cat(freqs,freqs))
+#       Built on the HOST with numpy fp32 OUTSIDE any device mesh — V4 lesson.
+#   • apply_rope_interleaved_jax(q, k, cos, sin) -> (q_out, k_out)
+#       Input cos/sin: first-half slice [T, head_dim//2] or full [T, head_dim].
+#       Matches HF apply_rotary_pos_emb_interleave exactly.
+#   • apply_rope_rotate_half_jax(q, k, cos, sin) -> (q_out, k_out)
+#       Input cos/sin: full [T, head_dim].  Matches HF apply_rotary_pos_emb.
+# ---------------------------------------------------------------------------
+
+def _hf_cos_sin(positions_np, rope_theta, head_dim):
+    """Reproduce GlmMoeDsaRotaryEmbedding.forward() in numpy fp32 on host.
+
+    Returns (cos, sin) each shape [B=1, T, head_dim] as numpy arrays,
+    mirroring HF torch output (fp32, no dtype cast at the end).
+    """
+    import numpy as np
+    # HF: arange(0, dim, 2, int64) → float32 / dim
+    k = np.arange(0, head_dim, 2, dtype=np.int64).astype(np.float32)
+    inv_freq = 1.0 / (rope_theta ** (k / head_dim))  # [d/2]
+    # HF: inv_freq_expanded [B,d/2,1] @ position_ids_expanded [B,1,T] → [B,d/2,T]
+    # then .transpose(1,2) → [B,T,d/2]
+    B = 1
+    T = len(positions_np)
+    inv_freq_exp = inv_freq[None, :, None]                       # [1, d/2, 1]
+    pos_exp = positions_np[None, None, :].astype(np.float32)     # [1, 1, T]
+    freqs = (inv_freq_exp * pos_exp).transpose(0, 2, 1)          # [B, T, d/2]
+    emb = np.concatenate([freqs, freqs], axis=-1)                # [B, T, d]
+    cos = np.cos(emb)   # attention_scaling=1.0 for default rope
+    sin = np.sin(emb)
+    return cos, sin   # [1, T, head_dim]
+
+
+def _hf_oracle_rope_interleave(q_np, k_np, cos_np, sin_np):
+    """Apply HF apply_rotary_pos_emb_interleave using torch (fp32).
+
+    q_np, k_np: [B, n_heads, T, head_dim]
+    cos_np, sin_np: [B, T, head_dim]  (full-width; function slices to first half)
+    Returns (q_out, k_out) as numpy.
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        apply_rotary_pos_emb_interleave
+    q = torch.as_tensor(q_np, dtype=torch.float32)
+    k = torch.as_tensor(k_np, dtype=torch.float32)
+    cos = torch.as_tensor(cos_np, dtype=torch.float32)
+    sin = torch.as_tensor(sin_np, dtype=torch.float32)
+    with torch.no_grad():
+        q_out, k_out = apply_rotary_pos_emb_interleave(q, k, cos, sin,
+                                                        unsqueeze_dim=1)
+    return q_out.numpy(), k_out.numpy()
+
+
+def _hf_oracle_rope_rotate_half(q_np, k_np, cos_np, sin_np):
+    """Apply HF apply_rotary_pos_emb (rotate-half) using torch (fp32).
+
+    q_np, k_np: [B, n_heads, T, head_dim]
+    cos_np, sin_np: [B, T, head_dim]
+    Returns (q_out, k_out) as numpy.
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        apply_rotary_pos_emb
+    q = torch.as_tensor(q_np, dtype=torch.float32)
+    k = torch.as_tensor(k_np, dtype=torch.float32)
+    cos = torch.as_tensor(cos_np, dtype=torch.float32)
+    sin = torch.as_tensor(sin_np, dtype=torch.float32)
+    with torch.no_grad():
+        q_out, k_out = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+    return q_out.numpy(), k_out.numpy()
+
+
+# ---- Test 1: MLA interleaved RoPE parity at small positions -----------------
+
+def test_rope_mla_interleaved_parity_small():
+    """JAX MLA interleaved RoPE matches HF oracle at small positions (maxabs < 1e-6).
+
+    Fixture: [B=2, n_heads=8, T=16, qk_rope_head_dim=64], positions 0..15.
+    Sub-assertion: cos/sin table matches HF before testing applied output.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (
+        apply_rope_interleaved_jax, build_rope_cos_sin_np)
+
+    B, n_heads, T, head_dim = 2, 8, 16, 64
+    rope_theta = 10000.0
+    rng = np.random.default_rng(42)
+    positions = np.arange(T, dtype=np.int32)
+    q_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
+    k_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
+
+    # Build cos/sin with HF numpy helper (reference)
+    hf_cos, hf_sin = _hf_cos_sin(positions, rope_theta, head_dim)  # [1, T, d]
+
+    # Build cos/sin with JAX function (host numpy, no device)
+    jax_cos, jax_sin = build_rope_cos_sin_np(positions, rope_theta, head_dim)
+    # jax_cos/sin: [T, head_dim]
+
+    # Sub-assertion: cos/sin TABLE parity (localize construction bugs)
+    assert maxabs(hf_cos[0], jax_cos) < 1e-6, (
+        f"cos table mismatch: maxabs={maxabs(hf_cos[0], jax_cos):.2e}")
+    assert maxabs(hf_sin[0], jax_sin) < 1e-6, (
+        f"sin table mismatch: maxabs={maxabs(hf_sin[0], jax_sin):.2e}")
+
+    # HF oracle applied output
+    hf_q_out, hf_k_out = _hf_oracle_rope_interleave(q_np, k_np, hf_cos, hf_sin)
+
+    # JAX applied output  — broadcast cos/sin over batch
+    q_jax = jnp.array(q_np)
+    k_jax = jnp.array(k_np)
+    cos_jax = jnp.array(jax_cos)  # [T, head_dim]
+    sin_jax = jnp.array(jax_sin)
+    jax_q_out, jax_k_out = apply_rope_interleaved_jax(q_jax, k_jax,
+                                                       cos_jax, sin_jax)
+
+    delta_q = maxabs(hf_q_out, jax_q_out)
+    delta_k = maxabs(hf_k_out, jax_k_out)
+    assert delta_q < 1e-6, (
+        f"MLA interleaved q maxabs={delta_q:.2e} >= 1e-6 (small positions)")
+    assert delta_k < 1e-6, (
+        f"MLA interleaved k maxabs={delta_k:.2e} >= 1e-6 (small positions)")
+
+
+# ---- Test 2: Indexer rotate-half RoPE parity at small positions -------------
+
+def test_rope_indexer_rotate_half_parity_small():
+    """JAX indexer rotate-half RoPE matches HF oracle at small positions (maxabs < 1e-6).
+
+    Fixture: [B=2, n_heads=8, T=16, qk_rope_head_dim=64], positions 0..15.
+    Sub-assertion: same cos/sin table as Test 1 (full-width, shared builder).
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (
+        apply_rope_rotate_half_jax, build_rope_cos_sin_np)
+
+    B, n_heads, T, head_dim = 2, 8, 16, 64
+    rope_theta = 10000.0
+    rng = np.random.default_rng(99)
+    positions = np.arange(T, dtype=np.int32)
+    q_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
+    k_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
+
+    hf_cos, hf_sin = _hf_cos_sin(positions, rope_theta, head_dim)  # [1, T, d]
+
+    jax_cos, jax_sin = build_rope_cos_sin_np(positions, rope_theta, head_dim)
+
+    # Sub-assertion: cos/sin TABLE parity
+    assert maxabs(hf_cos[0], jax_cos) < 1e-6, (
+        f"cos table mismatch: maxabs={maxabs(hf_cos[0], jax_cos):.2e}")
+    assert maxabs(hf_sin[0], jax_sin) < 1e-6, (
+        f"sin table mismatch: maxabs={maxabs(hf_sin[0], jax_sin):.2e}")
+
+    # HF oracle applied output
+    hf_q_out, hf_k_out = _hf_oracle_rope_rotate_half(q_np, k_np, hf_cos, hf_sin)
+
+    # JAX applied output
+    q_jax = jnp.array(q_np)
+    k_jax = jnp.array(k_np)
+    cos_jax = jnp.array(jax_cos)
+    sin_jax = jnp.array(jax_sin)
+    jax_q_out, jax_k_out = apply_rope_rotate_half_jax(q_jax, k_jax,
+                                                       cos_jax, sin_jax)
+
+    delta_q = maxabs(hf_q_out, jax_q_out)
+    delta_k = maxabs(hf_k_out, jax_k_out)
+    assert delta_q < 1e-6, (
+        f"Indexer rotate-half q maxabs={delta_q:.2e} >= 1e-6 (small positions)")
+    assert delta_k < 1e-6, (
+        f"Indexer rotate-half k maxabs={delta_k:.2e} >= 1e-6 (small positions)")
+
+
+# ---- Test 3: MLA interleaved RoPE parity at near-1M positions ---------------
+
+def test_rope_mla_interleaved_parity_near_1m():
+    """JAX MLA interleaved RoPE matches HF oracle at near-1M positions (maxabs < 1e-6).
+
+    Uses rope_theta=8_000_000 (real checkpoint value).  The near-1M positions
+    exercise the highest angles: pos * inv_freq[0] ≈ 1048575 rad (the D4 FIX
+    precision risk, spec §D4).  Verified by orchestrator: numpy/torch/jnp all
+    agree to ~6e-8 in fp32 at this angle, so 1e-6 is achievable.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (
+        apply_rope_interleaved_jax, build_rope_cos_sin_np)
+
+    B, n_heads, T, head_dim = 1, 8, 8, 64
+    rope_theta = 8_000_000.0
+    rng = np.random.default_rng(7)
+    # Near-1M positions; max_position_embeddings=1,048,576 in production
+    positions = np.array([1048575, 1048574, 1048000, 1047000,
+                          524288, 262144, 131072, 65536], dtype=np.int32)
+    q_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
+    k_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
+
+    hf_cos, hf_sin = _hf_cos_sin(positions, rope_theta, head_dim)  # [1, T, d]
+
+    jax_cos, jax_sin = build_rope_cos_sin_np(positions, rope_theta, head_dim)
+
+    # Sub-assertion: cos/sin TABLE parity at near-1M
+    assert maxabs(hf_cos[0], jax_cos) < 1e-6, (
+        f"cos table mismatch (near-1M): maxabs={maxabs(hf_cos[0], jax_cos):.2e}")
+    assert maxabs(hf_sin[0], jax_sin) < 1e-6, (
+        f"sin table mismatch (near-1M): maxabs={maxabs(hf_sin[0], jax_sin):.2e}")
+
+    # HF oracle applied output
+    hf_q_out, hf_k_out = _hf_oracle_rope_interleave(q_np, k_np, hf_cos, hf_sin)
+
+    # JAX applied output
+    q_jax = jnp.array(q_np)
+    k_jax = jnp.array(k_np)
+    cos_jax = jnp.array(jax_cos)
+    sin_jax = jnp.array(jax_sin)
+    jax_q_out, jax_k_out = apply_rope_interleaved_jax(q_jax, k_jax,
+                                                       cos_jax, sin_jax)
+
+    delta_q = maxabs(hf_q_out, jax_q_out)
+    delta_k = maxabs(hf_k_out, jax_k_out)
+    assert delta_q < 1e-6, (
+        f"MLA interleaved q maxabs={delta_q:.2e} >= 1e-6 (near-1M positions)")
+    assert delta_k < 1e-6, (
+        f"MLA interleaved k maxabs={delta_k:.2e} >= 1e-6 (near-1M positions)")
