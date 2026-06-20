@@ -14,6 +14,7 @@
 
 import math
 import os
+import sys as _sys
 from abc import abstractmethod
 from dataclasses import InitVar, dataclass
 from itertools import islice
@@ -856,18 +857,17 @@ class DeepseekV2Moe(JaxModule):
                  enable_return_routed_experts: bool = False,
                  # Optional kwargs — each defaults to the current module global or
                  # router literal so that existing call-sites are byte-identical.
-                 num_local_experts: int = None,
-                 hidden_size: int = None,
-                 moe_intermediate_size: int = None,
-                 num_experts_per_tok: int = None,
-                 n_group: int = None,
-                 topk_groups: int = None,
-                 norm_topk_prob: bool = None,
-                 routed_scaling_factor: float = None,
-                 num_shared_experts: int = None,
-                 hidden_act: str = None,
+                 num_local_experts: int | None = None,
+                 hidden_size: int | None = None,
+                 moe_intermediate_size: int | None = None,
+                 num_experts_per_tok: int | None = None,
+                 n_group: int | None = None,
+                 topk_groups: int | None = None,
+                 norm_topk_prob: bool | None = None,
+                 routed_scaling_factor: float | None = None,
+                 num_shared_experts: int | None = None,
+                 hidden_act: str | None = None,
                  expert_axis_name=None):
-        import sys as _sys
         _m = _sys.modules[__name__]
 
         # Resolve each optional kwarg to the module global when not supplied.

@@ -35,6 +35,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import tpu_inference.models.jax.deepseek_v3 as _dv3_mod
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -264,3 +266,128 @@ class TestDeepseekV2MoeParamize:
         assert out.shape == (T, D), (
             f"output shape {out.shape} != ({T}, {D})")
         assert expert_indices is not None, "expert_indices should be returned"
+
+    # ------------------------------------------------------------------
+    # Fix 1 gate: default-resolution is a pure no-op forward.
+    # Proves that the kwarg-defaulting path produces byte-identical
+    # computation to explicit passing, AND locks the math with a snapshot.
+    # ------------------------------------------------------------------
+
+    def test_default_resolution_is_noop_forward(self, monkeypatch):
+        """Construct two DeepseekV2Moe instances over identical tiny configs:
+          A — no kwargs (relies on module-global defaults, patched to tiny values).
+          B — explicit kwargs equal to those same tiny values.
+        Copy A's weights into B.  Forward both on the same input and assert
+        byte-identical outputs (maxabs == 0).  Also assert a numeric snapshot
+        of A's output to lock the MoE math going forward.
+
+        Design: patching module globals to a tiny config lets us run a real
+        forward (< 1 MB) while still exercising the default-resolution code path.
+        Byte-identity between A and B proves the defaulting is a pure no-op.
+        The snapshot asserts the numerical value is reproducible — any future
+        change to the routing/scaling/renorm math will trip this.
+        """
+        # --- Tiny config values to patch into the module globals ---
+        TINY_NUM_LOCAL_EXPERTS = 8
+        TINY_HIDDEN_SIZE = 128
+        TINY_MOE_INTERMEDIATE_SIZE = 64
+        TINY_NUM_EXPERTS_PER_TOKEN = 2
+        TINY_N_GROUP = 1
+        TINY_ROUTED_SCALING_FACTOR = 2.5
+        TINY_NUM_SHARED_EXPERTS = 1
+        TINY_HIDDEN_ACT = "silu"
+        TINY_EXPERT_AXIS_NAME = ShardingAxisName.ATTN_DATA_EXPERT
+
+        # Patch the module globals that DeepseekV2Moe.__init__ reads for defaults.
+        monkeypatch.setattr(_dv3_mod, "num_local_experts", TINY_NUM_LOCAL_EXPERTS)
+        monkeypatch.setattr(_dv3_mod, "hidden_size", TINY_HIDDEN_SIZE)
+        monkeypatch.setattr(_dv3_mod, "moe_intermediate_size", TINY_MOE_INTERMEDIATE_SIZE)
+        monkeypatch.setattr(_dv3_mod, "num_experts_per_token", TINY_NUM_EXPERTS_PER_TOKEN)
+        monkeypatch.setattr(_dv3_mod, "n_group", TINY_N_GROUP)
+        monkeypatch.setattr(_dv3_mod, "routed_scaling_factor", TINY_ROUTED_SCALING_FACTOR)
+        monkeypatch.setattr(_dv3_mod, "num_shared_experts", TINY_NUM_SHARED_EXPERTS)
+        monkeypatch.setattr(_dv3_mod, "hidden_act", TINY_HIDDEN_ACT)
+        monkeypatch.setattr(_dv3_mod, "expert_axis_name", TINY_EXPERT_AXIS_NAME)
+
+        mesh = _single_device_mesh()
+        rng_a = _make_rng(42)
+
+        from tpu_inference.layers.jax.quantization.unquantized import UnquantizedConfig
+
+        with _moe_context(mesh):
+            # Instance A — no optional kwargs; resolves from (patched) globals.
+            moe_a = DeepseekV2Moe(
+                mesh=mesh,
+                dtype=jnp.bfloat16,
+                num_expert_parallelism=1,
+                moe_backend=MoEBackend.DENSE_MAT,
+                quant_config=UnquantizedConfig({}),
+                scoring_func="sigmoid",
+                rng=rng_a,
+                prefix="noop_a",
+                enable_return_routed_experts=False,
+            )
+
+            # Instance B — all kwargs explicitly set to the same tiny values.
+            rng_b = _make_rng(42)  # same seed → same initial random weights
+            moe_b = DeepseekV2Moe(
+                mesh=mesh,
+                dtype=jnp.bfloat16,
+                num_expert_parallelism=1,
+                moe_backend=MoEBackend.DENSE_MAT,
+                quant_config=UnquantizedConfig({}),
+                scoring_func="sigmoid",
+                rng=rng_b,
+                prefix="noop_b",
+                enable_return_routed_experts=False,
+                num_local_experts=TINY_NUM_LOCAL_EXPERTS,
+                hidden_size=TINY_HIDDEN_SIZE,
+                moe_intermediate_size=TINY_MOE_INTERMEDIATE_SIZE,
+                num_experts_per_tok=TINY_NUM_EXPERTS_PER_TOKEN,
+                n_group=TINY_N_GROUP,
+                topk_groups=4,       # matches the literal default in __init__
+                norm_topk_prob=True, # matches the literal default in __init__
+                routed_scaling_factor=TINY_ROUTED_SCALING_FACTOR,
+                num_shared_experts=TINY_NUM_SHARED_EXPERTS,
+                hidden_act=TINY_HIDDEN_ACT,
+                expert_axis_name=TINY_EXPERT_AXIS_NAME,
+            )
+
+            # Copy A's weights into B so both compute over identical parameters.
+            from flax import nnx as _nnx
+            _nnx.update(moe_b, _nnx.state(moe_a))
+
+            # Same seeded input for both.
+            key = jax.random.PRNGKey(7)
+            x = jax.random.normal(key, (4, TINY_HIDDEN_SIZE), dtype=jnp.bfloat16)
+
+            out_a, _ = moe_a(x)
+            out_b, _ = moe_b(x)
+
+        # --- Byte-identity gate: default-resolution is a pure no-op ---
+        maxabs = float(jnp.max(jnp.abs(out_a.astype(jnp.float32)
+                                       - out_b.astype(jnp.float32))))
+        assert maxabs == 0.0, (
+            f"default-resolution is NOT a no-op: max |A-B| = {maxabs:.3e}. "
+            "The kwarg-defaulting path diverges from explicit passing.")
+
+        # --- Numeric snapshot: lock the MoE math going forward ---
+        # Value captured on first green run (seed=42 weights, seed=7 input, tiny config).
+        # If this fails, the routing/scaling/renorm math changed unexpectedly.
+        snapshot_mean = float(jnp.mean(out_a.astype(jnp.float32)))
+        # NOTE: _SNAPSHOT_MEAN captured on 2026-06-20 (seed=42 weights, seed=7 input,
+        # tiny config: experts=8, hidden=128, moe_inter=64, tok=2, group=1).
+        # Tolerance is 0 — bfloat16 on JAX is fully reproducible.
+        # To regenerate: set to None, run test, print snapshot_mean, hardcode.
+        _SNAPSHOT_MEAN = 0.0038310810923576355
+        if _SNAPSHOT_MEAN is not None:
+            assert snapshot_mean == _SNAPSHOT_MEAN, (
+                f"MoE math snapshot mismatch: got {snapshot_mean}, "
+                f"expected {_SNAPSHOT_MEAN}. "
+                "Routing/scaling/renorm math may have changed.")
+
+        # Always check finite + shape.
+        assert jnp.all(jnp.isfinite(out_a.astype(jnp.float32))), (
+            "Instance A forward output contains non-finite values")
+        assert out_a.shape == (4, TINY_HIDDEN_SIZE), (
+            f"Instance A output shape {out_a.shape} != (4, {TINY_HIDDEN_SIZE})")
