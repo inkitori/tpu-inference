@@ -306,7 +306,7 @@ class GlmMoeDsaAttentionRef:
     # config.rms_norm_eps (=1e-5).  Copying rms_norm_eps here is a silent bug.
     NORM_EPS = 1e-6
 
-    def __init__(self, config):
+    def __init__(self, config, *, norm_eps: float = NORM_EPS):
         self.config = config
         # Explicit MLA dims — NEVER read config.head_dim (overwritten to 64 in
         # __post_init__); use the explicit fields.
@@ -320,6 +320,10 @@ class GlmMoeDsaAttentionRef:
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim  # 256
         # Default rope (mscale=1, no YaRN): sm_scale = qk_head_dim**-0.5.
         self.sm_scale = self.qk_head_dim ** (-0.5)
+        # norm_eps injection knob (test affordance; default=1e-6 = NORM_EPS).
+        # Used by the eps-teeth test to prove the gate catches a wrong eps.
+        # Production code never passes this — the default is the only safe value.
+        self._norm_eps = norm_eps
         self._w: Dict[str, jnp.ndarray] = {}
 
     # -- weight management ---------------------------------------------------
@@ -366,7 +370,7 @@ class GlmMoeDsaAttentionRef:
         # --- query path: q_a -> q_a_layernorm(eps=1e-6) -> q_b -> split ------
         q_resid = x @ w["self_attn.q_a_proj.weight"]            # [B,T,q_lora]
         q_resid = _rms_norm_jax(q_resid, w["self_attn.q_a_layernorm.weight"],
-                                self.NORM_EPS)
+                                self._norm_eps)
         q = q_resid @ w["self_attn.q_b_proj.weight"]            # [B,T,N*256]
         q = q.reshape(B, T, N, self.qk_head_dim).transpose(0, 2, 1, 3)  # [B,N,T,256]
         q_nope = q[..., : self.qk_nope_head_dim]                # [B,N,T,192]
@@ -378,7 +382,7 @@ class GlmMoeDsaAttentionRef:
         k_rope = compressed[..., self.kv_lora_rank:]              # [B,T,64]
         # kv_a_layernorm (eps=1e-6) on the 512-latent ONLY, NOT the rope part.
         latent = _rms_norm_jax(latent, w["self_attn.kv_a_layernorm.weight"],
-                               self.NORM_EPS)
+                               self._norm_eps)
         kv = latent @ w["self_attn.kv_b_proj.weight"]            # [B,T,N*448]
         kv = kv.reshape(B, T, N, self.qk_nope_head_dim + self.v_head_dim)
         kv = kv.transpose(0, 2, 1, 3)                            # [B,N,T,448]

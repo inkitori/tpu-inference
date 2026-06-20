@@ -750,22 +750,80 @@ def _build_mla_parity_fixture(seed=0, layer_idx=0, T=32):
     return cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np
 
 
+def _check_jax_weights_match_hf_raw(model, layer_idx, jax_w):
+    """Assert JAX-loaded MLA weights match the raw HF torch weights (with transpose).
+
+    For each MLA linear projection weight, this takes the RAW torch tensor from
+    the HF block (shape ``[out, in]``), applies the documented HF→JAX transpose
+    (``.T`` → ``[in, out]``), converts to fp32 numpy, and compares against the
+    corresponding JAX-loaded weight (maxabs == 0.0).
+
+    This is an INDEPENDENT check — it does not call export_weights() or compare
+    jax_w against itself, so it catches a t2j_weights transpose/shape/mapping
+    bug that a self-comparison would miss.
+    """
+    prefix = f"model.layers.{layer_idx}."
+    sd = model.state_dict()
+    # Linear projections: HF shape (out, in) → JAX wants (in, out) via .T
+    linear_names = (
+        "self_attn.q_a_proj.weight",
+        "self_attn.q_b_proj.weight",
+        "self_attn.kv_a_proj_with_mqa.weight",
+        "self_attn.kv_b_proj.weight",
+        "self_attn.o_proj.weight",
+    )
+    # 1-D norm weights: shape unchanged
+    norm_names = (
+        "self_attn.q_a_layernorm.weight",
+        "self_attn.kv_a_layernorm.weight",
+    )
+    for bare in linear_names:
+        hf_torch = sd[prefix + bare]  # [out, in]
+        expected = hf_torch.detach().float().cpu().numpy().T  # [in, out]
+        actual = np.asarray(jax_w[bare]).astype(np.float32)
+        delta = float(np.max(np.abs(expected - actual)))
+        assert delta == 0.0, (
+            f"HF↔JAX weight mismatch for {bare!r}: maxabs={delta:.3e} "
+            f"(expected 0.0 — transpose or mapping bug in t2j_weights)")
+    for bare in norm_names:
+        hf_torch = sd[prefix + bare]  # [dim]
+        expected = hf_torch.detach().float().cpu().numpy()
+        actual = np.asarray(jax_w[bare]).astype(np.float32)
+        delta = float(np.max(np.abs(expected - actual)))
+        assert delta == 0.0, (
+            f"HF↔JAX norm weight mismatch for {bare!r}: maxabs={delta:.3e}")
+
+
 def test_mla_ref_math_gate():
     """GlmMoeDsaAttentionRef (non-absorbed fp32) == HF eager MLA block, maxabs<1e-3.
 
     Single-MLA-submodule parity at seq=32 < index_topk=64 (DSA dense identity,
-    §A5). assert_identical_weights BEFORE comparing outputs so the result
-    reflects the two implementations, not a weight mismatch.
+    §A5). An INDEPENDENT HF↔JAX raw-weight check (not a self-comparison) is
+    run BEFORE comparing outputs so the result reflects the two implementations,
+    not a weight mismatch or a transpose/mapping bug.
     """
+    import torch
     from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
 
-    cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np = _build_mla_parity_fixture()
+    cfg = tiny_glm_moe_dsa_config()
+    seed = 0
+    layer_idx = 0
+    T = 32
+    model = build_hf_oracle(cfg=cfg, seed=seed)
 
-    ref = GlmMoeDsaAttentionRef(cfg)
+    cfg_ret, hidden_np, cos_np, sin_np, jax_w, hf_out_np = _build_mla_parity_fixture(
+        seed=seed, layer_idx=layer_idx, T=T)
+
+    ref = GlmMoeDsaAttentionRef(cfg_ret)
     ref.load_weights(jax_w)
 
-    # Sanity: the loaded weights round-trip identically through the converter.
-    assert_identical_weights(jax_w, ref.export_weights())
+    # Fix 2: INDEPENDENT HF↔JAX raw-weight check (not a self-comparison).
+    # Takes each raw torch tensor, applies the documented .T transpose for linears,
+    # converts to fp32 numpy, and compares against the JAX-loaded weight.
+    # This catches a t2j_weights transpose/shape/mapping bug independently of
+    # the forward gate. The previous assert_identical_weights(jax_w, ref.export_weights())
+    # was vacuous because export_weights() returns the same jax_w dict.
+    _check_jax_weights_match_hf_raw(model, layer_idx, jax_w)
 
     out = ref(jnp.asarray(hidden_np),
               jnp.asarray(cos_np), jnp.asarray(sin_np))
@@ -801,3 +859,101 @@ def test_mla_ref_injected_error_trips_gate():
     # And it must trip by a clear margin (well above the fp32 tolerance).
     assert delta > 1e-2, (
         f"injected error margin too small: maxabs={delta:.3e} (expected >1e-2)")
+
+
+def _build_small_input_mla_fixture(seed=0, layer_idx=0, T=32, scale=1e-3):
+    """Build a parity fixture with a SMALL-MAGNITUDE hidden input.
+
+    Scales the hidden states so the latent ``mean(x²) ≈ scale`` (default 1e-3).
+    This regime makes the q_a/kv_a layernorm eps (1e-6 vs 1e-5) produce a
+    relative difference ~4.5e-3 in the layernorm output — well above the 1e-3
+    gate — making the eps a load-bearing gate tooth.
+
+    Returns the same tuple as ``_build_mla_parity_fixture`` but with the hidden
+    array scaled down so ``mean(hidden²) ≈ scale``.
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        GlmMoeDsaRotaryEmbedding
+
+    cfg = tiny_glm_moe_dsa_config()
+    assert T < cfg.index_topk, f"T={T} must be < index_topk={cfg.index_topk}"
+    model = build_hf_oracle(cfg=cfg, seed=seed)
+
+    B, hidden = 1, cfg.hidden_size
+    rng = np.random.default_rng(9999)
+    # Standard-normal → scale to achieve mean(x²) ≈ scale.
+    # For a standard-normal x, mean(x²) ≈ 1.0; multiplying by sqrt(scale) gives
+    # mean(x²) ≈ scale.
+    hidden_np = (rng.standard_normal((B, T, hidden)) * np.sqrt(scale)).astype(
+        np.float32)
+    hidden_t = torch.as_tensor(hidden_np, dtype=torch.float32)
+
+    # Real rotary module cos/sin
+    rotary = GlmMoeDsaRotaryEmbedding(cfg)
+    pos = torch.arange(T, dtype=torch.long)[None, :]  # [1, T]
+    with torch.no_grad():
+        cos_t, sin_t = rotary.forward(hidden_t, pos)   # [1, T, 64]
+    cos_np = cos_t[0].numpy().astype(np.float32)       # [T, 64]
+    sin_np = sin_t[0].numpy().astype(np.float32)
+
+    hf_out = _hf_mla_block_output(model, layer_idx, hidden_t, cos_t, sin_t)
+    hf_out_np = hf_out.detach().numpy().astype(np.float32)
+
+    jax_w = _extract_mla_jax_weights(model, layer_idx)
+    return cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np
+
+
+def test_mla_ref_eps_teeth_clean_parity():
+    """Small-input regime: CLEAN parity (both sides eps=1e-6) still passes < 1e-3.
+
+    Fix 1(a): at hidden scale sqrt(1e-3), mean(x²)≈1e-3 in the latent.  Both
+    the HF oracle (eps=1e-6) and the jnp ref (default norm_eps=1e-6) use the
+    correct eps, so parity should hold to the same tolerance as the normal-input
+    gate.  This confirms the small-input regime does not break the clean case.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+
+    cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np = _build_small_input_mla_fixture()
+
+    # Default norm_eps=1e-6 (same as HF).
+    ref = GlmMoeDsaAttentionRef(cfg)
+    ref.load_weights(jax_w)
+
+    out = ref(jnp.asarray(hidden_np),
+              jnp.asarray(cos_np), jnp.asarray(sin_np))
+    delta = maxabs(hf_out_np, out)
+    assert delta < 1e-3, (
+        f"Small-input CLEAN parity failed: maxabs={delta:.3e} >= 1e-3 "
+        f"(both eps=1e-6; expected clean pass)")
+
+
+def test_mla_ref_eps_teeth_wrong_eps_trips_gate():
+    """Small-input regime: eps=1e-5 in the jnp ref MUST fail the 1e-3 gate.
+
+    Fix 1(b): proves the eps is pinned — the gate bites on a wrong eps value.
+    At mean(x²)≈1e-3, swapping eps 1e-6→1e-5 produces a relative layernorm
+    diff ~4.5e-3 (eps/variance ratio changes by ~9x), which propagates through
+    q_b/kv_b projections and the attention path to yield maxabs >> 1e-3.
+
+    This test ASSERTS FAILURE (parity MUST break with wrong eps), confirming
+    the gate is not silent in the face of the #1 eps-bug risk (spec §H3).
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+
+    cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np = _build_small_input_mla_fixture()
+
+    # Mutate ONLY the jnp ref's eps to 1e-5; HF oracle stays at 1e-6.
+    ref_wrong_eps = GlmMoeDsaAttentionRef(cfg, norm_eps=1e-5)
+    ref_wrong_eps.load_weights(jax_w)
+
+    out = ref_wrong_eps(jnp.asarray(hidden_np),
+                        jnp.asarray(cos_np), jnp.asarray(sin_np))
+    delta = maxabs(hf_out_np, out)
+    assert delta >= 1e-3, (
+        f"Wrong eps (1e-5) did NOT trip the gate in small-input regime: "
+        f"maxabs={delta:.3e} < 1e-3 (eps is NOT pinned — silent bug risk!)")
+    # Must trip by a clear margin (this is the whole point of the teeth test).
+    assert delta > 2e-3, (
+        f"Wrong eps margin too small: maxabs={delta:.3e} (expected >2e-3 at "
+        f"mean(x²)≈1e-3); the gate is too weak to be meaningful")
