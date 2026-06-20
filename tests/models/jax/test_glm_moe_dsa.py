@@ -2805,3 +2805,132 @@ def test_absorbed_kernel_kv_b_absorption_injected_error(mesh_1d):
         f"the kv_b-absorption corruption leaked into the jnp-ref math gate: "
         f"maxabs={ref_gate_delta:.3e} >= 1e-3 — the corruption was not "
         f"absorption-only, so gate (c) does not prove the unique-catcher claim.")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 8 — Greedy generate() token-exact vs HF.
+#
+# GOAL: prove the decode loop + argmax handoff is correct end-to-end.
+# Method: recompute the full fp32 jnp-ref forward over the growing prefix at
+# each step (no incremental KV-cache decode — that is Phase 1c), argmax the
+# last-position logit, append, repeat K times.  Assert the K-token sequence
+# is element-wise EQUAL to HF generate(do_sample=False, max_new_tokens=K).
+#
+# Tie-risk discipline (§H11a): use buffer_scale=5.0 (default in build_hf_oracle)
+# so e_score_correction_bias is randomized with large magnitude → peaked logits.
+# Prompt length = 16, K=32 → total seq = 48 ≤ index_topk=64 (dense-equiv, DSA
+# identity).  Per-step top1-top2 gaps are printed for the orchestrator.
+# ---------------------------------------------------------------------------
+
+_TASK8_PROMPT_LEN = 16
+_TASK8_K = 32  # decode steps; total seq = 16+32 = 48 ≤ index_topk=64
+
+
+def _build_generate_fixture(mesh, seed: int = 0, prompt_len: int = _TASK8_PROMPT_LEN):
+    """Build HF oracle + JAX model sharing identical weights for the generate gate."""
+    import torch
+    from tpu_inference.models.jax.glm_moe_dsa import (
+        GlmMoeDsaForCausalLM, build_glm_vllm_config, convert_hf_weights,
+        greedy_generate_jax_ref,
+    )
+
+    cfg = tiny_glm_moe_dsa_config()
+    # build_hf_oracle with randomize_buffers=True, buffer_scale=5.0 (the default)
+    # gives large e_score_correction_bias → peaks the MoE router logits → peaked
+    # top-1 margin on every step, which is our tie-risk defence (§H11a).
+    hf_model = build_hf_oracle(cfg=cfg, seed=seed,
+                               randomize_buffers=True, buffer_scale=5.0)
+
+    # Build JAX model and load IDENTICAL weights.
+    vllm_cfg = build_glm_vllm_config(cfg, mesh=mesh)
+    jax_model = GlmMoeDsaForCausalLM(vllm_cfg, seed, mesh)
+    jax_w, _ = convert_hf_weights(hf_model.state_dict(), cfg)
+    jax_model.load_weights(jax_w)
+
+    # Fixed prompt: use a deterministic non-trivial token sequence.
+    rng = np.random.default_rng(seed + 1)
+    prompt_np = rng.integers(1, cfg.vocab_size, size=(1, prompt_len),
+                             dtype=np.int32)  # [1, T_prompt]
+    prompt_torch = torch.tensor(prompt_np, dtype=torch.long)
+
+    return cfg, hf_model, jax_model, prompt_np, prompt_torch, greedy_generate_jax_ref
+
+
+def test_greedy_generate_token_exact_vs_hf(mesh_1d):
+    """Generated K-token sequence must be element-wise equal to HF generate.
+
+    This is the decode-loop + argmax handoff gate.  A single wrong token at
+    step i diverges the context for all subsequent steps, so token-exact over
+    all K=32 tokens is a strong test.
+
+    Per-step top1-top2 logit gaps are printed so the orchestrator can verify
+    the gate is real (non-trivial, not near-tie).
+    """
+    import torch
+    from transformers import GenerationConfig
+
+    K = _TASK8_K
+    cfg, hf_model, jax_model, prompt_np, prompt_torch, greedy_generate_jax_ref = (
+        _build_generate_fixture(mesh_1d, seed=0))
+
+    # --- HF reference: greedy generate K tokens --------------------------------
+    with torch.no_grad():
+        gen_cfg = GenerationConfig(
+            do_sample=False,
+            max_new_tokens=K,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            repetition_penalty=1.0,
+        )
+        hf_output = hf_model.generate(
+            prompt_torch,
+            generation_config=gen_cfg,
+        )
+    # hf_output shape: [1, prompt_len + K]; slice the generated tokens only.
+    hf_tokens = hf_output[0, prompt_np.shape[1]:].numpy()  # [K]
+
+    # --- JAX reference: greedy generate K tokens (fp32 jnp-ref path) ----------
+    with jax.default_matmul_precision("highest"):
+        jax_tokens, per_step_gaps = greedy_generate_jax_ref(
+            jax_model, jnp.asarray(prompt_np), K)
+
+    jax_tokens_np = np.asarray(jax_tokens)  # [K]
+
+    # --- diagnostics -----------------------------------------------------------
+    print(f"\n[task8] K={K}, prompt_len={prompt_np.shape[1]}, "
+          f"total_seq_max={prompt_np.shape[1] + K} (index_topk=64)")
+    print(f"[task8] HF tokens :  {hf_tokens.tolist()}")
+    print(f"[task8] JAX tokens:  {jax_tokens_np.tolist()}")
+    print(f"[task8] Per-step top1-top2 gaps (fp32 logit space):")
+    mismatches = []
+    for step, gap in enumerate(per_step_gaps):
+        match = "OK" if hf_tokens[step] == jax_tokens_np[step] else "MISMATCH"
+        if match == "MISMATCH":
+            mismatches.append(step)
+        print(f"  step {step:02d}: gap={gap:.4f}  hf={hf_tokens[step]}  "
+              f"jax={jax_tokens_np[step]}  {match}")
+
+    # --- primary assertion: token-exact equality over all K steps --------------
+    assert np.array_equal(hf_tokens, jax_tokens_np), (
+        f"Token-exact generate gate FAILED.\n"
+        f"  Matched {K - len(mismatches)}/{K} tokens.\n"
+        f"  First mismatch at step {mismatches[0] if mismatches else '?'}.\n"
+        f"  HF    : {hf_tokens.tolist()}\n"
+        f"  JAX   : {jax_tokens_np.tolist()}\n"
+        f"  Per-step gaps (top1-top2): {[f'{g:.4f}' for g in per_step_gaps]}\n"
+        "See §H11a — if gap is tiny at the mismatch step this is a tie-flip "
+        "(not necessarily a bug); if gap is large it IS a real bug."
+    )
+
+    # --- secondary: all per-step gaps must be non-trivial (peaked init) --------
+    # Warn (not fail) if any gap < 0.01 — means the init wasn't peaked enough
+    # to make this a strong gate.  The test already passed above, so this is
+    # diagnostic only.
+    min_gap = min(per_step_gaps)
+    if min_gap < 0.01:
+        print(f"[task8 WARNING] min per-step top1-top2 gap = {min_gap:.6f} < 0.01 "
+              f"— logits may be near-tied at some steps; gate may be less rigorous.")
+    else:
+        print(f"[task8] min per-step top1-top2 gap = {min_gap:.4f} ≥ 0.01 "
+              f"— gate is rigorous (no near-ties).")

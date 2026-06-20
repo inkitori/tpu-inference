@@ -1167,6 +1167,99 @@ class GlmMoeDsaForCausalLM(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
+# Greedy-generate helper (Task 8 — decode loop + argmax gate).
+#
+# Recomputes the FULL fp32 jnp-ref forward over the growing prefix at each
+# decode step (no incremental KV-cache decode — that is Phase 1c).  This
+# isolates the decode-loop + argmax handoff from kernel/KV-cache machinery
+# and serves as the answer-key usage example for later phases.
+#
+# MUST be called under jax.default_matmul_precision("highest") by the caller
+# (the test does this) so the fp32 matmuls are genuine true-fp32.
+# ---------------------------------------------------------------------------
+
+def greedy_generate_jax_ref(
+    model: "GlmMoeDsaForCausalLM",
+    input_ids: jnp.ndarray,
+    K: int,
+) -> Tuple[jnp.ndarray, List[float]]:
+    """Greedy-generate ``K`` tokens using the fp32 jnp-ref forward path.
+
+    At each step the FULL forward is recomputed over a FIXED-SHAPE padded
+    buffer (shape ``[1, T_prompt + K]``), which keeps the JAX computation
+    graph shape-stable and avoids one recompilation per step.  The buffer
+    is pre-allocated with pad token 0; each step writes the newly generated
+    token at the correct position, runs the forward, and reads the logit at
+    the "current last real token" position.
+
+    The causal mask inside ``GlmMoeDsaAttentionRef._forward`` ensures that
+    positions beyond the current "real" length do not affect earlier positions:
+    padding tokens sit in the future relative to the predicted position, so
+    they are masked by the upper-triangular ``-inf`` causal mask.
+
+    No KV-cache append — full-prefix recompute.  Phase 1c will add
+    incremental cache decode.
+
+    Args:
+        model: ``GlmMoeDsaForCausalLM`` with weights already loaded.
+        input_ids: ``[1, T_prompt]`` int32 prompt token ids.
+        K: number of tokens to generate.
+
+    Returns:
+        ``(generated_ids, per_step_top1_top2_gaps)`` where:
+        * ``generated_ids`` — ``[K]`` int32 array of generated token ids.
+        * ``per_step_top1_top2_gaps`` — Python list of ``K`` floats, each
+          the (top-1 logit) − (top-2 logit) at that decode step (for tie
+          diagnosis per §H11a).
+    """
+    assert input_ids.ndim == 2 and input_ids.shape[0] == 1, (
+        f"input_ids must be [1, T_prompt]; got {input_ids.shape}")
+
+    T_prompt = input_ids.shape[1]
+    T_max = T_prompt + K  # fixed padded length — one compile for all steps
+
+    # Pre-allocate padded buffer (numpy, mutated in place between steps).
+    token_buf = np.zeros((1, T_max), dtype=np.int32)
+    token_buf[0, :T_prompt] = np.asarray(input_ids[0])
+
+    # Fixed positions array — shape never changes → one XLA compilation.
+    positions = jnp.arange(T_max, dtype=jnp.int32)
+
+    generated: List[int] = []
+    per_step_gaps: List[float] = []
+
+    for step in range(K):
+        # Position of the "last real token" whose logit we read for this step.
+        last_real_pos = T_prompt + step - 1
+        tokens_jnp = jnp.asarray(token_buf)  # [1, T_max] — shape is constant
+
+        # GlmMoeDsaForCausalLM.__call__ signature:
+        #   (kv_caches, input_ids, attention_metadata, ...) ->
+        #   (kv_caches, hidden [1,T_max,D], [], expert_indices)
+        _, hidden, _, _ = model(None, tokens_jnp, positions)
+
+        # Read logit at the last real position.
+        last_hidden = hidden[:, last_real_pos:last_real_pos + 1, :]  # [1,1,D]
+        logits = model.compute_logits(last_hidden)          # [1, 1, vocab]
+        logits_1d = jnp.squeeze(logits, axis=(0, 1))        # [vocab]
+
+        # Top-1 argmax → next token.
+        next_token = int(jnp.argmax(logits_1d))
+
+        # Top-1 − top-2 gap for tie diagnostics.
+        top2 = jnp.sort(logits_1d)[-2]
+        gap = float(logits_1d[next_token] - top2)
+
+        generated.append(next_token)
+        per_step_gaps.append(gap)
+
+        # Write the generated token into the buffer at the next position.
+        token_buf[0, T_prompt + step] = next_token
+
+    return jnp.array(generated, dtype=jnp.int32), per_step_gaps
+
+
+# ---------------------------------------------------------------------------
 # HF state_dict -> JAX weight converter (the Task-5 weight-map contract).
 #
 # Builds on the shared ``t2j`` (utils.py) — NEVER shadows it — and applies the
