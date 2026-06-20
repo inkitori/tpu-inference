@@ -31,6 +31,12 @@ and multi-device, **before** any DSA or giant-model work.
 - **Greedy generation on the mesh** matches single-device (token-exact).
 - *(Shared with Phase 1a: the `max_model_len=1M` wide-kernel variant — see phase-1a; it forces the same wide
   `pages_per_seq` MLA program the decode path will hit at real context length.)*
+  > **Phase-1a verified correction:** the current `mla/v2` kernel has **no** `pages_per_seq`-keyed wide-program
+  > / SMEM-OOM-split branch (one static-tuned path) and its flash gather loop is **`kv_len`-bounded**, not
+  > `pages_per_seq`-bounded. So a wide `pages_per_seq` at short seq does **not** exercise long-context flash
+  > **compute** — only RoPE-width + cache allocation/addressing (1a covered that). **This phase (1c) is where
+  > the long-context compute is first genuinely exercised, via REAL long sequences** (`kv_len` near `index_topk`
+  > and beyond). Gate the long-context numerics here with actual long decode, not a wide cache at seq≈8.
 
 ## Acceptance gates (numeric)
 - **Prefill↔decode equivalence** (fp32 1e-3 + **argmax-exact**) on tiny + medium, single- and multi-device
