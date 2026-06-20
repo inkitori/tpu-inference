@@ -231,6 +231,31 @@ def medium_glm_moe_dsa_config(**overrides):
     return GlmMoeDsaConfig(**kwargs)
 
 
+# --- 1M max_model_len variant (Task 9) ---------------------------------------
+# The real GLM 5.2 checkpoint serves a 1,048,576-token context. The 1M variant
+# keeps every MEDIUM per-layer dim (so it tests the SAME shapes as the medium
+# gates) and only sets `max_position_embeddings=1_048_576`, the long-context
+# knob that drives the production wide-context paths:
+#   * the full-width RoPE sin/cos table (built per-forward from the `positions`
+#     array — near-1M positions materialize the real-scale table), and
+#   * the wide KV-cache `pages_per_seq` (1_048_576 / page_size(128) = 8192),
+#     which the caller drives by allocating a large paged cache + block_tables.
+MEDIUM_1M_MAX_POS = 1_048_576   # production GLM 5.2 max_model_len / context
+
+
+def medium_1m_glm_moe_dsa_config(**overrides):
+    """Build the medium config with the 1M `max_position_embeddings` knob set.
+
+    Same per-layer dims as `medium_glm_moe_dsa_config` (heads=64, hidden=6144,
+    top-8-of-16 MoE, layers=6, page_size=128) — only the long-context limit
+    differs. This is the Task-9 compile variant that first-contacts the
+    full-width RoPE table + the wide `pages_per_seq≈8192` MLA program.
+    """
+    kwargs = dict(max_position_embeddings=MEDIUM_1M_MAX_POS)
+    kwargs.update(overrides)
+    return medium_glm_moe_dsa_config(**kwargs)
+
+
 def build_hf_decode_oracle(input_ids, decode_ids, *, cfg=None, seed=0,
                            randomize_buffers=False):
     """Run HF-eager stepped decode; return per-step last-token logits.

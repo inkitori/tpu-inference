@@ -27,9 +27,11 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from tests.models.jax.glm_moe_dsa_harness import (
-    TINY_SEQ_DENSE, TINY_SEQ_SPARSE, assert_identical_weights, build_hf_oracle,
-    build_hf_decode_oracle, make_glm_mesh, maxabs, medium_glm_moe_dsa_config,
-    tiny_glm_moe_dsa_config, t2j_weights, weight_checksum)
+    MEDIUM_1M_MAX_POS, MEDIUM_PAGE_SIZE, TINY_SEQ_DENSE, TINY_SEQ_SPARSE,
+    assert_identical_weights, build_hf_oracle, build_hf_decode_oracle,
+    make_glm_mesh, maxabs, medium_1m_glm_moe_dsa_config,
+    medium_glm_moe_dsa_config, tiny_glm_moe_dsa_config, t2j_weights,
+    weight_checksum)
 from tpu_inference.layers.common.moe import MoEBackend
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxLmHead
@@ -721,18 +723,20 @@ def _hf_mla_block_output(model, layer_idx, hidden_states_t, cos_t, sin_t):
     return out  # [B, T, hidden]
 
 
-def _build_mla_parity_fixture(seed=0, layer_idx=0, T=32):
+def _build_mla_parity_fixture(seed=0, layer_idx=0, T=32, cfg=None):
     """Shared fixture: build oracle, random hidden states, cos/sin, weights.
 
     Returns (cfg, hidden_np, cos_np, sin_np, jax_w, hf_out_np) all fp32 host
-    numpy / jnp arrays. layer_idx=0 is a "full" indexer layer; T=32<index_topk=64
-    keeps the indexer dense-equivalent.
+    numpy / jnp arrays. layer_idx=0 is a "full" indexer layer; T < index_topk
+    keeps the indexer dense-equivalent. ``cfg`` defaults to the tiny config so
+    existing Task-3/7 callers are unchanged; Task 9 passes the medium config.
     """
     import torch
     from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
         GlmMoeDsaRotaryEmbedding
 
-    cfg = tiny_glm_moe_dsa_config()
+    if cfg is None:
+        cfg = tiny_glm_moe_dsa_config()
     assert T < cfg.index_topk, f"T={T} must be < index_topk={cfg.index_topk}"
     model = build_hf_oracle(cfg=cfg, seed=seed)
 
@@ -1988,13 +1992,20 @@ def test_load_weights_accepts_indexer_keys_in_expected_skip_set(mesh_1d):
 
 
 def _build_full_forward_fixture(mesh, seed=0, T=TINY_SEQ_DENSE,
-                                input_seed=2024):
-    """Shared fixture for the Task-6 full-forward gates.
+                                input_seed=2024, cfg=None, run_hf=True):
+    """Shared fixture for the full-forward gates (Task 6 tiny + Task 9 medium).
 
-    Builds the HF oracle (tiny config, seed, randomize_buffers=True so the
-    e_score_correction_bias selection path is non-trivial), runs its full eager
-    forward (fp32) to get the oracle logits, and converts its state_dict into a
-    GlmMoeDsaForCausalLM via the in-module converter + load_weights.
+    Builds the HF oracle (``cfg``, defaulting to the tiny config; seed,
+    randomize_buffers=True so the e_score_correction_bias selection path is
+    non-trivial), runs its full eager forward (fp32) to get the oracle logits,
+    and converts its state_dict into a GlmMoeDsaForCausalLM via the in-module
+    converter + load_weights.
+
+    ``cfg`` lets a caller swap in a larger config (Task 9 medium / 1M variant);
+    it defaults to ``tiny_glm_moe_dsa_config()`` so existing Task-6 callers are
+    unchanged. ``run_hf=False`` skips the (expensive) HF oracle forward when the
+    caller only needs the JAX model + ids (e.g. the 1M RoPE-width compile smoke,
+    which gates on compile+finite, not HF parity); ``hf_logits_np`` is then None.
 
     ``mesh`` is the AMBIENT mesh established by the ``mesh_1d`` test fixture
     (already entered via ``jax.set_mesh`` in the fixture body) — we reuse it
@@ -2003,26 +2014,31 @@ def _build_full_forward_fixture(mesh, seed=0, T=TINY_SEQ_DENSE,
     Returns:
         (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights, hf_model)
     where ``ids_jax`` is [1, T] int32, ``positions_jax`` is [T] int32, and
-    ``hf_logits_np`` is the fp32 host [1, T, vocab] HF oracle logits.
+    ``hf_logits_np`` is the fp32 host [1, T, vocab] HF oracle logits (or None if
+    ``run_hf=False``).
 
-    T=32 < index_topk=64 keeps the indexer dense-equivalent (the indexer-less
-    jnp ref == the full HF model).
+    T < index_topk keeps the indexer dense-equivalent (the indexer-less jnp ref
+    == the full HF model).
     """
     import torch
     from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
                                                       build_glm_vllm_config,
                                                       convert_hf_weights)
-    cfg = tiny_glm_moe_dsa_config()
+    if cfg is None:
+        cfg = tiny_glm_moe_dsa_config()
     assert T < cfg.index_topk, f"T={T} must be < index_topk={cfg.index_topk}"
 
     hf_model = build_hf_oracle(cfg=cfg, seed=seed, randomize_buffers=True)
 
     rng = np.random.default_rng(input_seed)
     ids_np = rng.integers(0, cfg.vocab_size, size=(1, T)).astype(np.int32)
-    with torch.no_grad():
-        hf_logits = hf_model(input_ids=torch.as_tensor(ids_np),
-                             use_cache=False).logits  # [1, T, vocab]
-    hf_logits_np = hf_logits.detach().float().cpu().numpy()
+    if run_hf:
+        with torch.no_grad():
+            hf_logits = hf_model(input_ids=torch.as_tensor(ids_np),
+                                 use_cache=False).logits  # [1, T, vocab]
+        hf_logits_np = hf_logits.detach().float().cpu().numpy()
+    else:
+        hf_logits_np = None
 
     sd = hf_model.state_dict()
     jax_weights, _skipped = convert_hf_weights(sd, cfg)
@@ -2579,16 +2595,18 @@ def test_full_forward_eps_teeth_integration_wrong_eps_trips(mesh_1d):
 _TASK7_T = 32   # < index_topk=64 so DSA is the dense identity (spec §A5)
 
 
-def _build_absorbed_kernel_inputs(seed=0, layer_idx=0, T=_TASK7_T):
+def _build_absorbed_kernel_inputs(seed=0, layer_idx=0, T=_TASK7_T, cfg=None):
     """Shared fixture for the absorbed-kernel gates.
 
     Reuses the Task-3 MLA parity fixture (oracle, hidden states, REAL cos/sin
     tables, t2j-converted MLA weights), so the absorbed path and the jnp-ref
     consume bit-identical pre-attention inputs and weights. The gate is then a
     pure isolation of (absorption split + mla/v2 kernel) vs the jnp-ref math.
+    ``cfg`` defaults to the tiny config (existing Task-7 callers); Task 9 passes
+    the medium / 1M config.
     """
     cfg, hidden_np, cos_np, sin_np, jax_w, _hf_out = _build_mla_parity_fixture(
-        seed=seed, layer_idx=layer_idx, T=T)
+        seed=seed, layer_idx=layer_idx, T=T, cfg=cfg)
     return cfg, hidden_np, cos_np, sin_np, jax_w
 
 
@@ -2615,29 +2633,50 @@ def _make_glm_mla_kernel_layer(cfg, jax_w, mesh, *, dtype, s_dtype,
     return layer
 
 
-def _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np, *, dtype):
+def _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np, *, dtype,
+                         page_size=64, num_pages=1):
     """Run the absorbed mla/v2 kernel layer on a single-seq prefill.
 
     Builds the single-sequence prefill KV cache + AttentionMetadata, runs the
     layer forward, and returns the [T, hidden] attention-block output as fp32.
+
+    ``page_size`` defaults to 64 (Task-7 tiny: one page holds T=32 tokens).
+    Task 9 passes page_size=128 (MEDIUM_PAGE_SIZE) so ``bkv_sz % 128 == 0`` and
+    the MLA fast-masking path is exercised.
+
+    ``num_pages`` defaults to 1. Task 9's 1M variant passes num_pages=8192 to
+    first-contact the WIDE ``pages_per_seq`` program: the kernel derives
+    ``pages_per_seq = num_page_indices // max_num_seqs`` from the block_tables
+    length, so allocating an 8192-entry block_tables + an 8192-page cache makes
+    pages_per_seq=8192 (= 1_048_576 / 128, the production width). The single
+    sequence's page list is ``arange(num_pages)``; only the first ceil(T/
+    page_size) page(s) hold real tokens (seq_lens=[T] bounds the gather loop, so
+    the unused pages are capacity, mirroring a long-context allocation with a
+    short current sequence).
     """
     from tpu_inference.kernels.mla.v2.kernel import get_kv_cache_shape
     from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 
     B, T, hidden = hidden_np.shape
     assert B == 1, "absorbed-kernel gate runs a single sequence"
+    assert T <= page_size, (
+        f"this single-page-prefill helper needs T={T} <= page_size={page_size} "
+        f"(tokens are written into page 0)")
     kv_lora_rank = layer.kv_lora_rank
     qk_rope = layer.qk_rope_head_dim
 
-    page_size = 64           # one page holds all T=32 tokens
-    num_pages = 1
     cache_shape = get_kv_cache_shape(
         num_pages, page_size, kv_lora_rank + qk_rope, dtype)
     kv_cache = jnp.zeros(cache_shape, dtype=dtype)
 
+    # The single sequence's page list. For num_pages=1 this is [0] (the Task-7
+    # path); for the wide case it is arange(num_pages) so pages_per_seq spans
+    # the whole allocation.
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32)
+
     md = AttentionMetadata(
         input_positions=jnp.arange(T, dtype=jnp.int32),
-        block_tables=jnp.zeros((num_pages,), dtype=jnp.int32),
+        block_tables=block_tables,
         seq_lens=jnp.array([T], dtype=jnp.int32),
         query_start_loc=jnp.array([0, T], dtype=jnp.int32),
         request_distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
@@ -2934,3 +2973,262 @@ def test_greedy_generate_token_exact_vs_hf(mesh_1d):
     else:
         print(f"[task8] min per-step top1-top2 gap = {min_gap:.4f} ≥ 0.01 "
               f"— gate is rigorous (no near-ties).")
+
+
+# ===========================================================================
+# Phase 1a Task 9 — MEDIUM-config real-shape coverage + 1M max_model_len
+# compile variant.
+#
+# The tiny config (8 heads, hidden=512, 8 experts/top-2, page_size=16) never
+# reaches the PRODUCTION shapes:
+#   * 64-head MLA attention (head reshape/tiling at the real head count);
+#   * a NON-DEGENERATE MoE (top-8-of-16 routed experts, not top-2-of-8);
+#   * the MLA fast-masking path that triggers on ``bkv_sz % 128 == 0``
+#     (page_size=128 => bkv%128==0), which tiny's page_size=16 never hits.
+#
+# Task 9 re-runs the two load-bearing fp32 gates on the MEDIUM config
+# (heads=64, hidden=6144, n_routed_experts=16, num_experts_per_tok=8,
+# moe_intermediate=512, layers=6) at seq=8 < index_topk=2048 (DSA dense
+# identity, §A5):
+#   (1) the Task-6 full-forward fp32 MATH gate vs HF eager;
+#   (2) the Task-7 absorbed-kernel fp32 ALGEBRA gate vs the jnp-ref,
+#       with page_size=128 so the MLA fast-masking path is exercised.
+# Both at maxabs < 1e-3.
+#
+# §H11a caveat: random weights buy SHAPE coverage, NOT real-weight selection
+# fidelity (the router's top-8-of-16 selection is exercised for SHAPE/wiring,
+# but a random-weight config does not validate that the SELECTED experts match
+# a real checkpoint's — that is real-weight loading, Phase 1b+).
+#
+# Then a 1M ``max_position_embeddings`` compile variant first-contacts the
+# production wide-context paths:
+#   * the FULL-WIDTH RoPE sin/cos table at near-1M positions (DRIVABLE from
+#     the harness — the table is built per-forward from the ``positions``
+#     array, so passing near-1M positions materializes the real-scale table);
+#   * the wide ``pages_per_seq`` MLA kernel program (DRIVABLE from the harness
+#     by allocating a large paged KV cache + block_tables, as the Task-7 test
+#     did with num_pages=1 — ``pages_per_seq`` is ``num_page_indices //
+#     max_num_seqs``, derived from the block_tables shape the caller allocates,
+#     NOT from any upstream vLLM CacheConfig).
+# Gate = COMPILES + finite output (the near-1M RoPE NUMERICS are already
+# bit-for-bit covered by Task 2; the small-position parity by the gates above).
+# ===========================================================================
+
+_MEDIUM_SEQ = 8   # << index_topk=2048 so DSA is the dense identity (§A5)
+
+
+def test_medium_full_forward_fp32_math_gate(mesh_1d):
+    """MEDIUM full GLM forward (jnp-ref MLA) == HF eager, logits maxabs < 1e-3.
+
+    The Task-6 end-to-end assembly gate re-parametrized for the MEDIUM config
+    (heads=64, hidden=6144, n_routed_experts=16, num_experts_per_tok=8,
+    moe_intermediate=512, layers=6), seq=8 < index_topk=2048 (DSA dense
+    identity, §A5). This exercises the 64-head MLA reshape and the
+    NON-DEGENERATE top-8-of-16 MoE gmm path that the tiny config never reaches.
+
+    assert_identical_weights runs FIRST (converter output vs an INDEPENDENT
+    raw-HF->JAX ground-truth rebuild) so a converter bug trips before the
+    forward and the parity reflects the two implementations.
+
+    §H11a: random weights buy SHAPE coverage only — this validates the 64-head
+    / non-degenerate-MoE WIRING + algebra, NOT that the routed-expert SELECTION
+    matches a real checkpoint (that needs real weights, Phase 1b+).
+    """
+    cfg = medium_glm_moe_dsa_config()
+    (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+     hf_model) = _build_full_forward_fixture(
+         mesh_1d, seed=0, T=_MEDIUM_SEQ, cfg=cfg)
+
+    # --- assert_identical_weights FIRST (independent ground truth) -----------
+    ground_truth = _hf_ground_truth_jax_weights(hf_model, cfg)
+    loaded_jax = {k: np.asarray(v) for k, v in jax_weights.items()}
+    assert_identical_weights(loaded_jax, ground_truth, atol=1e-9)
+    assert set(loaded_jax) == set(ground_truth)
+    for k in ground_truth:
+        assert float(np.max(np.abs(
+            loaded_jax[k].astype(np.float64)
+            - ground_truth[k].astype(np.float64)))) == 0.0, (
+            f"converter weight {k!r} differs elementwise from raw-HF ground "
+            f"truth (transpose/split/drop bug)")
+
+    # --- DSA dense regime: seq < index_topk so the indexer is identity ------
+    assert ids_jax.shape[1] < cfg.index_topk, (
+        "medium full-forward fp32 gate must run in the DSA dense-equivalent "
+        f"regime (seq={ids_jax.shape[1]} < index_topk={cfg.index_topk})")
+    # Sanity: the medium config really does exercise 64 heads + non-deg MoE.
+    assert cfg.num_attention_heads == 64
+    assert cfg.n_routed_experts == 16 and cfg.num_experts_per_tok == 8
+
+    with jax.default_matmul_precision("highest"):
+        _, hidden, _, _ = model([], ids_jax, positions_jax)
+        jax_logits = model.compute_logits(hidden)
+    jax_logits_np = np.asarray(jax_logits).astype(np.float32)
+
+    assert jax_logits_np.shape == hf_logits_np.shape, (
+        f"logits shape mismatch: jax={jax_logits_np.shape} "
+        f"hf={hf_logits_np.shape}")
+    assert np.isfinite(jax_logits_np).all(), "JAX logits are not finite"
+
+    delta = maxabs(hf_logits_np, jax_logits_np)
+    print(f"\n[task9 medium math] full-forward fp32 logits maxabs = {delta:.6e}")
+    assert delta < 1e-3, (
+        f"MEDIUM full-forward fp32 logits maxabs={delta:.3e} >= 1e-3 (MATH "
+        f"gate). 64-head / non-degenerate-MoE shapes diverge from HF — this is "
+        f"an ASSEMBLY/shape bug surfaced only at the real head count or the "
+        f"top-8-of-16 MoE. Do NOT loosen the tolerance.")
+
+
+def test_medium_absorbed_kernel_fp32_algebra_gate(mesh_1d):
+    """MEDIUM absorbed mla/v2 kernel (fp32) == jnp-ref(fp32), maxabs < 1e-3.
+
+    The Task-7 absorption-equivalence gate re-parametrized for the MEDIUM
+    config at seq=8, with page_size=128 (MEDIUM_PAGE_SIZE). page_size=128
+    makes ``bkv_sz % 128 == 0``, which triggers the MLA kernel's fast-masking
+    path that the tiny config's page_size=16 never reaches. 64-head absorption
+    (k_up/v_up over 64 heads) is also first-contacted here.
+
+    A pass < 1e-3 proves the W_UK/W_UV absorption + the fast-masked kernel
+    reproduce the non-absorbed jnp-ref at the production head count. Debug, do
+    not loosen, on failure.
+    """
+    cfg = medium_glm_moe_dsa_config()
+    cfg, hidden_np, cos_np, sin_np, jax_w = _build_absorbed_kernel_inputs(
+        cfg=cfg, T=_MEDIUM_SEQ)
+
+    layer = _make_glm_mla_kernel_layer(
+        cfg, jax_w, mesh_1d, dtype=jnp.float32,
+        s_dtype=jnp.float32, p_same_dtype_as_v=False,
+        two_step_flash_attention=True)
+    # page_size=128 (MEDIUM_PAGE_SIZE): bkv_sz%128==0 -> MLA fast-masking path.
+    absorbed = _run_absorbed_kernel(layer, hidden_np, cos_np, sin_np,
+                                    dtype=jnp.float32,
+                                    page_size=MEDIUM_PAGE_SIZE)
+
+    ref = _jnp_ref_output(cfg, jax_w, hidden_np, cos_np, sin_np,
+                          dtype=jnp.float32)
+
+    delta = maxabs(ref, absorbed)
+    print(f"\n[task9 medium kernel-algebra fp32] absorbed-kernel vs jnp-ref "
+          f"maxabs = {delta:.6e}  (page_size={MEDIUM_PAGE_SIZE}, heads="
+          f"{cfg.num_attention_heads})")
+    assert delta < 1e-3, (
+        f"MEDIUM absorbed mla/v2 kernel (fp32) vs jnp-ref(fp32) "
+        f"maxabs={delta:.3e} >= 1e-3 — the absorption or the bkv%128 "
+        f"fast-masking path diverges at the 64-head shape. Debug; do NOT "
+        f"loosen.")
+
+
+# --- 1M max_position_embeddings compile variant -----------------------------
+
+def test_medium_1m_config_sets_max_position_embeddings():
+    """The 1M variant helper builds a medium config with 1M max_position_embeddings.
+
+    Pure-config smoke (no device): confirms the harness 1M-variant helper plumbs
+    ``max_position_embeddings=1_048_576`` while leaving the medium per-layer dims
+    intact (so the wide-context variant tests the SAME shapes as the medium
+    gates, only with the long-context knob set).
+    """
+    cfg = medium_1m_glm_moe_dsa_config()
+    assert cfg.max_position_embeddings == MEDIUM_1M_MAX_POS == 1_048_576
+    # Medium per-layer dims unchanged.
+    assert cfg.num_attention_heads == 64
+    assert cfg.hidden_size == 6144
+    assert cfg.n_routed_experts == 16 and cfg.num_experts_per_tok == 8
+    assert cfg.index_topk == 2048
+
+
+def test_medium_1m_full_forward_rope_width_compiles_and_finite(mesh_1d):
+    """1M VARIANT (part A): full-width RoPE table at near-1M positions compiles + finite.
+
+    FIRST-CONTACTS the production full-width RoPE sin/cos table. The table is
+    built per-forward from the ``positions`` array (build_rope_cos_sin_np), so
+    feeding near-1M positions materializes the real-scale RoPE table inside the
+    full jnp-ref forward — the exact path production hits at 1M context.
+
+    Gate = COMPILES + finite logits (NOT a numeric-parity gate): the near-1M
+    RoPE NUMERICS are already bit-for-bit covered by Task 2
+    (test_rope_mla_interleaved_parity_near_1m). seq is kept short (8 tokens at
+    near-1M positions) so the forward stays fast; the point is the RoPE-table
+    WIDTH/position magnitude, not a long sequence.
+
+    NOTE (honest coverage): this drives the RoPE-table-width production path. It
+    does NOT exercise the wide paged-KV-cache program (that is part B / the
+    absorbed-kernel path). The jnp-ref full-forward path carries no paged KV
+    cache (Phase-1a dense-equivalent recompute).
+    """
+    cfg = medium_1m_glm_moe_dsa_config()
+    T = _MEDIUM_SEQ
+    assert T < cfg.index_topk, "must stay in the DSA dense-equivalent regime"
+
+    # Build the 1M-variant model (same weights load path as the medium gate).
+    (cfg, model, ids_jax, _positions_default, _hf_logits_np, _jax_weights,
+     _hf_model) = _build_full_forward_fixture(
+         mesh_1d, seed=0, T=T, cfg=cfg, run_hf=False)
+
+    # NEAR-1M positions: this is what forces the full-width RoPE table. Use the
+    # last T positions of the 1M context window (descending from the max index).
+    max_pos = cfg.max_position_embeddings - 1   # 1_048_575
+    positions_1m = jnp.asarray(
+        np.arange(max_pos - T + 1, max_pos + 1, dtype=np.int32))
+    assert int(positions_1m[-1]) == max_pos, "must touch the 1M ceiling"
+
+    with jax.default_matmul_precision("highest"):
+        _, hidden, _, _ = model([], ids_jax, positions_1m)
+        jax_logits = model.compute_logits(hidden)
+    jax_logits_np = np.asarray(jax_logits).astype(np.float32)
+
+    print(f"\n[task9 1M rope-width] near-1M positions {int(positions_1m[0])}.."
+          f"{int(positions_1m[-1])} -> logits shape {jax_logits_np.shape}, "
+          f"finite={bool(np.isfinite(jax_logits_np).all())}")
+    assert jax_logits_np.shape == (1, T, cfg.vocab_size)
+    assert np.isfinite(jax_logits_np).all(), (
+        "1M-position full-width RoPE forward produced non-finite logits — the "
+        "full-width RoPE table or downstream forward broke at near-1M positions")
+
+
+def test_medium_1m_absorbed_kernel_wide_cache_compiles_and_finite(mesh_1d):
+    """1M VARIANT (part B): wide pages_per_seq paged-KV-cache MLA program compiles + finite.
+
+    FIRST-CONTACTS the wide ``pages_per_seq`` MLA kernel program. ``pages_per_seq``
+    = ``num_page_indices // max_num_seqs`` is derived from the block_tables shape
+    the CALLER allocates (not from any upstream vLLM CacheConfig), so the harness
+    can drive it directly: allocate a paged KV cache + block_tables sized for a
+    near-1M context at page_size=128 (1_048_576 / 128 = 8192 pages_per_seq).
+
+    HBM guard: a 1M-context cache at page_size=128, kv_dim=576 in fp32 is
+    ~8192 * 128 * 576 * 4 B ≈ 2.4 GB — feasible on one v6e chip, but we use a
+    bf16 cache (~1.2 GB) to keep margin. The actual tokens written are only the
+    seq=8 prefill; the remaining pages are unused capacity, exactly mirroring a
+    real long-context allocation with a short current sequence.
+
+    Gate = COMPILES + finite output. This is the COMPILE-coverage variant; the
+    fp32 absorption NUMERICS at this head shape are covered by
+    test_medium_absorbed_kernel_fp32_algebra_gate. We assert the kernel runs
+    end-to-end on a 8192-page-per-seq allocation without OOM/assert.
+    """
+    cfg = medium_1m_glm_moe_dsa_config()
+    T = _MEDIUM_SEQ
+    cfg, hidden_np, cos_np, sin_np, jax_w = _build_absorbed_kernel_inputs(
+        cfg=cfg, T=T)
+
+    # bf16 cache to keep HBM margin at the 1M allocation.
+    layer = _make_glm_mla_kernel_layer(
+        cfg, jax_w, mesh_1d, dtype=jnp.bfloat16,
+        s_dtype=jnp.bfloat16, p_same_dtype_as_v=True,
+        two_step_flash_attention=True)
+
+    # pages_per_seq = 1_048_576 / page_size(128) = 8192 (the production width).
+    pages_per_seq = cfg.max_position_embeddings // MEDIUM_PAGE_SIZE
+    assert pages_per_seq == 8192, f"expected 8192 pages, got {pages_per_seq}"
+
+    out = _run_absorbed_kernel(
+        layer, hidden_np, cos_np, sin_np, dtype=jnp.bfloat16,
+        page_size=MEDIUM_PAGE_SIZE, num_pages=pages_per_seq)
+
+    print(f"\n[task9 1M wide-cache] pages_per_seq={pages_per_seq} "
+          f"page_size={MEDIUM_PAGE_SIZE} bf16 cache -> out shape {out.shape}, "
+          f"finite={bool(np.isfinite(out).all())}")
+    assert out.shape == (T, cfg.hidden_size)
+    assert np.isfinite(out).all(), (
+        "wide pages_per_seq=8192 MLA kernel produced non-finite output — the "
+        "wide-cache program broke at the 1M allocation")
