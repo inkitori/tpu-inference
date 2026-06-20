@@ -14,7 +14,7 @@
 """Phase 0 test harness for GLM 5.2 (GlmMoeDsa) bring-up.
 
 This module is the shared scaffolding for the GLM/DSA validation ladder
-(spec `docs/superpowers/specs/2026-06-19-glm5.2-dsa-jax-tpu-design.md`, §6/§7):
+(spec `docs/superpowers/specs/glm5.2-dsa/` — see `phases/phase-0.md` + `core.md` §H):
 
   * `tiny_glm_moe_dsa_config` - a min-viable `GlmMoeDsaConfig` that still
     exercises every real code path (>=1 dense + >=1 MoE layer, >=1 "full" and

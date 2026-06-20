@@ -4,7 +4,8 @@ This fork (`github.com:inkitori/tpu-inference`) is being used to bring up **GLM 
 (`GlmMoeDsaForCausalLM`, DeepSeek-V3.2-style MLA + DSA) as a native-JAX model on TPU.**
 
 **Authoritative design spec** (read first for any GLM 5.2 / DSA work):
-`docs/superpowers/specs/2026-06-19-glm5.2-dsa-jax-tpu-design.md`
+`docs/superpowers/specs/glm5.2-dsa/` — start at `README.md`, then `core.md` + the relevant `phases/phase-*.md`
+(a phase worker loads `core.md` + its one phase file).
 
 Ignore what's under `docs/superpowers/research/`, that's just for my own reference.
 
