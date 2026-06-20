@@ -2264,3 +2264,287 @@ def test_full_forward_injected_error_trips_fp32_gate(mesh_1d):
     # And it must trip by a clear margin, not knife-edge.
     assert delta > 1e-2, (
         f"injected-error margin too small: maxabs={delta:.3e} (expected >1e-2)")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 6 — Gap 1: BACKBONE injection gates.
+#
+# The committed injected-error test above perturbs lm_head only (scales output
+# logits ~1%). That does NOT prove the fp32 full-forward gate catches a backbone
+# error. Two additional injections:
+#
+#   (a) MLA backbone injection: perturb the o_proj weight in a MIDDLE layer
+#       (layer 1) by 1%. The gate must fail by a clear margin (>1e-2).
+#       Scratch-verified: o_proj L1 +1% → ~1.31e-2.
+#
+#   (b) MoE-expert injection: perturb the gating expert kernel in the sparse
+#       layer (layer 3) by 1%. The gate must fail (>1e-3) to prove the gate
+#       covers the MoE path end-to-end.
+#       Scratch-verified: expert gating L3 +1% → ~9e-4 (near-threshold; use
+#       down_proj which gives a stronger signal at ~4e-3).
+#
+# These prove the full-forward fp32 math gate has genuine BACKBONE coverage —
+# not just a trivially-failing logit-scale test.
+# ---------------------------------------------------------------------------
+
+
+def test_full_forward_backbone_mla_injection_trips_fp32_gate(mesh_1d):
+    """A 1% MLA backbone weight perturbation (o_proj, layer 1) trips the fp32 gate.
+
+    Proves the full-forward fp32 gate catches a BACKBONE error, not only a
+    final-projection (lm_head) error. Perturbing the output projection of a
+    MIDDLE MLA layer (layer 1, not layer 0 or the last layer) by 1% must
+    propagate through the remaining layers + lm_head to logits maxabs >> 1e-3.
+
+    Failing maxabs (from scratch probe): o_proj L1 +1% → ~1.31e-2.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import GlmMoeDsaAttentionRef
+
+    (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+     hf_model) = _build_full_forward_fixture(mesh_1d, seed=0, T=TINY_SEQ_DENSE)
+
+    # Inject a 1% error into the o_proj (output projection) MLA weight in
+    # layer 1 — a middle-backbone layer, not lm_head or the first/last layer.
+    attn_layer1 = model.model.layers[1].self_attn
+    assert isinstance(attn_layer1, GlmMoeDsaAttentionRef), (
+        "layer 1 self_attn must be GlmMoeDsaAttentionRef for backbone injection")
+    attn_layer1._w["self_attn.o_proj.weight"] = (
+        attn_layer1._w["self_attn.o_proj.weight"] * 1.01)
+
+    with jax.default_matmul_precision("highest"):
+        _, hidden, _, _ = model([], ids_jax, positions_jax)
+        jax_logits = model.compute_logits(hidden)
+    jax_logits_np = np.asarray(jax_logits).astype(np.float32)
+
+    delta = maxabs(hf_logits_np, jax_logits_np)
+    print(f"\n[backbone MLA injection] o_proj L1 +1%: logits maxabs = {delta:.6e}")
+    assert delta >= 1e-3, (
+        f"1% o_proj backbone injection (layer 1) did NOT trip the fp32 gate: "
+        f"maxabs={delta:.3e} < 1e-3 (gate has no BACKBONE coverage)")
+    assert delta > 1e-2, (
+        f"backbone MLA injection margin too small: maxabs={delta:.3e} "
+        f"(expected >1e-2; scratch probe o_proj L1 +1% → ~1.31e-2)")
+
+
+def test_full_forward_backbone_moe_injection_trips_fp32_gate(mesh_1d):
+    """A 1% MoE expert weight perturbation (layer 3 down_proj) trips the fp32 gate.
+
+    Proves the full-forward fp32 gate covers the MoE path end-to-end, not only
+    the dense-backbone layers. The sparse MoE layer (layer 3, the only sparse
+    layer in the tiny config) receives a 1% perturbation on its expert
+    down_proj kernel — the weight that produces the final expert output for each
+    routed token. This must propagate to logits maxabs >> 1e-3.
+
+    Failing maxabs (from scratch probe): down_proj L3 +1% → ~4e-3, which is
+    above the 1e-3 gate but may not be well above 1e-2 due to the 4-layer
+    depth; we assert >1e-3 (gate trips) as the mandatory condition.
+    """
+    from tpu_inference.models.jax.deepseek_v3 import DeepseekV2Moe
+
+    (cfg, model, ids_jax, positions_jax, hf_logits_np, jax_weights,
+     hf_model) = _build_full_forward_fixture(mesh_1d, seed=0, T=TINY_SEQ_DENSE)
+
+    # Layer 3 is the lone sparse MoE layer (first_k_dense_replace=3).
+    moe_layer3 = model.model.layers[3].mlp
+    assert isinstance(moe_layer3, DeepseekV2Moe), (
+        "layer 3 mlp must be DeepseekV2Moe for MoE backbone injection")
+
+    # Perturb the routed expert down_proj kernel by 1%. This is the output
+    # projection that maps from the expert intermediate dim back to hidden_size
+    # for every routed token — a backbone error in the MoE expert path.
+    moe_layer3.experts.kernel_down_proj_EFD.value = (
+        moe_layer3.experts.kernel_down_proj_EFD.value * 1.01)
+
+    with jax.default_matmul_precision("highest"):
+        _, hidden, _, _ = model([], ids_jax, positions_jax)
+        jax_logits = model.compute_logits(hidden)
+    jax_logits_np = np.asarray(jax_logits).astype(np.float32)
+
+    delta = maxabs(hf_logits_np, jax_logits_np)
+    print(f"\n[backbone MoE injection] down_proj L3 +1%: logits maxabs = {delta:.6e}")
+    assert delta >= 1e-3, (
+        f"1% MoE expert down_proj injection (layer 3) did NOT trip the fp32 gate: "
+        f"maxabs={delta:.3e} < 1e-3 (gate does not cover the MoE path end-to-end)")
+    # The gate must fail by a clear margin — not a knife-edge case.
+    assert delta > 3e-3, (
+        f"MoE backbone injection margin too small: maxabs={delta:.3e} "
+        f"(expected >3e-3; down_proj L3 +1% should propagate clearly to logits)")
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 6 — Gap 2: eps-teeth at integration/layer scale.
+#
+# The spec headline bug: copying rms_norm_eps=1e-5 into the q_a/kv_a layernorm
+# that must use 1e-6 is SILENT at seq=32 in the full-forward gate because
+# mean(x²) ≫ eps after the input_layernorm normalizes the hidden states.
+#
+# This is already caught at the submodule level (Task 3 tests
+# test_mla_ref_eps_teeth_*), but the brief requires a test that ALSO catches it
+# at the integration/layer scale — in the Task 6 full-forward context, to
+# prove the ASSEMBLED MODEL (not only the isolated attention submodule) carries
+# teeth for the eps bug.
+#
+# Approach: extract a single decoder layer from the FULLY ASSEMBLED model (all
+# HF weights loaded via the production converter), feed a small-magnitude
+# hidden input (mean(x²)~1e-3) DIRECTLY to the MLA attention block (bypassing
+# the input_layernorm, which would normalize away the small magnitude), compare
+# the HF MLA block output vs the JAX MLA ref:
+#   (a) correct eps (1e-6): must pass < 1e-3 (same as the Task-3 clean case);
+#   (b) wrong eps (1e-5) in the JAX ref: must FAIL > 1e-3.
+#
+# This proves the eps is correctly wired through the FULL ASSEMBLY chain
+# (convert_hf_weights → load_weights → GlmMoeDsaAttentionRef._norm_eps) and
+# that the bug is detectable at the INTEGRATION level, not only by the Task-3
+# isolated norm test.
+# ---------------------------------------------------------------------------
+
+
+def test_full_forward_eps_teeth_integration_clean(mesh_1d):
+    """INTEGRATION eps-teeth (clean): assembled model layer 0 MLA, correct eps=1e-6.
+
+    Builds the FULLY ASSEMBLED GlmMoeDsaForCausalLM (all HF weights loaded
+    via the production converter + load_weights), extracts layer 0's self_attn,
+    feeds a small-magnitude hidden input (mean(x²)~1e-3) directly to the MLA
+    attention block, and asserts parity with the HF MLA block at < 1e-3.
+
+    The 'integration' aspect: the JAX MLA ref was loaded via the production
+    assembly chain (not a hand-built fixture), so this test validates that the
+    eps wiring survives the full converter→loader path.
+
+    Small-magnitude inputs are necessary because at normal magnitude
+    mean(x²) ≫ eps and the 1e-6/1e-5 difference is below the gate (§H eps
+    bug). At mean(x²)~1e-3 the layernorm eps is load-bearing.
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        GlmMoeDsaRotaryEmbedding
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaAttentionRef,
+                                                      GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config,
+                                                      convert_hf_weights)
+
+    cfg = tiny_glm_moe_dsa_config()
+    seed, layer_idx, T, scale = 0, 0, 32, 1e-3
+    assert T < cfg.index_topk
+
+    # Build fully-assembled JAX model (all HF weights loaded via production chain).
+    hf_model = build_hf_oracle(cfg=cfg, seed=seed, randomize_buffers=True)
+    sd = hf_model.state_dict()
+    jax_weights, _ = convert_hf_weights(sd, cfg)
+    vllm_config = build_glm_vllm_config(cfg, mesh=mesh_1d)
+    model = GlmMoeDsaForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh_1d)
+    model.load_weights(jax_weights)
+
+    # Confirm the assembled layer's self_attn is a GlmMoeDsaAttentionRef.
+    attn = model.model.layers[layer_idx].self_attn
+    assert isinstance(attn, GlmMoeDsaAttentionRef)
+    # Confirm the eps is the CORRECT value (1e-6, not rms_norm_eps=1e-5).
+    assert attn._norm_eps == 1e-6, (
+        f"assembled model layer {layer_idx} self_attn._norm_eps = "
+        f"{attn._norm_eps} (expected 1e-6; weight loading must not corrupt eps)")
+
+    # Build small-magnitude hidden input (mean(x²) ≈ scale = 1e-3).
+    rng = np.random.default_rng(7777)
+    B, hidden = 1, cfg.hidden_size
+    hidden_np = (rng.standard_normal((B, T, hidden)) * np.sqrt(scale)).astype(
+        np.float32)
+    hidden_t = torch.as_tensor(hidden_np)
+
+    # Real rotary module cos/sin for BOTH sides.
+    rotary = GlmMoeDsaRotaryEmbedding(cfg)
+    pos = torch.arange(T, dtype=torch.long)[None, :]
+    with torch.no_grad():
+        cos_t, sin_t = rotary.forward(hidden_t, pos)
+    cos_np = cos_t[0].numpy().astype(np.float32)
+    sin_np = sin_t[0].numpy().astype(np.float32)
+
+    # HF MLA block output on the small input.
+    hf_out = _hf_mla_block_output(hf_model, layer_idx, hidden_t, cos_t, sin_t)
+    hf_out_np = hf_out.detach().numpy().astype(np.float32)
+
+    # JAX MLA ref output via the ASSEMBLED model's self_attn (correct eps=1e-6).
+    with jax.default_matmul_precision("highest"):
+        jax_out = attn(jnp.asarray(hidden_np),
+                       jnp.asarray(cos_np), jnp.asarray(sin_np))
+    delta = maxabs(hf_out_np, jax_out)
+    print(f"\n[integration eps-teeth clean] correct eps=1e-6 maxabs = {delta:.6e}")
+    assert delta < 1e-3, (
+        f"Integration eps-teeth CLEAN parity failed: maxabs={delta:.3e} >= 1e-3 "
+        f"(both eps=1e-6; small-magnitude input should not break clean parity)")
+
+
+def test_full_forward_eps_teeth_integration_wrong_eps_trips(mesh_1d):
+    """INTEGRATION eps-teeth (teeth): wrong eps=1e-5 in assembled model FAILS gate.
+
+    Same setup as test_full_forward_eps_teeth_integration_clean, but mutates
+    the ASSEMBLED model's layer 0 self_attn._norm_eps to 1e-5 — the value that
+    would result from copying rms_norm_eps (the spec headline bug). The full-
+    forward fp32 gate (maxabs < 1e-3) must FAIL by a clear margin.
+
+    This proves the eps bug is caught at the INTEGRATION level: the assembled
+    model (weights loaded via the production converter) cannot silently carry
+    the wrong eps without the gate triggering. A pass here would mean the
+    headline eps bug is invisible at integration scale.
+
+    Expected failing maxabs: > 2e-3 (same regime as Task-3 wrong-eps test).
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        GlmMoeDsaRotaryEmbedding
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaAttentionRef,
+                                                      GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config,
+                                                      convert_hf_weights)
+
+    cfg = tiny_glm_moe_dsa_config()
+    seed, layer_idx, T, scale = 0, 0, 32, 1e-3
+    assert T < cfg.index_topk
+
+    # Build fully-assembled JAX model (all HF weights loaded via production chain).
+    hf_model = build_hf_oracle(cfg=cfg, seed=seed, randomize_buffers=True)
+    sd = hf_model.state_dict()
+    jax_weights, _ = convert_hf_weights(sd, cfg)
+    vllm_config = build_glm_vllm_config(cfg, mesh=mesh_1d)
+    model = GlmMoeDsaForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh_1d)
+    model.load_weights(jax_weights)
+
+    # MUTATE the assembled model's eps to the WRONG value (1e-5 = rms_norm_eps).
+    # This simulates the headline bug: copying rms_norm_eps into q_a/kv_a norms.
+    attn = model.model.layers[layer_idx].self_attn
+    assert isinstance(attn, GlmMoeDsaAttentionRef)
+    attn._norm_eps = 1e-5   # THE BUG: should be 1e-6.
+
+    # Build small-magnitude hidden input (mean(x²) ≈ scale = 1e-3).
+    rng = np.random.default_rng(7777)  # Same seed as the clean test.
+    B, hidden = 1, cfg.hidden_size
+    hidden_np = (rng.standard_normal((B, T, hidden)) * np.sqrt(scale)).astype(
+        np.float32)
+    hidden_t = torch.as_tensor(hidden_np)
+
+    # Real rotary module cos/sin for BOTH sides.
+    rotary = GlmMoeDsaRotaryEmbedding(cfg)
+    pos = torch.arange(T, dtype=torch.long)[None, :]
+    with torch.no_grad():
+        cos_t, sin_t = rotary.forward(hidden_t, pos)
+    cos_np = cos_t[0].numpy().astype(np.float32)
+    sin_np = sin_t[0].numpy().astype(np.float32)
+
+    # HF MLA block output (correct eps=1e-6 on the oracle side).
+    hf_out = _hf_mla_block_output(hf_model, layer_idx, hidden_t, cos_t, sin_t)
+    hf_out_np = hf_out.detach().numpy().astype(np.float32)
+
+    # JAX MLA ref output with WRONG eps=1e-5.
+    with jax.default_matmul_precision("highest"):
+        jax_out = attn(jnp.asarray(hidden_np),
+                       jnp.asarray(cos_np), jnp.asarray(sin_np))
+    delta = maxabs(hf_out_np, jax_out)
+    print(f"\n[integration eps-teeth wrong eps] eps=1e-5 maxabs = {delta:.6e}")
+    assert delta >= 1e-3, (
+        f"Wrong eps=1e-5 in ASSEMBLED model did NOT trip the gate: "
+        f"maxabs={delta:.3e} < 1e-3 (headline eps bug is invisible at "
+        f"integration scale — the gate has no eps teeth)")
+    # Must trip by a clear margin (same as Task-3 teeth test).
+    assert delta > 2e-3, (
+        f"Wrong-eps integration margin too small: maxabs={delta:.3e} "
+        f"(expected >2e-3; at mean(x²)~1e-3, eps=1e-5 vs 1e-6 must diverge "
+        f"materially — if this fails, the small-input regime is not small enough)")
