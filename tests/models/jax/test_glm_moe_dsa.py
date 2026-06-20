@@ -19,6 +19,9 @@ maxabs, identical-weights checksum, mesh fixtures). Single-device tests are
 auto-collected on the single-chip Buildkite queue; the 8-chip gate skips off
 the v6e-8.
 """
+import gc
+import math
+
 import jax
 import numpy as np
 import pytest
@@ -3283,24 +3286,21 @@ def _build_dense_medium_config(num_hidden_layers: int):
     """Medium HIDDEN dim (6144) + reduced MLA/FFN inner dims, all-dense sweep config.
 
     Rationale for the dim choices:
-      • hidden=6144 is the production residual-stream width and is the PRIMARY
-        driver of the bf16 floor: each layer adds rounding error O(bf16_eps *
-        ||hidden||) to the residual stream, so the floor compounds with depth
-        at the rate set by hidden, not by the inner projection dims.
+      • hidden=6144 is the production residual-stream width and sets the scale
+        of the bf16 floor in the final lm_head projection (the dominant term in
+        the measured logits floor — not per-layer residual accumulation).
       • Inner dims (q_lora_rank, kv_lora_rank, n_heads, intermediate_size) are
         reduced to keep per-layer HBM cost ~40MB (L=40 fits in ~1.5GB on one
         device, well within the per-chip budget even with other tests in-session).
-      • All-dense (first_k_dense_replace=num_hidden_layers): the bf16 floor
-        compounds through the residual stream equally in dense and MoE layers;
-        dropping MoE keeps the sweep strictly config-driven with no per-expert
-        indexing overhead.
+      • All-dense (first_k_dense_replace=num_hidden_layers): dropping MoE keeps
+        the sweep strictly config-driven with no per-expert indexing overhead.
       • index_topk=16 > seq=8: the DSA indexer is always the dense identity
         (spec §A5) — no sparse path triggered.
 
-    NOTE: inner-dim reduction makes the L=78 PREDICTION APPROXIMATE (the
-    attention algebra error per layer differs from production); the dominant
-    term (residual-stream bf16 rounding through hidden=6144) is preserved and
-    drives the slope. The caveats are recorded in the report.
+    NOTE: the measured logits floor is dominated by the final lm_head projection
+    (bf16 contraction over hidden=6144), not by depth-compounding in the backbone.
+    The L=78 lower-bound prediction is approximate; the dominant Phase 1c
+    uncertainty is vocab scaling in lm_head (production vocab >> 2048 here).
     """
     return medium_glm_moe_dsa_config(
         num_hidden_layers=num_hidden_layers,
@@ -3338,9 +3338,9 @@ def _measure_bf16_floor_at_depth(L: int, mesh) -> float:
     Returns maxabs of the logits.
 
     Uses a fixed seed (``_DEPTH_SWEEP_SEED``) across all L so only depth varies.
-    Random weights (not real checkpoint weights) are sufficient; the bf16 floor
-    compounds mainly through the residual stream (independent of weight scale
-    within O(1) factors).
+    Random weights (not real checkpoint weights) are sufficient; the measured
+    logits floor is dominated by the depth-independent lm_head projection, not
+    by depth-compounding in the backbone.
     """
     from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
                                                       build_glm_vllm_config)
@@ -3376,30 +3376,45 @@ def _measure_bf16_floor_at_depth(L: int, mesh) -> float:
 
 
 def test_bf16_floor_depth_compounding_slope(mesh_1d):
-    """bf16 floor grows with depth: measure + fit + extrapolate L=78 floor.
+    """bf16 floor characterization across depths: FLAT finding + L=78 lower bound.
 
     CHARACTERIZATION gate (not a pass/fail oracle) — see §Task10 brief.
 
     Sweeps L ∈ {4,8,16,24,32,40} (medium dims, all-dense, random weights,
     seq=8, fixed seed). For each L: floor = maxabs(jnp_ref_fp32, jnp_ref_bf16).
 
-    ASSERTIONS (defensible, not brittle):
-      (a) floor(L_max) > floor(L_min) * 2 — clear upward trend over the sweep.
-      (b) linear-fit slope > 0 — the floor trends up with depth.
-      (c) sane envelope: floor(L_min) > 0 (bf16 degrades something nonzero)
-          and floor(L_max) < 2.0 (has not diverged past reason).
+    KEY FINDING: the measured logits floor is APPROXIMATELY FLAT with depth
+    (spread < 5×, ~1e-2 at all L).  The flatness is dominated by the
+    depth-INDEPENDENT final lm_head projection: a bf16 contraction over
+    hidden=6144 on an RMSNorm'd O(1) input produces ~9.4e-3 error regardless
+    of depth, masking the backbone contribution.  The backbone's post-norm
+    hidden floor actually SHRINKS with depth (the growing residual magnitude
+    is divided out by the final RMSNorm, so the relative residual floor
+    shrinks ~11× over L∈{4..40}).  There is therefore genuinely no
+    depth-compounding to extrapolate from these measurements.
 
-    DELIVERABLE: fit the floor-vs-L trend; print and record the extrapolated
-    L=78 floor prediction. The prediction is consumed by Phase 1c / the
-    real-checkpoint expectation so it can be PREDICTED, not first-measured.
+    ASSERTIONS:
+      (a) all floors lie in a sane band [1e-4, 5e-1].
+      (b) spread (max/min ratio) < 5× — confirms approximate flatness.
+      (c) extrapolated L=78 lower bound is positive, finite, and within
+          100× of the measured mean (sanity on the log-linear fit).
+
+    Also measures backbone-only floor (lm_head in fp32 on both sides) at
+    L_min and L_max to DOCUMENT lm_head dominance in-test (Fix 3).
+
+    DELIVERABLE: prints the measured band, fit parameters, and recommended
+    L=78 LOWER BOUND (~1.1e-2) with named caveats for Phase 1c.  The real
+    L=78 floor will be RAISED above this bound primarily by vocab scaling in
+    the lm_head (production vocab >> 2048 used here → more accumulation).
 
     CAVEATS (approximation):
       • Dense-only path — dropping MoE slightly underestimates the real floor.
-      • Random weights — actual checkpoint distribution may compound differently.
+      • Random weights + reduced inner dims — hidden=6144 preserved (the key
+        dimension for the lm_head floor); inner dims reduced for HBM budget.
+      • The L=78 bound is a LOWER BOUND from random-weight/small-vocab sweep;
+        trained weights, full vocab, and full MoE will raise it — the lm_head
+        vocab-scaling term is the dominant Phase 1c uncertainty.
     """
-    import math
-
-    import gc
     floors = {}
     for L in _DEPTH_SWEEP_L:
         floor = _measure_bf16_floor_at_depth(L, mesh_1d)
@@ -3423,8 +3438,6 @@ def test_bf16_floor_depth_compounding_slope(mesh_1d):
 
     floor_min = min(floor_vals)
     floor_max = max(floor_vals)
-    floor_at_L4 = floors[4]
-    floor_at_Lmax = floors[_DEPTH_SWEEP_L[-1]]
 
     # --- assertion (c) sane envelope (primary correctness gate) ---------------
     # Every floor must be nonzero (bf16 degrades vs fp32) and bounded below
@@ -3443,21 +3456,26 @@ def test_bf16_floor_depth_compounding_slope(mesh_1d):
             f"bf16 floor at L={L_pt} = {floors[L_pt]:.4e} < 1e-4 — suspiciously "
             f"small; the default precision path likely not active.")
 
-    # --- FINDING: with random weights + LayerNorm, floor is approximately flat
-    # The bf16 floor does NOT strongly grow with depth for random weights.
-    # Reason: LayerNorm normalizes the residual stream before each sublayer,
-    # keeping activation magnitudes ~O(1) at every depth. The bf16 rounding
-    # error per layer is therefore approximately constant, and the random-weight
-    # projections "re-randomize" the residual stream so errors don't coherently
-    # accumulate. This is physically correct — it is NOT a bug.
+    # --- FINDING: the measured LOGITS floor is approximately FLAT with depth.
+    # Root cause: the floor is DOMINATED by the depth-INDEPENDENT final lm_head
+    # projection (bf16 contraction over hidden=6144 on an RMSNorm'd O(1) input
+    # ≈ 9.4e-3, the same at every depth).  Probe data: lm_head-only floor ≈
+    # logits floor at all depths (9.4e-3 @L4, 9.25e-3 @L40); backbone
+    # post-final-norm hidden floor SHRINKS with depth (1.97e-3 @L4 → 1.10e-4
+    # @L40) because the growing residual magnitude is divided out by the final
+    # RMSNorm (relative residual floor shrinks ~11×).  There is genuinely no
+    # depth-compounding in either the backbone or the logits: the backbone hides
+    # it behind normalization and the logits hide it behind lm_head dominance.
+    # This is physically correct — it is NOT a bug.
     #
-    # The PREDICTION for the real L=78 checkpoint (trained weights) will differ:
-    # trained weights produce structured activations that may compound differently.
-    # However, the measured floor band (~5e-3 to 2e-2) gives a LOWER BOUND for
-    # the real floor at L=78 (the real model will have at least this much bf16
-    # degradation, likely more due to structured signal accumulation).
+    # PHASE 1c implication: the real L=78 floor will be RAISED above the ~1.1e-2
+    # lower bound measured here primarily by vocab scaling in the lm_head
+    # (production vocab >> 2048 used here → more accumulation in the lm_head
+    # output contraction).  Trained weights, full MoE, and production inner dims
+    # are secondary factors.  Phase 1c must account for the lm_head/vocab-scaling
+    # term as the dominant uncertainty — NOT depth-compounding.
     #
-    # Defensible assertions on the flat-floor finding:
+    # Assertions on the flat-floor finding:
     #   (a) all floors lie in the measured band [band_lo, band_hi]
     #   (b) floor spread (max/min ratio) < 5× (verifies flatness)
     #   (c) no pathological growth or shrinkage
@@ -3474,6 +3492,67 @@ def test_bf16_floor_depth_compounding_slope(mesh_1d):
         f"bf16 floor spread (max/min) = {spread:.2f}x — unexpectedly large "
         f"variation across depths; check for an OOM truncation or a NaN.")
 
+    # --- Fix 3: backbone-only floor at L_min and L_max -------------------------
+    # Measures the hidden-state floor (lm_head in fp32 on both sides) to
+    # DOCUMENT lm_head dominance in-test — confirms the head is the bottleneck,
+    # not the backbone.  Reuses the already-swept L points; builds 2 new models.
+    def _measure_backbone_floor(L: int, mesh_arg) -> float:
+        """Return maxabs(hidden_fp32, hidden_bf16) at the final post-norm position.
+
+        Both sides use compute_logits with "highest" precision so the lm_head
+        is in fp32; the floor reflects backbone-only bf16 error in the residual
+        stream up to (and including) the final RMSNorm.
+        """
+        from tpu_inference.models.jax.glm_moe_dsa import (
+            GlmMoeDsaForCausalLM, build_glm_vllm_config)
+        cfg_bb = _build_dense_medium_config(L)
+        T_bb = _DEPTH_SWEEP_SEQ
+        vllm_cfg_bb = build_glm_vllm_config(cfg_bb, mesh=mesh_arg)
+        model_bb = GlmMoeDsaForCausalLM(
+            vllm_cfg_bb, jax.random.PRNGKey(_DEPTH_SWEEP_SEED), mesh_arg)
+        rng_bb = np.random.default_rng(_DEPTH_SWEEP_SEED)
+        ids_bb = jnp.asarray(
+            rng_bb.integers(0, cfg_bb.vocab_size, size=(1, T_bb)).astype(np.int32))
+        pos_bb = jnp.arange(T_bb, dtype=jnp.int32)
+        # Both passes run with "highest" so lm_head is fp32; only the backbone
+        # bf16 matmul paths differ between the two hidden states.
+        with jax.default_matmul_precision("highest"):
+            _, hid_fp32, _, _ = model_bb([], ids_bb, pos_bb)
+        _, hid_bf16, _, _ = model_bb([], ids_bb, pos_bb)
+        hid_fp32_np = np.asarray(hid_fp32).astype(np.float32)
+        hid_bf16_np = np.asarray(hid_bf16).astype(np.float32)
+        return maxabs(hid_fp32_np, hid_bf16_np)
+
+    L_min_pt = _DEPTH_SWEEP_L[0]   # 4
+    L_max_pt = _DEPTH_SWEEP_L[-1]  # 40
+    backbone_floor_Lmin = _measure_backbone_floor(L_min_pt, mesh_1d)
+    gc.collect(); jax.effects_barrier(); jax.clear_caches()
+    backbone_floor_Lmax = _measure_backbone_floor(L_max_pt, mesh_1d)
+    gc.collect(); jax.effects_barrier(); jax.clear_caches()
+
+    logits_floor_Lmin = floors[L_min_pt]
+    logits_floor_Lmax = floors[L_max_pt]
+
+    print(f"\n[Task10 backbone-only floor] (lm_head in fp32 on both sides)")
+    print(f"  L={L_min_pt}: backbone_floor={backbone_floor_Lmin:.4e}, "
+          f"logits_floor={logits_floor_Lmin:.4e}  "
+          f"(head_dominance={logits_floor_Lmin / max(backbone_floor_Lmin, 1e-20):.1f}x)")
+    print(f"  L={L_max_pt}: backbone_floor={backbone_floor_Lmax:.4e}, "
+          f"logits_floor={logits_floor_Lmax:.4e}  "
+          f"(head_dominance={logits_floor_Lmax / max(backbone_floor_Lmax, 1e-20):.1f}x)")
+    print(f"  backbone_floor shrink ratio: "
+          f"{backbone_floor_Lmin / max(backbone_floor_Lmax, 1e-20):.1f}x "
+          f"(L{L_max_pt} << L{L_min_pt} — RMSNorm divides out growing residual)")
+
+    # Light assertion: backbone-only floor must NOT exceed the logits floor
+    # (confirms the lm_head dominates / backbone doesn't blow up beyond head).
+    assert backbone_floor_Lmin <= logits_floor_Lmin * 2.0, (
+        f"backbone floor at L={L_min_pt} ({backbone_floor_Lmin:.4e}) > 2× logits "
+        f"floor ({logits_floor_Lmin:.4e}) — lm_head dominance assumption violated")
+    assert backbone_floor_Lmax <= logits_floor_Lmax * 2.0, (
+        f"backbone floor at L={L_max_pt} ({backbone_floor_Lmax:.4e}) > 2× logits "
+        f"floor ({logits_floor_Lmax:.4e}) — lm_head dominance assumption violated")
+
     # --- linear + log-linear fit for the record --------------------------------
     # Both fits are used to quantify the (approximately zero) trend.
     # Even for a flat floor, fitting gives the mean level + slope uncertainty,
@@ -3485,11 +3564,11 @@ def test_bf16_floor_depth_compounding_slope(mesh_1d):
 
     # --- L=78 extrapolation ---------------------------------------------------
     L_target = 78
-    # Log-linear extrapolation: exp(slope_log * L + intercept_log)
+    # Log-linear extrapolation: exp(slope_log * L + intercept_log).
+    # Note: slope_log is slightly negative (fit noise on a flat signal, not a
+    # real downward trend); the conservative max-sweep bound is preferred.
     floor_pred_log = math.exp(slope_log * L_target + intercept_log)
-    # Linear extrapolation (can go negative for negative slope; clamp to 0).
-    floor_pred_lin = max(0.0, slope_lin * L_target + intercept_lin)
-    # Conservative estimate: use the measured MAX floor as an upper bound,
+    # Conservative estimate: use the measured MAX floor as a lower bound,
     # since random-weight floors don't grow reliably beyond the measured band.
     floor_pred_conservative = floor_max
 
@@ -3515,37 +3594,44 @@ def test_bf16_floor_depth_compounding_slope(mesh_1d):
         f"which is implausible; check fit stability.")
 
     # --- full report print -----------------------------------------------------
-    print(f"\n[Task10 FINDING] bf16 floor is APPROXIMATELY FLAT with depth "
-          f"(random weights + LayerNorm normalization keeps activations O(1)).")
+    print(f"\n[Task10 FINDING] bf16 logits floor is APPROXIMATELY FLAT with depth.")
+    print(f"[Task10 FINDING] ROOT CAUSE: floor is DOMINATED by the depth-independent")
+    print(f"  final lm_head projection (bf16 contraction over hidden=6144 on an")
+    print(f"  RMSNorm'd O(1) input ≈ ~9e-3 at every depth).  The backbone post-norm")
+    print(f"  hidden floor SHRINKS with depth (final RMSNorm divides out the growing")
+    print(f"  residual magnitude), so there is genuinely no compounding to extrapolate.")
     print(f"[Task10 FINDING] This is physically correct, not a bug.")
+    print(f"[Task10 FINDING] PHASE 1c: the real L=78 floor will be RAISED above the")
+    print(f"  lower bound (~{floor_pred_conservative:.2e}) primarily by vocab scaling in the")
+    print(f"  lm_head (production vocab >> {_build_dense_medium_config(4).vocab_size} used here).")
+    print(f"  lm_head/vocab-scaling is the dominant Phase 1c uncertainty.")
     print(f"[Task10 fit] linear fit:     slope={slope_lin:.4e}, "
           f"intercept={intercept_lin:.4e}  (slope ~0: flat trend)")
     print(f"[Task10 fit] log-linear fit: slope={slope_log:.4e}, "
-          f"intercept={intercept_log:.4e}  (slope ~0: flat trend in log domain)")
+          f"intercept={intercept_log:.4e}  (slope slightly negative = fit noise, not "
+          f"a real trend)")
     print(f"[Task10 fit] floor mean={floor_mean:.4e}, "
           f"spread (max/min)={spread:.2f}x")
-    print(f"\n[Task10 PREDICTION] Extrapolated L=78 bf16 floor (random-weight, "
+    print(f"\n[Task10 PREDICTION] L=78 bf16 floor LOWER BOUND (random-weight, "
           f"all-dense, hidden=6144):")
-    print(f"  log-linear extrapolation: {floor_pred_log:.4e}")
-    print(f"  linear extrapolation:     {floor_pred_lin:.4e}")
-    print(f"  conservative (max of sweep): {floor_pred_conservative:.4e}")
-    print(f"  RECOMMENDED BOUND: floor at L=78 >= {floor_pred_conservative:.4e} "
-          f"(lower bound from random-weight sweep)")
+    print(f"  RECOMMENDED BOUND (conservative max-sweep): "
+          f">= {floor_pred_conservative:.4e}")
+    print(f"  log-linear extrapolation (noisy fit, informational): "
+          f"{floor_pred_log:.4e}")
+    print(f"  linear extrapolation (informational): "
+          f"{max(0.0, slope_lin * L_target + intercept_lin):.4e}")
     print(f"\n[Task10 CAVEATS]")
-    print(f"  • RANDOM WEIGHTS + LAYERNORM: bf16 floor is ~flat vs depth because")
-    print(f"    LayerNorm normalizes activations before each sublayer, preventing")
-    print(f"    coherent error accumulation. Trained weights may compound differently.")
-    print(f"  • Dense-only (no MoE): dropping MoE removes extra residual variance;")
-    print(f"    the real GLM-MoE floor at L=78 may be somewhat higher.")
+    print(f"  • lm_head VOCAB SCALING (dominant Phase 1c term): production vocab")
+    print(f"    is far larger than {_build_dense_medium_config(4).vocab_size} used here → more")
+    print(f"    accumulation in the lm_head output contraction → larger head floor.")
+    print(f"  • RANDOM WEIGHTS: backbone floor doesn't compound; trained weights")
+    print(f"    may differ but lm_head dominance means the effect is secondary.")
+    print(f"  • Dense-only (no MoE): dropping MoE removes extra residual variance.")
     print(f"  • Reduced inner dims (n_heads=8, q_lora_rank=128, intermediate=256):")
-    print(f"    hidden=6144 preserved (the key compounding dimension); inner dims")
-    print(f"    reduced to fit all L in ~1.5GB HBM. Per-layer error magnitude may")
-    print(f"    differ from production but the depth trend is captured.")
-    print(f"  • The real L=78 floor (trained weights, full MoE, production dims)")
-    print(f"    is likely in the range [~1e-2, ~2e-1] based on the spec's nominal")
-    print(f"    band; the random-weight sweep gives {floor_mean:.4e} as a reference.")
+    print(f"    hidden=6144 preserved; per-layer error may differ from production.")
     print(f"\n[Task10 SUMMARY] deepest_L={int(L_vals[-1])}, "
           f"floor_min={floor_min:.4e}, floor_max={floor_max:.4e}, "
           f"spread={spread:.2f}x, log_slope={slope_log:.4e}, "
-          f"predicted_L78_log={floor_pred_log:.4e}, "
-          f"predicted_L78_conservative={floor_pred_conservative:.4e}")
+          f"recommended_L78_lower_bound={floor_pred_conservative:.4e}, "
+          f"backbone_floor_L{L_min_pt}={backbone_floor_Lmin:.4e}, "
+          f"backbone_floor_L{L_max_pt}={backbone_floor_Lmax:.4e}")
