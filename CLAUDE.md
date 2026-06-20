@@ -5,8 +5,8 @@ This fork (`github.com:inkitori/tpu-inference`) is being used to bring up **GLM 
 
 **Authoritative design spec** (read first for any GLM 5.2 / DSA work):
 `docs/superpowers/specs/2026-06-19-glm5.2-dsa-jax-tpu-design.md`
-Companion research/explainer under `docs/superpowers/research/` predates the spec and
-contains superseded claims — the spec is authoritative.
+
+Ignore what's under `docs/superpowers/research/`, that's just for my own reference.
 
 ## Sibling source trees (load-bearing — referenced throughout the spec)
 
@@ -28,13 +28,23 @@ Both live one level up, under `/home/enyouki/`:
 
 ## Environment
 
-- **venv:** `/home/enyouki/.venv` (Python 3.12.13, created with `uv`; gitignored). This is
-  where the validated `transformers==5.12.1` glm_moe_dsa oracle resolves
+- **venv (TPU box):** `/home/enyouki/.venv` (Python 3.12.13, created with `uv`; gitignored).
+  This is where the validated `transformers==5.12.1` glm_moe_dsa oracle resolves
   (`/home/enyouki/.venv/lib/python3.12/site-packages/transformers/models/glm_moe_dsa/`).
   System Python is 3.10 and **cannot** install the pinned
   `jax==0.10.1` (needs ≥3.11) — always use the venv.
   Install/refresh deps with `uv pip install --python /home/enyouki/.venv/bin/python ...`
   (absolute path — a cwd-relative `.venv` resolves wrong from the repo root).
+- **venv (local macOS dev box, `/Users/enyouki/...`):** `/Users/enyouki/.venv` (Python 3.12.13,
+  `uv`; gitignored — `/home/enyouki` isn't creatable here, autofs firmlink). Same usage:
+  `uv pip install --python /Users/enyouki/.venv/bin/python ...`. The same glm_moe_dsa oracle
+  resolves at `/Users/enyouki/.venv/lib/python3.12/site-packages/transformers/models/glm_moe_dsa/`.
+  **CPU-only subset** (TPU hardware doesn't line up locally — that's expected): `transformers==5.12.1`,
+  `torch==2.12.1`, `jax==0.10.1`/`jaxlib==0.10.1` (CPU device), `flax==0.12.4`, `numpy`, `safetensors`.
+  Deliberately **absent** (Linux/TPU-only, won't install on macOS): `libtpu`, `torchax`, `pathwaysutils`,
+  and the rest of the TPU runtime. ⇒ The **HF-eager oracle and standalone `jnp` CPU reference math run
+  locally**; anything importing `tpu_inference`/`vllm`/`torchax` (incl. parts of the test harness that
+  pull the TPU stack) does **not** — run those on the v6e-8.
 - Pins (`requirements.txt`): `jax==0.10.1`, `jaxlib==0.10.1`, `libtpu==0.0.41`,
   `flax==0.12.4`, `transformers==5.12.1` (the validated `glm_moe_dsa` oracle pin; spec §6).
 - The persistent XLA **compilation cache is on by default** — edit→run is near-instant
