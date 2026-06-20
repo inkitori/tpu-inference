@@ -701,10 +701,16 @@ class GlmMoeDsa(nnx.Module):
     def load_weights(self, jax_weights: Dict[str, jnp.ndarray]) -> set:
         """Load a converted (``t2j_weights``) HF weight map into the stack.
 
-        Sufficient for the Task-4 submodule + scaffold tests: maps the
-        dense-FFN, MoE (router/shared/experts), per-layer norms, MLA attention,
-        embed and final norm. The rigorous weight-map golden (indexer name-
-        gating, layers.78 drop, gate_up split provenance) is Task 5.
+        Maps the dense-FFN, MoE (router/shared/experts), per-layer norms, MLA
+        attention, embed and final norm.  Enforces the CONSUME-OR-SKIP contract:
+        every key handed to this function must be either consumed (loaded into a
+        parameter) or in the explicit expected-skip set (indexer params on "full"
+        layers, MTP/nextn layers).  Any key that is neither consumed nor in the
+        expected-skip set RAISES ``ValueError`` — no silent drops.
+
+        The expected-skip set is computed from the same gating oracle
+        (``_is_expected_skip_key``) that ``convert_hf_weights`` uses, so the two
+        callers can never drift apart.
 
         Expects keys prefixed ``model.layers.{i}.`` (and ``model.embed_tokens``,
         ``model.norm``). Linear kernels must already be ``[in, out]`` (i.e. run
@@ -760,6 +766,29 @@ class GlmMoeDsa(nnx.Module):
                 moe.experts.kernel_gating_EDF.value = jnp.swapaxes(g, -2, -1)
                 moe.experts.kernel_up_proj_EDF.value = jnp.swapaxes(u, -2, -1)
                 moe.experts.kernel_down_proj_EFD.value = jnp.swapaxes(dn, -2, -1)
+
+        # --- consume-or-skip contract enforcement ----------------------------
+        # Compute the expected-skip set: keys in jax_weights that were NOT
+        # consumed (i.e. not in `loaded`) but are EXPECTED to be skipped.
+        # Uses the same _is_expected_skip_key oracle as convert_hf_weights.
+        hf_config = self.vllm_config.model_config.hf_config
+        indexer_types = list(getattr(hf_config, "indexer_types", []) or [])
+        num_hidden_layers = int(hf_config.num_hidden_layers)
+
+        unconsumed = set(jax_weights) - loaded
+        unexpected = {
+            k for k in unconsumed
+            if not _is_expected_skip_key(k, indexer_types, num_hidden_layers)
+        }
+        if unexpected:
+            raise ValueError(
+                f"load_weights received {len(unexpected)} unrecognized key(s) "
+                f"that were neither consumed nor in the expected-skip set "
+                f"(indexer params + MTP layers). Unrecognized keys:\n"
+                + "\n".join(f"  {k!r}" for k in sorted(unexpected))
+                + "\nThis usually means a typo in a mapped key name, a new "
+                f"parameter without a load rule, or a key from the wrong model.")
+
         return loaded
 
 
@@ -828,10 +857,40 @@ class GlmMoeDsaForCausalLM(nnx.Module):
         return self.lm_head(hidden_states)
 
     def load_weights(self, jax_weights: Dict[str, jnp.ndarray]) -> set:
-        """Load a ``t2j_weights``-converted HF map (incl. ``lm_head.weight``)."""
-        loaded = self.model.load_weights(jax_weights)
-        if "lm_head.weight" in jax_weights:
-            self.lm_head.weight.value = jnp.asarray(jax_weights["lm_head.weight"])
+        """Load a ``t2j_weights``-converted HF map (incl. ``lm_head.weight``).
+
+        Splits the weight dict by namespace before delegating:
+          * ``model.*`` keys go to ``GlmMoeDsa.load_weights``, which enforces
+            the consume-or-skip contract for the inner stack.
+          * ``lm_head.weight`` is consumed here.
+          * Any remaining key (in neither namespace) triggers a ``ValueError``.
+
+        This split-before-dispatch ensures neither loader sees keys that belong
+        to the other scope — so neither can silently drop them.
+        """
+        # Partition by namespace.
+        model_weights = {k: v for k, v in jax_weights.items()
+                         if k.startswith("model.")}
+        lm_head_weight = jax_weights.get("lm_head.weight")
+
+        # All keys that are neither model.* nor lm_head.weight are unexpected.
+        accounted = set(model_weights)
+        if lm_head_weight is not None:
+            accounted.add("lm_head.weight")
+        top_level_unexpected = set(jax_weights) - accounted
+        if top_level_unexpected:
+            raise ValueError(
+                f"GlmMoeDsaForCausalLM.load_weights: {len(top_level_unexpected)} "
+                f"key(s) in jax_weights are outside the 'model.*' and "
+                f"'lm_head.weight' namespaces:\n"
+                + "\n".join(f"  {k!r}" for k in sorted(top_level_unexpected)))
+
+        # Load inner stack (enforces its own consume-or-skip contract).
+        loaded = self.model.load_weights(model_weights)
+
+        # Load lm_head.
+        if lm_head_weight is not None:
+            self.lm_head.weight.value = jnp.asarray(lm_head_weight)
             loaded.add("lm_head.weight")
         return loaded
 
@@ -866,6 +925,42 @@ def _layer_index_of(name: str) -> Optional[int]:
     return None
 
 
+def _is_expected_skip_key(name: str, indexer_types: list,
+                          num_hidden_layers: int) -> bool:
+    """Return True if ``name`` is EXPECTED to be silently skipped by load_weights.
+
+    This is the SINGLE gating oracle shared by ``convert_hf_weights`` and
+    ``GlmMoeDsa.load_weights`` so the two callers can never drift apart:
+
+    * MTP / nextn layers — any ``model.layers.{i}.*`` with ``i >= num_hidden_layers``.
+    * Indexer params — keys containing ``_INDEXER_SUBSTR`` on "full" layers
+      (gated on ``indexer_types[i] != "shared"``).  Phase 1a has no indexer
+      module (Phase 2), so they are recognized-but-unloadable.
+
+    A key that passes this predicate is in the EXPECTED-SKIP set; it must NOT
+    produce an error even though it was not consumed by the loader.  Any key
+    that fails this predicate AND was not consumed IS an error (unrecognized key
+    → unknown param → silent random-init).
+    """
+    layer_idx = _layer_index_of(name)
+
+    # MTP / nextn: decoder layer beyond the built stack.
+    if layer_idx is not None and layer_idx >= num_hidden_layers:
+        return True
+
+    # Indexer param on a "full" layer (Phase 1a: no indexer module yet).
+    if _INDEXER_SUBSTR in name:
+        kind = (indexer_types[layer_idx]
+                if layer_idx is not None and layer_idx < len(indexer_types)
+                else None)
+        # "shared" layers carry no indexer params on disk — the key must not
+        # appear at all.  Here we just return False so the caller will raise.
+        # "full" layers DO carry indexer params → skip.
+        return kind != "shared"
+
+    return False
+
+
 def convert_hf_weights(state_dict, hf_config):
     """Convert an HF ``GlmMoeDsa`` ``state_dict`` to JAX weights + a skip set.
 
@@ -897,23 +992,20 @@ def convert_hf_weights(state_dict, hf_config):
     for name, tensor in state_dict.items():
         layer_idx = _layer_index_of(name)
 
-        # --- MTP / nextn drop: any decoder layer beyond the built stack -----
-        if layer_idx is not None and layer_idx >= num_hidden_layers:
-            skipped.add(name)
-            continue
-
-        # --- indexer drop, gated on indexer_types[i] (Phase 1a: no module) --
-        if _INDEXER_SUBSTR in name:
-            kind = (indexer_types[layer_idx]
-                    if layer_idx is not None and layer_idx < len(indexer_types)
-                    else None)
-            if kind == "shared":
-                # A "shared" layer must NOT carry indexer params on disk.
-                raise ValueError(
-                    f"indexer param {name!r} found on a 'shared' layer "
-                    f"(indexer_types[{layer_idx}]=='shared'); the indexer-type "
-                    f"gate disagrees with the checkpoint")
-            # present on a "full" layer -> explicitly skip (recognized).
+        # --- MTP / nextn drop + indexer drop (delegate to shared oracle) -----
+        if _is_expected_skip_key(name, indexer_types, num_hidden_layers):
+            # Sanity-check: an indexer param on a "shared" layer must NOT
+            # appear on disk at all.  _is_expected_skip_key returns False for
+            # that case (forcing the caller to raise), but guard here too.
+            if _INDEXER_SUBSTR in name:
+                kind = (indexer_types[layer_idx]
+                        if layer_idx is not None and layer_idx < len(indexer_types)
+                        else None)
+                if kind == "shared":
+                    raise ValueError(
+                        f"indexer param {name!r} found on a 'shared' layer "
+                        f"(indexer_types[{layer_idx}]=='shared'); the indexer-type "
+                        f"gate disagrees with the checkpoint")
             skipped.add(name)
             continue
 

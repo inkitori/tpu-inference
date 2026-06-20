@@ -1864,3 +1864,99 @@ def test_glm_weight_map_golden(mesh_1d):
                 assert full in skipped
             else:
                 assert full not in skipped and full not in sd
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a Task 5 — consume-or-skip TEETH test.
+#
+# Proves that load_weights (the real loader the model runs) RAISES on an
+# unrecognized key rather than silently dropping it.  This is the enforcement
+# contract: a typo'd mapped key or a new parameter without a load rule produces
+# a loud error, not a silent leftover random-init.
+# ---------------------------------------------------------------------------
+
+def test_load_weights_raises_on_unrecognized_key(mesh_1d):
+    """load_weights raises ValueError when handed an UNRECOGNIZED extra key.
+
+    Proves the consume-or-skip contract has teeth on the real loader:
+    injecting a key that is neither consumed nor in the expected-skip set
+    (not an indexer param, not MTP) must RAISE, not silently drop.
+
+    The bogus key is in the model.* namespace so it reaches GlmMoeDsa.load_weights
+    (rather than being caught at the top-level namespace check in
+    GlmMoeDsaForCausalLM.load_weights).
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config,
+                                                      convert_hf_weights)
+    cfg = tiny_glm_moe_dsa_config()
+    model_hf = build_hf_oracle(cfg=cfg, seed=0)
+    sd = model_hf.state_dict()
+    jax_weights, _ = convert_hf_weights(sd, cfg)
+
+    vllm_config = build_glm_vllm_config(cfg, mesh=mesh_1d)
+    model = GlmMoeDsaForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh_1d)
+
+    # Inject a bogus key in the model.* namespace that the loader will never
+    # consume and that is NOT in the expected-skip set (not an indexer key,
+    # not an MTP-layer key).
+    bogus_key = "model.layers.0.self_attn.bogus_proj.weight"
+    jax_weights_with_bogus = dict(jax_weights)
+    jax_weights_with_bogus[bogus_key] = jnp.zeros((4, 4))
+
+    with pytest.raises(ValueError, match="unrecognized key"):
+        model.load_weights(jax_weights_with_bogus)
+
+
+def test_load_weights_raises_on_top_level_unknown_namespace(mesh_1d):
+    """load_weights raises ValueError when a key is outside model.* and lm_head.*.
+
+    A key such as 'totally.unknown.weight' is outside both the 'model.*' and
+    'lm_head.weight' namespaces and must be caught at the top-level namespace
+    partition in GlmMoeDsaForCausalLM.load_weights.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config,
+                                                      convert_hf_weights)
+    cfg = tiny_glm_moe_dsa_config()
+    model_hf = build_hf_oracle(cfg=cfg, seed=0)
+    sd = model_hf.state_dict()
+    jax_weights, _ = convert_hf_weights(sd, cfg)
+
+    vllm_config = build_glm_vllm_config(cfg, mesh=mesh_1d)
+    model = GlmMoeDsaForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh_1d)
+
+    jax_weights_with_unknown = dict(jax_weights)
+    jax_weights_with_unknown["totally.unknown.weight"] = jnp.zeros((2, 2))
+
+    with pytest.raises(ValueError):
+        model.load_weights(jax_weights_with_unknown)
+
+
+def test_load_weights_accepts_indexer_keys_in_expected_skip_set(mesh_1d):
+    """load_weights silently skips indexer keys (they are in the expected-skip set).
+
+    The roundtrip test (test_glm_load_weights_roundtrip) passes t2j_weights(sd)
+    which includes the raw indexer keys.  This test explicitly verifies that those
+    keys are silently skipped (not errored) when passed directly to load_weights.
+    """
+    from tpu_inference.models.jax.glm_moe_dsa import (GlmMoeDsaForCausalLM,
+                                                      build_glm_vllm_config)
+    cfg = tiny_glm_moe_dsa_config()
+    model_hf = build_hf_oracle(cfg=cfg, seed=0)
+    # t2j_weights keeps indexer keys (they are not split or renamed).
+    jax_weights = t2j_weights(model_hf.state_dict())
+
+    vllm_config = build_glm_vllm_config(cfg, mesh=mesh_1d)
+    model = GlmMoeDsaForCausalLM(vllm_config, jax.random.PRNGKey(0), mesh_1d)
+
+    # Must not raise even though indexer keys are present and unconsumed.
+    loaded = model.load_weights(jax_weights)
+
+    # Confirm the indexer keys are NOT in `loaded` (silently skipped, not consumed).
+    for i, kind in enumerate(cfg.indexer_types):
+        if kind == "full":
+            for r in _INDEXER_REL_NAMES:
+                full = f"model.layers.{i}.{r}"
+                assert full not in loaded, (
+                    f"indexer key {full!r} unexpectedly in loaded set")
