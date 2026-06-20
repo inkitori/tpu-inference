@@ -65,13 +65,28 @@ def build_rope_cos_sin_np(
         MUST be called OUTSIDE any live JAX device mesh (V4 lesson).  The
         returned arrays are passed into ``apply_rope_interleaved_jax`` or
         ``apply_rope_rotate_half_jax`` which run on device.
+
+    Implementation note:
+        inv_freq is computed via torch (matching HF's exact float32 scalar-power
+        path) rather than pure numpy.  A pure-numpy ``theta ** float32_array``
+        uses numpy's fp32 pow which can differ by 1 ULP from torch's scalar-pow
+        for the same exponent.  At near-1M positions that 1-ULP inv_freq error
+        accumulates to ~3e-2 in angle, breaking the 1e-6 table gate.  Using
+        torch keeps the inv_freq bit-identical to ``GlmMoeDsaRotaryEmbedding``.
     """
-    positions = np.asarray(positions, dtype=np.float32)  # [T]
-    # HF: arange(0, dim, 2, dtype=int64) → float32 / dim
-    k = np.arange(0, head_dim, 2, dtype=np.int64).astype(np.float32)
-    inv_freq = (1.0 / (rope_theta ** (k / head_dim))).astype(np.float32)  # [d/2]
+    import torch as _torch
+    # HF: arange(0, dim, 2, dtype=int64) → float32 / dim → scalar-pow in torch
+    # Using torch matches GlmMoeDsaRotaryEmbedding.compute_default_rope_parameters
+    # exactly (1-ULP-safe even at rope_theta=8_000_000 and near-1M positions).
+    inv_freq = (1.0 / (
+        rope_theta ** (
+            _torch.arange(0, head_dim, 2, dtype=_torch.int64).to(dtype=_torch.float32)
+            / head_dim
+        )
+    )).numpy()  # [d/2], fp32
     # freqs[t, i] = positions[t] * inv_freq[i]  →  [T, d/2]
-    freqs = positions[:, None] * inv_freq[None, :]    # [T, d/2]
+    positions_f32 = np.asarray(positions, dtype=np.float32)
+    freqs = positions_f32[:, None] * inv_freq[None, :]    # [T, d/2]
     # HF: emb = cat(freqs, freqs, dim=-1)  →  [T, d]
     emb = np.concatenate([freqs, freqs], axis=-1).astype(np.float32)
     cos = np.cos(emb).astype(np.float32)

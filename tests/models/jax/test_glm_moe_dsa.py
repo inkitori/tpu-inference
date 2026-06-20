@@ -361,6 +361,10 @@ def _hf_cos_sin(positions_np, rope_theta, head_dim):
 
     Returns (cos, sin) each shape [B=1, T, head_dim] as numpy arrays,
     mirroring HF torch output (fp32, no dtype cast at the end).
+
+    Note: kept as a secondary cross-check only. The PRIMARY table reference
+    is now ``_real_module_cos_sin`` which calls the actual
+    ``GlmMoeDsaRotaryEmbedding`` torch module.
     """
     import numpy as np
     # HF: arange(0, dim, 2, int64) → float32 / dim
@@ -377,6 +381,42 @@ def _hf_cos_sin(positions_np, rope_theta, head_dim):
     cos = np.cos(emb)   # attention_scaling=1.0 for default rope
     sin = np.sin(emb)
     return cos, sin   # [1, T, head_dim]
+
+
+def _real_module_cos_sin(positions_np, rope_theta, head_dim):
+    """Call the actual ``GlmMoeDsaRotaryEmbedding`` torch module.
+
+    This is the PRIMARY table reference for all three RoPE tests.  It
+    instantiates the real HF rotary module with the given ``rope_theta``
+    (via config) and calls ``forward(x, position_ids)`` to get fp32 cos/sin.
+
+    Returns (cos, sin) each shape [T, head_dim] as numpy float32 arrays,
+    matching the shape returned by ``build_rope_cos_sin_np``.
+
+    ``x`` is a dummy fp32 tensor (only used for dtype/device); the returned
+    cos/sin are cast to ``x.dtype`` (fp32) inside HF's forward.
+    """
+    import torch
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import \
+        GlmMoeDsaRotaryEmbedding
+    cfg = tiny_glm_moe_dsa_config()
+    # Patch rope_theta so the module uses the requested base frequency.
+    # rope_parameters is a dict already populated by __post_init__ /
+    # RotaryEmbeddingConfigMixin; updating in-place is safe here.
+    cfg.rope_parameters = dict(cfg.rope_parameters)
+    cfg.rope_parameters["rope_theta"] = float(rope_theta)
+    # head_dim is set by __post_init__ to qk_rope_head_dim (64); we do not
+    # need to override it — all three tests use head_dim=64.
+
+    rotary = GlmMoeDsaRotaryEmbedding(cfg)
+    T = len(positions_np)
+    # dummy x: only dtype and device matter; shape [1, T, 1] is sufficient.
+    x = torch.ones(1, T, 1, dtype=torch.float32)
+    pos_ids = torch.tensor(positions_np[None, :], dtype=torch.long)  # [1, T]
+    with torch.no_grad():
+        cos, sin = rotary.forward(x, pos_ids)
+    # cos/sin: [1, T, head_dim]; drop the batch dim → [T, head_dim]
+    return cos[0].numpy(), sin[0].numpy()
 
 
 def _hf_oracle_rope_interleave(q_np, k_np, cos_np, sin_np):
@@ -436,21 +476,33 @@ def test_rope_mla_interleaved_parity_small():
     q_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
     k_np = rng.standard_normal((B, n_heads, T, head_dim)).astype(np.float32)
 
-    # Build cos/sin with HF numpy helper (reference)
+    # Build cos/sin with HF numpy helper (secondary cross-check)
     hf_cos, hf_sin = _hf_cos_sin(positions, rope_theta, head_dim)  # [1, T, d]
 
     # Build cos/sin with JAX function (host numpy, no device)
     jax_cos, jax_sin = build_rope_cos_sin_np(positions, rope_theta, head_dim)
     # jax_cos/sin: [T, head_dim]
 
-    # Sub-assertion: cos/sin TABLE parity (localize construction bugs)
+    # PRIMARY table gate: compare against the REAL GlmMoeDsaRotaryEmbedding module.
+    # real_cos/sin are used for BOTH sides of the apply comparison (see below) so
+    # that the apply assertion measures only the JAX vs torch arithmetic delta, not
+    # any residual table-construction difference.
+    real_cos, real_sin = _real_module_cos_sin(positions, rope_theta, head_dim)
+    assert maxabs(real_cos, jax_cos) < 1e-6, (
+        f"cos table vs real module: maxabs={maxabs(real_cos, jax_cos):.2e}")
+    assert maxabs(real_sin, jax_sin) < 1e-6, (
+        f"sin table vs real module: maxabs={maxabs(real_sin, jax_sin):.2e}")
+
+    # Secondary cross-check: numpy helper (same theta=10000, safe at small positions)
     assert maxabs(hf_cos[0], jax_cos) < 1e-6, (
         f"cos table mismatch: maxabs={maxabs(hf_cos[0], jax_cos):.2e}")
     assert maxabs(hf_sin[0], jax_sin) < 1e-6, (
         f"sin table mismatch: maxabs={maxabs(hf_sin[0], jax_sin):.2e}")
 
-    # HF oracle applied output
-    hf_q_out, hf_k_out = _hf_oracle_rope_interleave(q_np, k_np, hf_cos, hf_sin)
+    # HF oracle applied output — use real module table ([1,T,d]) so both sides
+    # share the same cos/sin and the delta reflects only JAX vs torch arithmetic.
+    hf_q_out, hf_k_out = _hf_oracle_rope_interleave(
+        q_np, k_np, real_cos[None], real_sin[None])
 
     # JAX applied output  — broadcast cos/sin over batch
     q_jax = jnp.array(q_np)
@@ -490,14 +542,25 @@ def test_rope_indexer_rotate_half_parity_small():
 
     jax_cos, jax_sin = build_rope_cos_sin_np(positions, rope_theta, head_dim)
 
-    # Sub-assertion: cos/sin TABLE parity
+    # PRIMARY table gate: compare against the REAL GlmMoeDsaRotaryEmbedding module.
+    # real_cos/sin are used for BOTH sides of the apply comparison so the delta
+    # measures only JAX vs torch arithmetic, not table-construction differences.
+    real_cos, real_sin = _real_module_cos_sin(positions, rope_theta, head_dim)
+    assert maxabs(real_cos, jax_cos) < 1e-6, (
+        f"cos table vs real module: maxabs={maxabs(real_cos, jax_cos):.2e}")
+    assert maxabs(real_sin, jax_sin) < 1e-6, (
+        f"sin table vs real module: maxabs={maxabs(real_sin, jax_sin):.2e}")
+
+    # Secondary cross-check: numpy helper (safe at small positions / theta=10000)
     assert maxabs(hf_cos[0], jax_cos) < 1e-6, (
         f"cos table mismatch: maxabs={maxabs(hf_cos[0], jax_cos):.2e}")
     assert maxabs(hf_sin[0], jax_sin) < 1e-6, (
         f"sin table mismatch: maxabs={maxabs(hf_sin[0], jax_sin):.2e}")
 
-    # HF oracle applied output
-    hf_q_out, hf_k_out = _hf_oracle_rope_rotate_half(q_np, k_np, hf_cos, hf_sin)
+    # HF oracle applied output — use real module table ([1,T,d]) so both sides
+    # share the same cos/sin.
+    hf_q_out, hf_k_out = _hf_oracle_rope_rotate_half(
+        q_np, k_np, real_cos[None], real_sin[None])
 
     # JAX applied output
     q_jax = jnp.array(q_np)
@@ -541,14 +604,26 @@ def test_rope_mla_interleaved_parity_near_1m():
 
     jax_cos, jax_sin = build_rope_cos_sin_np(positions, rope_theta, head_dim)
 
-    # Sub-assertion: cos/sin TABLE parity at near-1M
-    assert maxabs(hf_cos[0], jax_cos) < 1e-6, (
-        f"cos table mismatch (near-1M): maxabs={maxabs(hf_cos[0], jax_cos):.2e}")
-    assert maxabs(hf_sin[0], jax_sin) < 1e-6, (
-        f"sin table mismatch (near-1M): maxabs={maxabs(hf_sin[0], jax_sin):.2e}")
+    # PRIMARY table gate: compare against the REAL GlmMoeDsaRotaryEmbedding module.
+    # Uses rope_theta=8_000_000 (real checkpoint value) — the most demanding case:
+    # at near-1M positions a 1-ULP error in inv_freq accumulates to ~3e-2 in angle,
+    # so this gate is specifically designed to catch fp32 pow-path divergence.
+    # real_cos/sin are used for BOTH sides of the apply comparison so the delta
+    # measures only JAX vs torch float32 arithmetic, not table-construction diff.
+    real_cos, real_sin = _real_module_cos_sin(positions, rope_theta, head_dim)
+    assert maxabs(real_cos, jax_cos) < 1e-6, (
+        f"cos table vs real module (near-1M): maxabs={maxabs(real_cos, jax_cos):.2e}")
+    assert maxabs(real_sin, jax_sin) < 1e-6, (
+        f"sin table vs real module (near-1M): maxabs={maxabs(real_sin, jax_sin):.2e}")
+    # Note: _hf_cos_sin (numpy helper) is NOT a valid secondary reference at
+    # near-1M / rope_theta=8_000_000 — the helper's numpy pow-path has a 1-ULP
+    # error in inv_freq that causes ~3e-2 angle divergence at these positions.
+    # The real GlmMoeDsaRotaryEmbedding module above is the only valid reference.
 
-    # HF oracle applied output
-    hf_q_out, hf_k_out = _hf_oracle_rope_interleave(q_np, k_np, hf_cos, hf_sin)
+    # HF oracle applied output — use real module table ([1,T,d]) so both sides
+    # share the same cos/sin.
+    hf_q_out, hf_k_out = _hf_oracle_rope_interleave(
+        q_np, k_np, real_cos[None], real_sin[None])
 
     # JAX applied output
     q_jax = jnp.array(q_np)
