@@ -56,6 +56,7 @@ DTYPE_VIEW_MAP = {
     jnp.dtype(jnp.float8_e4m3fn): torch.uint8,
     jnp.dtype(jnp.bfloat16): torch.uint16,
     jnp.dtype(jnp.float32): torch.uint32,
+    jnp.dtype(jnp.uint32): torch.uint32,
 }
 
 
@@ -317,6 +318,52 @@ def get_default_maps(model_config, mesh: Mesh,
                        bias_pad_map=bias_pad_keys)
 
 
+def _get_active_int4_config(vllm_config):
+    """Return the active Int4Config, or None if int4 quant is not active.
+
+    Reuses the loader's quant-config dispatch (Task 3). Returns None on any
+    failure so non-int4 / non-MLX models are completely unaffected.
+    """
+    try:
+        from tpu_inference.layers.jax.quantization import \
+            get_tpu_quantization_config
+        from tpu_inference.layers.jax.quantization.int4 import Int4Config
+        # get_flax_model caches the active config here before loading; reuse it
+        # to avoid the deepcopy in get_tpu_quantization_config per-tensor.
+        cfg = getattr(vllm_config, "quant_config", None)
+        if not isinstance(cfg, Int4Config):
+            cfg = get_tpu_quantization_config(vllm_config)
+        return cfg if isinstance(cfg, Int4Config) else None
+    except Exception:
+        return None
+
+
+def _is_mlx_packed(hf_key: str, hf_weight: jax.Array,
+                   vllm_config) -> bool:
+    """True for an MLX affine-quantized tensor that must bypass cast/transpose.
+
+    Only ever returns True when an ``Int4Config`` is active, so all non-int4
+    behavior is preserved. An MLX-quantized module stores three sibling
+    tensors per prefix:
+
+    * ``.weight``  -- packed int4 codes, dtype uint32 (must keep uint32, no
+      transpose, leading expert dim intact);
+    * ``.scales`` / ``.biases`` -- dequant params, dtype bf16 (pass straight
+      through, no cast / no transpose).
+
+    A packed ``.weight`` is detected as uint32 (the MLX packed dtype); scales
+    and biases are detected by suffix. The (potentially expensive) active-config
+    lookup is only performed for these candidate keys, so non-quantized tensors
+    incur no extra cost.
+    """
+    candidate = (hf_key.endswith(".scales") or hf_key.endswith(".biases")
+                 or (hf_key.endswith(".weight")
+                     and hf_weight.dtype == jnp.uint32))
+    if not candidate:
+        return False
+    return _get_active_int4_config(vllm_config) is not None
+
+
 def _load_and_shard_weight(vllm_config,
                            params: nnx.State,
                            shardings: Any,
@@ -352,8 +399,15 @@ def _load_and_shard_weight(vllm_config,
                 keep_original_dtype = True
                 break
 
+    # MLX affine int4: packed .weight (uint32) and its .scales/.biases siblings
+    # must bypass the bf16 cast and the transpose, otherwise the packed codes
+    # are corrupted and the stacked expert layout is destroyed. Only engages
+    # when an Int4Config is active, so all other models are unaffected.
+    is_mlx_packed = _is_mlx_packed(hf_key, hf_weight, vllm_config)
+
     # Converting to config's dtype
-    if not keep_original_dtype and hf_weight.dtype != model_config.dtype:
+    if not is_mlx_packed and not keep_original_dtype \
+            and hf_weight.dtype != model_config.dtype:
         logger.warning(
             f"Converting dtype for {hf_key} from {hf_weight.dtype} to {model_config.dtype}"
         )
@@ -410,7 +464,10 @@ def _load_and_shard_weight(vllm_config,
                 if head_dim_pad > 0:
                     hf_weight = jnp.pad(hf_weight, ((0, 0), (0, head_dim_pad)))
                 break
-    else:
+    elif not is_mlx_packed:
+        # MLX-packed tensors (packed int4 .weight + .scales/.biases) keep
+        # their on-disk layout: skip reshape/transpose, leaving the leading
+        # expert dim intact and the packed codes untouched.
         for key in reshape_keys:
             if key in hf_key:
                 hf_weight = jnp.reshape(hf_weight, reshape_keys[key])
