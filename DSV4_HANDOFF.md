@@ -15,10 +15,17 @@ to fix, in this order: (0) the FP4 GMM compile failure on v6e [IMMEDIATE], then 
 First real forward dies with:
 `MosaicError: INTERNAL: Mosaic failed to compile TPU kernel: Unsupported type 'vector<8x128x8xf4E2M1FN>'`
 at `tpu_inference/kernels/megablox/gmm_v2.py:500` (`_matmul` convert_element_type) / `:584` (`matmul_first_last`).
-The offending MLIR op is `tpu.unpack_subelements(... : vector<8x128x8xf4E2M1FN>) -> vector<8x128xf32>` — i.e. the GMM
-kernel reads FP4 expert weights and tries to upcast them in VMEM via the **native f4E2M1FN vector unpack**, which the
-**v6e Mosaic compiler does not support** (it's a v7+ feature). This is EXACTLY spec Risk-1's open question — answer:
-**FP4 GMM as-written does not run on v6e.** (Loading/HBM is fine; it's the *compute* kernel that fails.)
+The offending MLIR op is `tpu.unpack_subelements(... : vector<8x128x8xf4E2M1FN>) -> vector<8x128xf32>`.
+**Precise diagnosis (NOT "gmm_v2 is broken on v6e"):** gmm_v2 works fine on v6e for **fp8** experts (matmul(fp8,fp8)
+native) and **int4** experts (int4→fp8 upcast, gmm_v2.py:1147). It fails ONLY for **native `float4_e2m1fn`** experts:
+the lhs-dtype heuristic picks fp8 for a float rhs (gmm_v2.py:1149-1151), then `is_matmul_supported(fp8, float4_e2m1fn)`
+is **False on v6e** (True on v7), so it falls to `block_rhs.astype(fp8)` (gmm_v2.py:500) which needs the native
+`f4E2M1FN` vector unpack that v6e Mosaic can't compile. So the native-FP4 matmul path is **v7-only**; v6e never had it.
+DeepSeek-V4 is the first model to feed gmm_v2 native mxfp4 experts (other DeepSeek runs used fp8 or int4-requant), which
+is why no prior model hit this. Loading/HBM is fine; only the FP4 *compute* path fails.
+NB: gmm_v2 already has a packed-uint32 + `pltpu.bitcast` unpack path (gmm_v2.py:387, 840) used by int4/requant — the
+likely fix is to route FP4 experts through THAT representation (bitcast unpack of packed nibbles → bf16) rather than as
+native `float4_e2m1fn`. Also check whether a non-EP "monolithic" mxfp4 apply path exists that bypasses gmm_v2.
 Decision point (spec Open-Decision-A). Options, best-first given the "keep FP4" constraint:
 - **(a) Port the kernel's FP4 unpack to v6e-supported ops** (recommended, matches user directive): make `gmm_v2.py`
   treat the FP4 rhs as packed **uint8** and unpack the nibbles → bf16 with ordinary integer/bitwise ops in VMEM
