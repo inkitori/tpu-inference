@@ -201,29 +201,32 @@ def build_mini_model(mesh, cfg=None):
     with patch.object(DummyModelLoader, "load_weights", _patched_load_weights):
         model = model_loader.get_vllm_model(vllm_config, rng, mesh)
 
-    # Build wo_a_bf16 on each MLA attention. vLLM's post-load PWAL driver gates
-    # pass-2 on isinstance(module, (Attention, MLAAttention, MMEncoderAttention))
-    # -- VllmDeepseekV4MLAAttention is a DeepseekV4Attention/AttentionLayerBase,
-    # matches NONE of those, so its process_weights_after_loading (which sets
-    # self.wo_a_bf16, read directly by _o_proj) NEVER fires via the driver and
-    # _o_proj raises AttributeError at forward. There is no production hook for
-    # this either (the GPU/ROCm path dequants wo_a lazily at forward via
-    # _get_cached_wo_a_bf16). So we call it explicitly here.
-    #   *** PRODUCTION GAP: the real runner serving DSV4 on TPU would hit the
-    #   same missing-wo_a_bf16 AttributeError -- the per-attention PWAL is not
-    #   wired. Flag for Phase 2 (see task report). ***
+    # Build wo_a_bf16 on each MLA attention via the SAME production helper the
+    # real loaders use (_process_dsv4_mla_weights in vllm_model_loader). vLLM's
+    # post-load PWAL driver gates pass-2 on isinstance(module, (Attention,
+    # MLAAttention, MMEncoderAttention)) -- VllmDeepseekV4MLAAttention is a
+    # DeepseekV4Attention/AttentionLayerBase, matches NONE of those, so its
+    # process_weights_after_loading (which sets self.wo_a_bf16, read by _o_proj)
+    # never fires via that driver. The production IncrementalModelLoader /
+    # RunaiIncrementalModelLoader now call _process_dsv4_mla_weights after their
+    # process_weights_after_loading pass; the load_format="dummy" path used here
+    # routes through vLLM's DummyModelLoader (not our loaders), so we invoke the
+    # same helper explicitly to mirror production.
     import torchax
 
-    from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import \
-        VllmDeepseekV4MLAAttention
+    from tpu_inference.models.vllm.vllm_model_loader import \
+        _process_dsv4_mla_weights
     # model.model is the VllmModelWrapper; its .model is the _VllmRunner nn.Module.
     nn_module = model.model.model
-    n_pwal = 0
     with torchax.default_env():
-        for _, module in nn_module.named_modules():
-            if isinstance(module, VllmDeepseekV4MLAAttention):
-                module.process_weights_after_loading()
-                n_pwal += 1
+        _process_dsv4_mla_weights(nn_module, vllm_config.model_config)
+
+    # Sanity: the helper must have found the patched MLA attention modules.
+    from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import \
+        VllmDeepseekV4MLAAttention
+    n_pwal = sum(
+        1 for _, m in nn_module.named_modules()
+        if isinstance(m, VllmDeepseekV4MLAAttention))
     if n_pwal == 0:
         raise RuntimeError(
             "no VllmDeepseekV4MLAAttention modules found -- the DSV4 MLA patch "

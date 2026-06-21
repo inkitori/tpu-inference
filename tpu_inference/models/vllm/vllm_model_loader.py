@@ -26,7 +26,25 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model, process_weights_after_loading)
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from tpu_inference.layers.vllm.custom_ops.deepseek_v4_attention import \
+    VllmDeepseekV4MLAAttention
 from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
+
+
+def _process_dsv4_mla_weights(model: torch.nn.Module,
+                              model_config: ModelConfig) -> None:
+    """Fire the DSV4 MLA per-attention ``process_weights_after_loading``.
+
+    ``VllmDeepseekV4MLAAttention`` is a ``DeepseekV4Attention`` /
+    ``AttentionLayerBase`` -- NOT an instance of vLLM's
+    ``(Attention, MLAAttention, MMEncoderAttention)``, so vLLM's loader pass-2
+    gate (``model_loader/utils.py``) never calls its
+    ``process_weights_after_loading``, which builds ``wo_a_bf16`` that ``_o_proj``
+    reads. Without this loop ``_o_proj`` raises ``AttributeError`` at forward.
+    """
+    for _, m in model.named_modules():
+        if isinstance(m, VllmDeepseekV4MLAAttention):
+            m.process_weights_after_loading(model_config.dtype)
 
 
 def attach_incremental_weight_loader(model: torch.nn.Module) -> None:
@@ -104,6 +122,10 @@ class IncrementalModelLoader(DefaultModelLoader):
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
             process_weights_after_loading(model, model_config, target_device)
+            # DSV4 MLA attention is not gated by vLLM's pass-2 PWAL driver
+            # (it matches none of Attention/MLAAttention/MMEncoderAttention);
+            # fire its per-attention PWAL explicitly to build wo_a_bf16.
+            _process_dsv4_mla_weights(model, model_config)
 
         return model.eval()
 
@@ -144,5 +166,9 @@ class RunaiIncrementalModelLoader(RunaiModelStreamerLoader):
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
             process_weights_after_loading(model, model_config, target_device)
+            # DSV4 MLA attention is not gated by vLLM's pass-2 PWAL driver
+            # (it matches none of Attention/MLAAttention/MMEncoderAttention);
+            # fire its per-attention PWAL explicitly to build wo_a_bf16.
+            _process_dsv4_mla_weights(model, model_config)
 
         return model.eval()

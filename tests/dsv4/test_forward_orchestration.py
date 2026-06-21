@@ -129,25 +129,38 @@ def test_weighted_rmsnorm_matches_reference():
 def test_wo_a_fp8_ue8m0_dequant_matches_reference():
     """process_weights_after_loading dequant of the FP8-block wo_a weight.
 
-    Synthetic wo_a stub in the REAL quant formats: float8_e4m3fn 2D weight
-    (g*r, d) with a ue8m0 (uint8) block-scale weight_scale_inv. Compare the
-    built self.wo_a_bf16 against a hand-computed dequant reference.
+    Synthetic wo_a stub in the REAL quant formats, in the TPU-transposed
+    (in, out) = (d, g*r) layout the linear-method PWAL produces: float8_e4m3fn
+    2D weight (d, g*r) with a ue8m0 (uint8) block-scale weight_scale_inv shaped
+    (d_blocks, g*r_blocks). process_weights_after_loading must .t() both back to
+    the GPU (g*r, d) / (g*r_blocks, d_blocks) orientation before the (g, r, d)
+    view + block-scale dequant. Compare against a hand-computed reference.
+
+    NB: on a real TPU FP8 build the FP8 linear PWAL deletes weight_scale_inv and
+    re-stores the requantized scale as weight_scale (fp8.py), so this hasattr-
+    weight_scale_inv branch is exercised only by hand-built parity stubs like
+    this one. The else (plain transposed view+cast) branch is what the live
+    synthetic build reaches; see test_wo_a_dequant_else_branch_view_cast.
     """
     torch.manual_seed(0)
     g, r, d = 2, 8, 16
     block = 4  # r and d are exact multiples of the block size
     r_blocks, d_blocks = r // block, d // block
 
-    # FP8 e4m3 weight, 2D (g*r, d). Round random bf16 through the fp8 dtype so
-    # the stored values are exactly representable in fp8 (no double rounding).
-    w_full = torch.randn(g * r, d) * 0.5
-    w_fp8 = w_full.to(torch.float8_e4m3fn)
+    # FP8 e4m3 weight, 2D TPU layout (d, g*r). Round random bf16 through the fp8
+    # dtype so the stored values are exactly representable in fp8 (no double
+    # rounding). The GPU-orientation w3 (g, r, d) is recovered by .t().view.
+    w3_full = torch.randn(g, r, d) * 0.5            # logical GPU [g, r, d]
+    w_gr_d = w3_full.reshape(g * r, d)              # GPU (g*r, d)
+    w_tpu = w_gr_d.t().contiguous()                 # TPU (d, g*r)
+    w_fp8 = w_tpu.to(torch.float8_e4m3fn)
 
     # ue8m0 (uint8) block scales: small biased exponents around 127 (== 2**0).
-    # Stored 2D (g*r_blocks, d_blocks) -- the loader keeps wo_a.weight_scale_inv
-    # 2D and process_weights_after_loading does the .view(g, -1, last) reshape.
-    scale_u8 = torch.randint(120, 132, (g * r_blocks, d_blocks),
-                             dtype=torch.uint8)
+    # Stored 2D in the TPU-transposed (d_blocks, g*r_blocks) orientation; the
+    # production code does weight_scale_inv.t().contiguous().view(g, -1, ...).
+    scale_gr_d = torch.randint(120, 132, (g * r_blocks, d_blocks),
+                               dtype=torch.uint8)    # GPU (g*r_blocks, d_blocks)
+    scale_u8 = scale_gr_d.t().contiguous()           # TPU (d_blocks, g*r_blocks)
 
     wo_a = SimpleNamespace(
         weight=w_fp8,
@@ -168,12 +181,12 @@ def test_wo_a_fp8_ue8m0_dequant_matches_reference():
     VllmDeepseekV4MLAAttention.process_weights_after_loading(stub)
     got = stub.wo_a_bf16
 
-    # Hand-computed reference dequant.
-    w3 = w_fp8.view(g, r, d).to(torch.float32)
+    # Hand-computed reference dequant, from the recovered GPU orientation.
+    w3 = w_fp8.t().contiguous().view(g, r, d).to(torch.float32)
     # ue8m0 byte -> fp32 power of two: (byte << 23) reinterpreted as float32,
     # i.e. 2**(byte - 127). Matches torch_ref.upcast_e8m0_to_fp32.
     scale_fp32 = torch_ref.upcast_e8m0_to_fp32(
-        scale_u8.view(g, r_blocks, d_blocks))
+        scale_u8.t().contiguous().view(g, r_blocks, d_blocks))
     scale_exp = scale_fp32.repeat_interleave(block, dim=1) \
                           .repeat_interleave(block, dim=2)
     ref = (w3 * scale_exp).to(torch.bfloat16)
@@ -184,10 +197,17 @@ def test_wo_a_fp8_ue8m0_dequant_matches_reference():
 
 
 def test_wo_a_dequant_else_branch_view_cast():
-    """Non-quantized (synthetic) build with no weight_scale_inv: view + cast."""
+    """Non-quantized (synthetic) build with no weight_scale_inv: transpose + view + cast.
+
+    The TPU linear-method PWAL transposes wo_a.weight to (in, out) = (d, g*r)
+    before process_weights_after_loading runs, so the stored weight is (d, g*r)
+    -- NOT the GPU (g*r, d) layout. process_weights_after_loading must .t() it
+    back to (g*r, d), then view (g, r, d). This orientation is exactly what the
+    Task-12 integration crux surfaced; building the GPU layout here hid the bug.
+    """
     torch.manual_seed(0)
     g, r, d = 3, 4, 8
-    w = torch.randn(g * r, d, dtype=torch.bfloat16)
+    w = torch.randn(d, g * r, dtype=torch.bfloat16)  # TPU (in, out) = (d, g*r)
     wo_a = SimpleNamespace(weight=w, bmm_batch_size=g)
     stub = SimpleNamespace(wo_a=wo_a, o_lora_rank=r)
 
@@ -196,7 +216,7 @@ def test_wo_a_dequant_else_branch_view_cast():
 
     assert got.shape == (g, r, d)
     assert got.dtype == torch.bfloat16
-    torch.testing.assert_close(got, w.view(g, r, d))
+    torch.testing.assert_close(got, w.t().contiguous().view(g, r, d))
 
 
 def test_expand_wo_a_block_scales_repeats_blocks():

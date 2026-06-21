@@ -213,7 +213,13 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
                jax_view(page_indices), jax_view(cu_q_lens),
                jax_view(distribution))
 
-        ctx.kv_caches[kv_cache_index] = torch_view(updated_cache)
+        # Store the RAW JAX array back into the kv_caches list (NOT a
+        # torch_view): step_fun_impl returns this list straight to JAX as
+        # new_kv_caches without re-unwrapping, so a torchax.Tensor here leaks out
+        # of the jit boundary ("not a valid JAX type"). Mirrors the production
+        # MLA/flash paths (mla_attention.py:198, flash_attn.py:213), which store
+        # the bare JAX array.
+        ctx.kv_caches[kv_cache_index] = updated_cache
         output.copy_(torch_view(out_j))
 
     def _mla_swa_logical_page_size(self, cache_kv) -> int:
@@ -279,16 +285,34 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
         # rocm_aiter_mla_sparse._get_cached_wo_a_bf16:967-1001.
         g = self.wo_a.bmm_batch_size          # == self.n_local_groups
         r = self.o_lora_rank
-        d = self.wo_a.weight.shape[1]         # heads_per_group * head_dim
+        # TPU linear-method PWAL transposes the weight to (in, out) = (d, g*r)
+        # and re-stores it (unquantized.py:264 / fp8.py:155-156 jnp.transpose),
+        # so the loaded weight is (d, g*r) -- NOT the GPU (g*r, d) layout. d is
+        # therefore shape[0] (heads_per_group*head_dim), and we must .t() back to
+        # (g*r, d) before the row-major (g outer, r inner) view that _o_proj's
+        # einsum("tgd,grd->tgr") consumes as [g, r, d].
+        d = self.wo_a.weight.shape[0]         # heads_per_group * head_dim
         if hasattr(self.wo_a, "weight_scale_inv"):
-            w = self.wo_a.weight.view(g, r, d).to(torch.float32)
+            w = self.wo_a.weight.t().contiguous().view(g, r, d).to(torch.float32)
+            # weight_scale_inv is TPU-transposed to (d_blocks, g*r_blocks); .t()
+            # restores the GPU (g*r_blocks, d_blocks) layout, so the per-group
+            # view's trailing block dim is d_blocks == the TPU pre-transpose
+            # shape[0]. (Mirrors the GPU ref view(g, -1, weight_scale_inv.
+            # shape[-1]) which on the GPU (g*r_blocks, d_blocks) tensor is
+            # d_blocks.) NOTE: this branch is DEAD on a real TPU FP8 build -- the
+            # FP8 linear PWAL deletes weight_scale_inv and re-stores a
+            # requantized scale as weight_scale (fp8.py:165-167), so the else
+            # branch runs there. This branch survives only for hand-built parity
+            # stubs in the GPU+ue8m0 (transposed) layout.
             scale = self._expand_wo_a_block_scales(
-                self.wo_a.weight_scale_inv.view(
-                    g, -1, self.wo_a.weight_scale_inv.shape[-1]), r, d)
+                self.wo_a.weight_scale_inv.t().contiguous().view(
+                    g, -1, self.wo_a.weight_scale_inv.shape[0]), r, d)
             self.wo_a_bf16 = (w * scale).to(torch.bfloat16)
         else:
-            # Non-quantized (synthetic) build: just view+cast.
-            self.wo_a_bf16 = self.wo_a.weight.view(g, r, d).to(torch.bfloat16)
+            # Non-quantized (synthetic) build: transpose back to (g*r, d), then
+            # view+cast.
+            self.wo_a_bf16 = self.wo_a.weight.t().contiguous().view(
+                g, r, d).to(torch.bfloat16)
 
     def _expand_wo_a_block_scales(self, scale: torch.Tensor, r: int,
                                   d: int) -> torch.Tensor:
