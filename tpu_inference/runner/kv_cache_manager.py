@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, List
 
 import jax
 import jax.numpy as jnp
+import torch
 import vllm.envs as envs
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
@@ -66,6 +67,31 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
                 attn_module, CompressorStateCache)
 
 
+# DeepSeek-V4 sparse-MLA (mla_swa) KV-cache kernel contract.
+#
+# The `mla_swa` kernel (kernels/experimental/deepseek_v4/mla_swa.py) asserts
+# `cache_kv.dtype == jnp.uint8` and destructures `cache_kv.shape` as
+# `(num_blocks, page_size_per_kv_packing, kv_packing, lkv_dim)` with kv_packing
+# == 4 (32 // 8 for uint8) and lkv_dim == 640. 640 = align_to(448 fp8 nope +
+# 128 bf16 rope + 7 e8m0 scale, 128) (= align_to(583, 128)); the extra 57 bytes
+# are padding. Only the DSV4 *MLA attention* layer (DeepseekV4Attention, whose
+# forward calls forward_mqa -> mla_swa) uses this pool; the shared R1/V3 MLA
+# path keeps its floating dtype + packing-32 layout.
+DSV4_MLA_KV_PACKING = 4
+DSV4_MLA_PACKED_HEAD_SIZE = 640
+
+
+def is_dsv4_mla_attention(attn_module: AttentionLayerBase) -> bool:
+    """True only for the DSV4 MLA attention layer (forward_mqa -> mla_swa).
+
+    Deliberately narrower than `is_cache_for_ds_v4`: it excludes the
+    indexer / SWA / compressor DSV4 caches (which are allocated-but-dead on the
+    Phase-1 forced-dense path) and, crucially, the shared R1/V3 MLA path. Used
+    to gate the uint8 / packing-4 / 640 kernel-contract pool to this layer only.
+    """
+    return isinstance(attn_module, DeepseekV4Attention)
+
+
 class KVCacheManager:
 
     def __init__(self, runner: "TPUModelRunner"):
@@ -100,20 +126,47 @@ class KVCacheManager:
             block_size: int,
             num_kv_heads: int,
             head_size: int,
-            sliding_window: bool | None = None) -> KVCacheSpec:
+            sliding_window: bool | None = None,
+            dsv4_mla: bool = False) -> KVCacheSpec:
         if self.use_mla:
+            # The DSV4 sparse-MLA layer needs the `mla_swa` kernel-contract pool:
+            # uint8 dtype, packing 4, packed head_size 640. Everything else
+            # (R1/V3 MLA) keeps the runner's floating kv_cache_dtype + packing
+            # 32. `page_size_bytes` MUST be computed with the same dtype/packing
+            # used to allocate (num_blocks = tensor.size // page_size_bytes), so
+            # we thread the packing override into get_attention_page_size_bytes.
+            if dsv4_mla:
+                spec_dtype = torch.uint8
+                spec_head_size = DSV4_MLA_PACKED_HEAD_SIZE
+                mla_kv_packing = DSV4_MLA_KV_PACKING
+                # Leave cache_dtype_str=None for the DSV4-MLA spec so vLLM's
+                # `real_page_size_bytes` uses the generic
+                # `storage_block_size * num_kv_heads * head_size * dtype_size`
+                # formula (= block_size * 1 * 640 * 1), which exactly matches the
+                # TPU-actual `page_size_padded` we set below. The "fp8_ds_mla"
+                # cache_dtype_str path instead asserts a fixed 656/584-byte
+                # layout that does NOT match our packed-640/uint8 TPU pool and
+                # would trip `page_size_padded >= real_page_size`. The TPU shape
+                # is derived from get_kv_cache_shape_with_mesh, not from
+                # cache_dtype_str, so this is purely page-accounting bookkeeping.
+                spec_cache_dtype_str = None
+            else:
+                spec_dtype = self.runner.kv_cache_dtype
+                spec_head_size = head_size
+                mla_kv_packing = None
+                spec_cache_dtype_str = (
+                    self.runner.vllm_config.cache_config.cache_dtype)
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
-                self.runner.kv_cache_dtype, True)
+                self.runner.mesh, block_size, num_kv_heads, spec_head_size,
+                spec_dtype, True, mla_kv_packing=mla_kv_packing)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
                                 is not None else int(page_size_bytes))
             return MLAAttentionSpec(block_size=block_size,
                                     num_kv_heads=1,
-                                    head_size=head_size,
-                                    dtype=self.runner.kv_cache_dtype,
-                                    cache_dtype_str=self.runner.vllm_config.
-                                    cache_config.cache_dtype,
+                                    head_size=spec_head_size,
+                                    dtype=spec_dtype,
+                                    cache_dtype_str=spec_cache_dtype_str,
                                     page_size_padded=page_size_padded)
         else:
             page_size_bytes = get_attention_page_size_bytes(
@@ -610,7 +663,26 @@ class KVCacheManager:
                         kv_cache_spec[layer_name] = spec
                     continue
 
+                if is_dsv4_mla_attention(attn_module):
+                    # DSV4 sparse-MLA attention layer (forward_mqa -> mla_swa).
+                    # Its KV pool MUST match the kernel contract: uint8,
+                    # packing 4, packed head_size 640 (set inside
+                    # _create_attention_spec via dsv4_mla=True). Dense layers
+                    # (compress_ratio <= 1) return a None spec -- their KV lives
+                    # in the separate DeepseekV4SWACache, so we allocate no pool
+                    # for them here.
+                    spec = attn_module.get_kv_cache_spec(
+                        self.runner.vllm_config)
+                    if spec is None:
+                        continue
+                    kv_cache_spec[layer_name] = self._create_attention_spec(
+                        spec.block_size, 1, spec.head_size, dsv4_mla=True)
+                    continue
+
                 if is_cache_for_ds_v4(attn_module):
+                    # Other DSV4 caches (indexer / SWA / compressor). On the
+                    # Phase-1 forced-dense path these are allocated-but-dead;
+                    # keep their existing (R1/V3-shared) layout untouched.
                     spec = attn_module.get_kv_cache_spec(
                         self.runner.vllm_config)
                     assert spec is not None
@@ -784,10 +856,16 @@ class KVCacheManager:
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     else:
+                        # DSV4-MLA (uint8) pool packs at 4; keep page-size bytes
+                        # consistent with the allocation packing (see the
+                        # create_kv_caches call below).
+                        attn_mla_packing = (DSV4_MLA_KV_PACKING if
+                                            (self.use_mla and spec.dtype
+                                             == torch.uint8) else None)
                         total_group_page_size += get_attention_page_size_bytes(
                             self.runner.mesh, spec.block_size,
                             spec.num_kv_heads, spec.head_size, spec.dtype,
-                            self.use_mla)
+                            self.use_mla, mla_kv_packing=attn_mla_packing)
                 num_blocks = kv_cache_tensor.size // total_group_page_size
             else:
                 # If sharing KV cache, compute `num_blocks` using the page size
@@ -874,6 +952,21 @@ class KVCacheManager:
                         # NOTE: we'll multiply the num_kv_heads by 2 in the function
                         head_size = layer_spec.head_size
 
+                        # DSV4-MLA gate: the sparse-MLA (mla_swa) pool is the
+                        # only MLA pool with a uint8 dtype (set by the
+                        # dsv4_mla=True spec branch). The shared R1/V3 MLA path
+                        # uses a floating dtype (the mla v2 kernel asserts
+                        # floating), so `use_mla and dtype is uint8` uniquely
+                        # identifies DSV4-MLA. Allocate it with packing 4 to
+                        # match the kernel contract; everything else keeps the
+                        # default (32). This packing matches the one used for
+                        # this layer's page_size_bytes in _create_attention_spec,
+                        # keeping num_blocks consistent.
+                        mla_kv_packing = None
+                        if (self.use_mla
+                                and layer_spec.dtype == torch.uint8):
+                            mla_kv_packing = DSV4_MLA_KV_PACKING
+
                         kv_cache = create_kv_caches(
                             num_blocks=num_blocks,
                             block_size=layer_spec.block_size,
@@ -883,6 +976,7 @@ class KVCacheManager:
                             layer_names=[f'kv_cache_tensor.{i}'],
                             cache_dtype=t2j_dtype(layer_spec.dtype),
                             use_mla=self.use_mla,
+                            mla_kv_packing=mla_kv_packing,
                         )[0]
                         kv_caches.append(kv_cache)
 

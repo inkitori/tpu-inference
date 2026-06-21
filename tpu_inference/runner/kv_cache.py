@@ -53,8 +53,16 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                                  actual_num_kv_heads: int,
                                  actual_head_dim: int,
                                  kv_dtype: any,
-                                 use_mla: bool = False):
-    """Gets the KV cache shape based on the mesh configuration."""
+                                 use_mla: bool = False,
+                                 mla_kv_packing: int | None = None):
+    """Gets the KV cache shape based on the mesh configuration.
+
+    ``mla_kv_packing`` overrides the MLA packing factor (default
+    ``envs.MLA_KV_PACKING_SIZE`` = 32). The DeepSeek-V4 sparse-MLA (``mla_swa``)
+    pool is uint8 and MUST use packing 4 (``32 // 8``); the shared R1/V3 MLA path
+    keeps 32. Threaded per-layer from the runner so only the DSV4-MLA layer is
+    affected.
+    """
 
     model_cnt = utils.get_mesh_shape_product(mesh,
                                              ShardingAxisName.KV_CACHE_HEAD)
@@ -66,6 +74,8 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
     if use_mla:
         # No assertion needed: MLA compresses all KV into a single latent vector,
         # so actual_num_kv_heads is never used in mla.get_kv_cache_shape().
+        kv_packing = (mla_kv_packing if mla_kv_packing is not None else
+                      envs.MLA_KV_PACKING_SIZE)
         get_kv_cache_shape_fn = mla.get_kv_cache_shape
         shape = list(
             get_kv_cache_shape_fn(
@@ -73,7 +83,7 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                 block_size,
                 actual_head_dim,
                 kv_dtype,
-                envs.MLA_KV_PACKING_SIZE,
+                kv_packing,
                 transpose_kv_cache=envs.MLA_TRANSPOSE_KV_CACHE))
     else:
         assert actual_num_kv_heads % model_cnt == 0
@@ -98,6 +108,7 @@ def create_kv_caches(
     layer_names: List[str],
     cache_dtype: jnp.dtype = DEFAULT_KV_CACHE_DTYPE,
     use_mla: bool = False,
+    mla_kv_packing: int | None = None,
 ) -> List[jax.Array]:
     """
     Creates a list of KV cache where each array mapps to single attention layer.
@@ -124,7 +135,8 @@ def create_kv_caches(
 
     cache_shape = get_kv_cache_shape_with_mesh(mesh, num_blocks, block_size,
                                                num_kv_heads, head_size,
-                                               cache_dtype, use_mla)
+                                               cache_dtype, use_mla,
+                                               mla_kv_packing=mla_kv_packing)
 
     # num_blocks --> shard by data batch
     # block_size --> shard by context
@@ -152,8 +164,18 @@ def create_kv_caches(
     return kv_caches
 
 
-def get_attention_page_size_bytes(mesh, block_size, num_kv_heads, head_size,
-                                  dtype, use_mla) -> int:
+def get_attention_page_size_bytes(mesh,
+                                  block_size,
+                                  num_kv_heads,
+                                  head_size,
+                                  dtype,
+                                  use_mla,
+                                  mla_kv_packing: int | None = None) -> int:
+    # ``mla_kv_packing`` MUST match the packing used by ``create_kv_caches`` for
+    # this layer, because ``num_blocks = kv_cache_tensor.size //
+    # page_size_bytes`` (kv_cache_manager.initialize_kv_cache). A desync here
+    # silently computes the wrong num_blocks. For the DSV4-MLA (uint8) pool this
+    # is 4; for the shared R1/V3 MLA pool it stays at the default 32.
     jax_dtype = to_jax_dtype(dtype)
     bits = dtypes.itemsize_bits(jax_dtype)
     kv_cache_shape = get_kv_cache_shape_with_mesh(
@@ -164,5 +186,6 @@ def get_attention_page_size_bytes(mesh, block_size, num_kv_heads, head_size,
         actual_head_dim=head_size,
         kv_dtype=jax_dtype,
         use_mla=use_mla,
+        mla_kv_packing=mla_kv_packing,
     )
     return int(bits * np.prod(kv_cache_shape)) // 8
