@@ -29,8 +29,10 @@ rebinds it on ``amd.model`` directly. It is invoked from
 ``_maybe_patch_for_deepseek_v4`` in ``vllm_model_wrapper`` while ``is_rocm`` is
 forced True and the package has been reloaded onto the AMD implementation.
 """
+import jax.numpy as jnp
 import torch
 import torch.nn as nn
+from torchax.interop import jax_view, torch_view
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
@@ -89,7 +91,37 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
 
     def _o_proj(self, o: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        # o: [N, n_local_heads, head_dim]. Step 7 of the attention dataflow.
+        # 1) inverse GPT-J RoPE on the last rope_head_dim dims, computed in fp32.
+        o = self._inverse_rope_gptj(o, positions).to(o.dtype)
+        # 2) group view -> grouped BMM via einsum("tgd,grd->tgr") over n_local_groups.
+        #    wo_a_bf16 is the dequantized+reshaped weight built in
+        #    process_weights_after_loading (Task 10): the raw self.wo_a.weight is
+        #    2D float8_e4m3fn, NOT this layout — do NOT read it directly here.
+        n = o.shape[0]
+        o_g = o.reshape(n, self.n_local_groups, -1)   # [N, G, heads_per_g*head_dim]
+        wo_a_w = self.wo_a_bf16  # bf16 [n_local_groups, o_lora_rank, heads_per_g*head_dim]
+        z = torch.einsum("tgd,grd->tgr", o_g.float(),
+                         wo_a_w.float()).to(o.dtype)  # [N, G, o_lora_rank]
+        # 3) wo_b RowParallelLinear over the flattened [N, G*o_lora_rank].
+        return self.wo_b(z.reshape(n, -1))
+
+    def _inverse_rope_gptj(self, x: torch.Tensor,
+                           positions: torch.Tensor) -> torch.Tensor:
+        # GPT-J interleaved inverse RoPE on the last rope_head_dim dims (fp32).
+        rope_dim = self.rope_head_dim
+        cache = self.rotary_emb.cos_sin_cache  # [max_pos, rope_dim] = cat(cos, sin)
+        cs = cache[positions.long()].float()
+        half = rope_dim // 2
+        cos = cs[..., :half].repeat_interleave(2, dim=-1).unsqueeze(-2)
+        sin = -cs[..., half:].repeat_interleave(2, dim=-1).unsqueeze(-2)
+        out = x.clone().float()
+        rot = out[..., -rope_dim:]
+        x1 = rot[..., ::2]
+        x2 = rot[..., 1::2]
+        rotated = torch.stack((-x2, x1), dim=-1).flatten(-2)
+        out[..., -rope_dim:] = rot * cos + rotated * sin
+        return out
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         return MLAAttentionSpec(
