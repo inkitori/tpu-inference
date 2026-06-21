@@ -6,10 +6,30 @@ Companion doc with full detail: **`DSV4_BRINGUP_NOTES.md`** (architecture map, k
 numeric references). Read that second.
 
 ## TL;DR state (as of this handoff)
-The model **constructs and loads** on v6e-8 through the vllm/torchax path. The attention **forward is still a
-pass-through stub** (returns hidden_states unchanged) — so output is NOT yet correct. Next big task = implement the
-real attention forward using the #2903 Pallas kernels (now in-tree). Everything else (weight load, FP4 experts,
-DP+EP sharding, mHC, MoE plumbing) is wired.
+The model **constructs, loads, and FITS IN HBM on v6e-8** through the vllm/torchax path (Risk-1 CLEARED). The engine
+initializes (KV cache built). It then **crashes in the first forward** at the **FP4 MoE matmul kernel** — NOT in
+attention. Attention's `forward` is also still a pass-through stub (separate, later issue). So there are now TWO things
+to fix, in this order: (0) the FP4 GMM compile failure on v6e [IMMEDIATE], then (1) the real attention forward.
+
+### ⛔ IMMEDIATE BLOCKER (post-load boot result) — FP4 GMM does NOT compile on v6e
+First real forward dies with:
+`MosaicError: INTERNAL: Mosaic failed to compile TPU kernel: Unsupported type 'vector<8x128x8xf4E2M1FN>'`
+at `tpu_inference/kernels/megablox/gmm_v2.py:500` (`_matmul` convert_element_type) / `:584` (`matmul_first_last`).
+The offending MLIR op is `tpu.unpack_subelements(... : vector<8x128x8xf4E2M1FN>) -> vector<8x128xf32>` — i.e. the GMM
+kernel reads FP4 expert weights and tries to upcast them in VMEM via the **native f4E2M1FN vector unpack**, which the
+**v6e Mosaic compiler does not support** (it's a v7+ feature). This is EXACTLY spec Risk-1's open question — answer:
+**FP4 GMM as-written does not run on v6e.** (Loading/HBM is fine; it's the *compute* kernel that fails.)
+Decision point (spec Open-Decision-A). Options, best-first given the "keep FP4" constraint:
+- **(a) Port the kernel's FP4 unpack to v6e-supported ops** (recommended, matches user directive): make `gmm_v2.py`
+  treat the FP4 rhs as packed **uint8** and unpack the nibbles → bf16 with ordinary integer/bitwise ops in VMEM
+  (helpers exist: `layers/common/quantization/__init__.py` `u8_unpack_e2m1`, `e8m0_to_fp32`), instead of emitting a
+  `vector<f4E2M1FN>` that calls `tpu.unpack_subelements`. Keeps experts FP4 in HBM (still fits), just changes how the
+  dequant is expressed so Mosaic on v6e accepts it. Look at how PR #1756 added FP4 to gmm_v2 and where the
+  f4E2M1FN-typed convert is emitted (`gmm_v2.py:500`).
+- (b) INT4 requant of experts (v6e-supported per spec, accuracy hit) — conflicts with "keep FP4".
+- (c) Run on v7 hardware — not available here.
+HBM proof (Risk-1 cleared): `total_hbm_used_gb=187.14 / cap 229.97 / avail 42.83`; per-chip after KV cache 28.75/31.25 GiB.
+KV cache: 531,456 tokens, 169 cache tensors, engine init 9.03s.
 
 ## Environment (all confirmed working)
 - TPU v6e-8 (`ct6e-standard-8t-tpu`), 8 chips, 31.25 GiB/chip free. 1.4 TB host RAM. venv: `source /home/enyouki/.venv/bin/activate` (jax 0.10.1).
