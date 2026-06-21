@@ -31,6 +31,6 @@ class Int4Config:
 
     def bits_for(self, module_name: str) -> tuple[int, int]:
         for k, v in self.overrides.items():
-            if module_name.endswith(k) or k in module_name:
+            if module_name == k or module_name.endswith("." + k):
                 return int(v["bits"]), int(v.get("group_size", self.group_size))
         return self.bits, self.group_size

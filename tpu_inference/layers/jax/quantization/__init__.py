@@ -45,8 +45,7 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
     mlx_block = getattr(model_config.hf_config, "quantization", None) \
         or hg_quant_config.get("quantization")
     if isinstance(mlx_block, dict) and "group_size" in mlx_block and "bits" in mlx_block:
-        from tpu_inference.layers.jax.quantization.int4 import Int4Config
-        return Int4Config.from_hf_quant_config(mlx_block)
+        return _Int4Config.from_hf_quant_config(mlx_block)
 
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
