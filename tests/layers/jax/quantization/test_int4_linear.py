@@ -42,12 +42,21 @@ def test_int4_linear_apply_matches_reference():
     w = rng.standard_normal((128, 64)).astype(np.float32)
     packed, s, b, gold = _quant(w)
 
-    # Build method — mirrors real construction: einsum_str comes from layer.
-    # The layer stub must carry einsum_str so Int4LinearMethod.__init__ can read it.
+    # Build method — mirrors real factory contract (fp8.py:681 pattern):
+    #   Int4LinearMethod(layer, linear_config, bits, group_size)
+    # The layer stub carries einsum_str; linear_config stub carries in/out/weight_sharding
+    # (same fields QuantLinearConfig exposes; we use a simple namespace here since
+    # QuantLinearConfig requires a real JaxEinsum with a weight param).
     layer = type("L", (), {})()
     layer.einsum_str = "mn,pn->mp"   # real JaxEinsum carries this
 
-    m = Int4LinearMethod(layer, Int4Config(), bits=4, group_size=64)
+    linear_config = type("LC", (), {
+        "in_features": (64,),
+        "out_features": (128,),
+        "weight_sharding": None,
+    })()
+
+    m = Int4LinearMethod(layer, linear_config, bits=4, group_size=64)
 
     # Attach packed params using [...]  accessor (mirrors nnx.Param [...] access).
     def _param(arr):

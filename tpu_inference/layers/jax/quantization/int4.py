@@ -50,24 +50,29 @@ class Int4LinearMethod(QuantizeMethodBase):
     """Phase-1 int4 linear method: dequantize in XLA (on-device), then einsum.
 
     Mirrors Fp8TensorwiseLinearMethod structure:
-    - stores einsum_str from layer at construction
-    - create_weights_jax declares weight (uint32), scales (bf16), biases (bf16)
-    - apply_jax calls mlx_dequantize then jnp.einsum with self.einsum_str
+    - __init__(layer, linear_config, bits, group_size) — reads dims from linear_config
+    - create_weights_jax(layer, *weight_args, rngs, **extra_weight_attrs) — no required kwargs
+    - apply_jax(layer, x) calls mlx_dequantize then jnp.einsum with self.einsum_str
     """
 
-    def __init__(self, layer: JaxModule, config: Int4Config, bits: int,
+    def __init__(self, layer: JaxModule, linear_config, bits: int,
                  group_size: int):
-        # Mirror FP8: read einsum_str from the layer at construction time so
-        # apply_jax(layer, x) needs no extra kwargs — matching the real dispatch
-        # seam at linear.py:88: self.quant_method.apply_jax(self, inputs)
+        # Mirror FP8 (fp8.py:86-104): read einsum_str and dims from layer/linear_config
+        # at construction time so create_weights_jax and apply_jax need no extra kwargs.
+        # Matches the real dispatch seam linear.py:82: create_weights_jax(self, rngs=rngs)
+        # and linear.py:88: apply_jax(self, inputs).
         self.einsum_str = layer.einsum_str
-        self.config = config
+        self.linear_config = linear_config
         self.bits = bits
         self.group_size = group_size
 
+        # Flatten in_features and out_features from linear_config (same as FP8 fp8.py:94-95).
+        self.in_features = math.prod(linear_config.in_features)
+        self.out_features = math.prod(linear_config.out_features)
+        self.weight_sharding = linear_config.weight_sharding
+
     def create_weights_jax(self, layer: JaxModule, *weight_args, rngs,
-                           in_features: int, out_features: int,
-                           weight_sharding=None, **extra_weight_attrs):
+                           **extra_weight_attrs):
         """Declare packed weight, scales, and biases parameters on layer.
 
         Shapes (MLX layout, output-major):
@@ -78,10 +83,21 @@ class Int4LinearMethod(QuantizeMethodBase):
         Partition spec mirrors FP8 tensorwise: shard the output dim (axis 0),
         leave the contraction dim (axis 1) unsharded — we must not shard finer
         than group_size along the contraction axis.
+
+        Dims are read from self (set at __init__ from linear_config), not from kwargs.
         """
+        in_features = self.in_features
+        out_features = self.out_features
+        weight_sharding = self.weight_sharding
+
+        assert in_features % self.group_size == 0, (
+            f"in_features={in_features} must be divisible by group_size={self.group_size}")
         per_word = 32 // self.bits
-        n_words = math.ceil(in_features / per_word)
-        n_groups = math.ceil(in_features / self.group_size)
+        assert in_features % per_word == 0, (
+            f"in_features={in_features} must be divisible by per_word={per_word} "
+            f"(bits={self.bits})")
+        n_words = in_features // per_word
+        n_groups = in_features // self.group_size
 
         # Output-dim sharding mirrors Fp8TensorwiseLinearMethod.
         if isinstance(weight_sharding, P) and len(weight_sharding) > 0:
