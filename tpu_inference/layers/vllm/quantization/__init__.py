@@ -26,6 +26,8 @@ from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensor
     VllmCompressedTensorsConfig
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.fp8 import VllmFp8Config
+from tpu_inference.layers.vllm.quantization.mlx import (VllmMLXConfig,
+                                                        is_mlx_quantized)
 from tpu_inference.layers.vllm.quantization.mxfp4 import VllmMxfp4Config
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedConfig
@@ -34,6 +36,12 @@ from tpu_inference.layers.vllm.quantization.unquantized import \
 def get_tpu_quantization_config(vllm_config: VllmConfig,
                                 mesh: Mesh) -> QuantizationConfig:
     model_config = copy.deepcopy(vllm_config.model_config)
+    # MLX checkpoints carry a quantization_config block (group_size + bits) but
+    # no quant_method key, so vLLM leaves model_config.quantization unset.
+    # Detect them here and route to VllmMLXConfig.
+    if model_config.quantization is None and is_mlx_quantized(
+            model_config.hf_config):
+        model_config.quantization = quant_methods.MLX
     # TODO(kyuyeunk): Add support for "tpu_int8".
     method_to_config: dict[str | None, Type[QuantizationConfig]] = {
         None: VllmUnquantizedConfig,
@@ -41,6 +49,7 @@ def get_tpu_quantization_config(vllm_config: VllmConfig,
         quant_methods.AWQ: VllmAWQConfig,
         quant_methods.FP8: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
+        quant_methods.MLX: VllmMLXConfig,
     }
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
