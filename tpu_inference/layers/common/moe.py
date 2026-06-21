@@ -138,6 +138,8 @@ def moe_apply(
                     w2_scale=weights.w2_weight_scale,
                     w1_bias=weights.w13_bias,
                     w2_bias=weights.w2_bias,
+                    w1_groupbias=weights.w13_groupbias,
+                    w2_groupbias=weights.w2_groupbias,
                     gating_output=gating_output,
                     topk=layer.top_k,
                     renormalize=layer.renormalize,

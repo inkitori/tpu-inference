@@ -46,6 +46,15 @@ class FusedMoEWeights:
     w2_weight: jax.Array | Tensor
     w2_weight_scale: jax.Array | Tensor | None
     w2_bias: jax.Array | Tensor | None
+    # Per-quant-block affine bias for MLX-style affine quant, where weight
+    # reconstruction is ``w = scale * q + groupbias``. Rides the SAME rails as
+    # ``w13_weight_scale``/``w2_weight_scale`` (NOT the per-channel ``w13_bias``/
+    # ``w2_bias`` MLP-bias rails): it is part of weight reconstruction inside the
+    # k-loop and so must apply on EVERY shard, exactly like scale. Same
+    # ``[E, num_blocks, 1, N]`` layout as the processed scale. Defaults to None so
+    # the dozen+ non-MLX callers (unquantized/fp8/awq/mxfp4/w4a8) are unaffected.
+    w13_groupbias: jax.Array | Tensor | None = None
+    w2_groupbias: jax.Array | Tensor | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -231,9 +240,11 @@ def process_moe_weights(
     w13_weight = weights.w13_weight
     w13_weight_scale = weights.w13_weight_scale
     w13_bias = weights.w13_bias
+    w13_groupbias = weights.w13_groupbias
     w2_weight = weights.w2_weight
     w2_weight_scale = weights.w2_weight_scale
     w2_bias = weights.w2_bias
+    w2_groupbias = weights.w2_groupbias
 
     num_experts, hidden_size, intermediate_size = w2_weight.shape
 
@@ -247,6 +258,12 @@ def process_moe_weights(
             w3_weight_scale = w13_weight_scale[:, 1::2, :]
             w13_weight_scale = jnp.concat([w1_weight_scale, w3_weight_scale],
                                           axis=1)
+
+        if w13_groupbias is not None:
+            # groupbias rides the scale rails: same [E, out, n_groups] layout.
+            w1_groupbias = w13_groupbias[:, ::2, :]
+            w3_groupbias = w13_groupbias[:, 1::2, :]
+            w13_groupbias = jnp.concat([w1_groupbias, w3_groupbias], axis=1)
 
         if w13_bias is not None:
             w1_bias = w13_bias[:, ::2]
@@ -269,6 +286,16 @@ def process_moe_weights(
         w2_weight_scale = w2_weight_scale.astype(jnp.float32)
         w2_weight_scale = jnp.swapaxes(w2_weight_scale, 1, 2)
         w2_weight_scale = jnp.expand_dims(w2_weight_scale, 2)
+    # groupbias rides the scale rails: identical swapaxes + expand_dims so it
+    # lands in the same [E, num_blocks, 1, N] layout the kernel expects.
+    if w13_groupbias is not None:
+        w13_groupbias = w13_groupbias.astype(jnp.float32)
+        w13_groupbias = jnp.swapaxes(w13_groupbias, 1, 2)
+        w13_groupbias = jnp.expand_dims(w13_groupbias, 2)
+    if w2_groupbias is not None:
+        w2_groupbias = w2_groupbias.astype(jnp.float32)
+        w2_groupbias = jnp.swapaxes(w2_groupbias, 1, 2)
+        w2_groupbias = jnp.expand_dims(w2_groupbias, 2)
     if w13_bias is not None:
         w13_bias = w13_bias.astype(jnp.float32)
         w13_bias = jnp.expand_dims(w13_bias, 1)
@@ -365,6 +392,12 @@ def process_moe_weights(
                                                   concat_dim=3,
                                                   name="w13_weight_scale")
 
+            if w13_groupbias is not None:
+                # groupbias is 4D like scale -> concat_dim=3 (NOT 2).
+                w13_groupbias = process_w13_tp(tensor=w13_groupbias,
+                                               concat_dim=3,
+                                               name="w13_groupbias")
+
             if w13_bias is not None:
                 w13_bias = process_w13_tp(tensor=w13_bias,
                                           concat_dim=2,
@@ -386,6 +419,12 @@ def process_moe_weights(
                                                   concat_dim=3,
                                                   name="w13_weight_scale")
 
+            if w13_groupbias is not None:
+                # groupbias is 4D like scale -> concat_dim=3 (NOT 2).
+                w13_groupbias = process_w13_ep(tensor=w13_groupbias,
+                                               concat_dim=3,
+                                               name="w13_groupbias")
+
             if w13_bias is not None:
                 w13_bias = process_w13_ep(tensor=w13_bias,
                                           concat_dim=2,
@@ -406,9 +445,11 @@ def process_moe_weights(
         w13_weight=w13_weight,
         w13_weight_scale=w13_weight_scale,
         w13_bias=w13_bias,
+        w13_groupbias=w13_groupbias,
         w2_weight=w2_weight,
         w2_weight_scale=w2_weight_scale,
         w2_bias=w2_bias,
+        w2_groupbias=w2_groupbias,
     )
 
 
@@ -424,28 +465,39 @@ def shard_moe_weights(
                 w13_weight=ep_sharding,
                 w13_weight_scale=ep_sharding,
                 w13_bias=ep_sharding,
+                w13_groupbias=ep_sharding,
                 w2_weight=ep_sharding,
                 w2_weight_scale=ep_sharding,
                 w2_bias=ep_sharding,
+                w2_groupbias=ep_sharding,
             )
         case MoEBackend.GMM_TP:
             # When using per-channel, in_dim // block_size == 1. This means we
             # are unable to shard w2_weight_scale along 1st dim. Therefore, we
             # fully replicate it instead.
-            if (weights.w2_weight_scale is not None
-                    and weights.w2_weight_scale.shape[1] == 1):
-                w2_weight_scale_p_spec = P()
-            else:
-                w2_weight_scale_p_spec = P(None, ShardingAxisName.MLP_TENSOR)
+            def _w2_grouped_p_spec(grouped):
+                # The grouped w2 tensors (scale / groupbias) are sharded along
+                # the block dim (dim 1) only when there is more than one block;
+                # a single block (per-channel) cannot shard, so replicate.
+                if grouped is not None and grouped.shape[1] == 1:
+                    return P()
+                return P(None, ShardingAxisName.MLP_TENSOR)
+
+            w2_weight_scale_p_spec = _w2_grouped_p_spec(weights.w2_weight_scale)
+            # groupbias rides the scale rails: same w13 spec, and the same
+            # block-dim-aware w2 spec computed from its OWN block dim.
+            w2_groupbias_p_spec = _w2_grouped_p_spec(weights.w2_groupbias)
+            w13_grouped_sharding = NamedSharding(
+                mesh,
+                P(None, None, None, ShardingAxisName.MLP_TENSOR),
+            )  # (num_experts, in_dim // block_size, 1, out_dim)
             weight_shardings = FusedMoEWeights(
                 w13_weight=NamedSharding(
                     mesh,
                     P(None, None, ShardingAxisName.MLP_TENSOR),
                 ),  # (num_experts, out_dim, in_dim)
-                w13_weight_scale=NamedSharding(
-                    mesh,
-                    P(None, None, None, ShardingAxisName.MLP_TENSOR),
-                ),  # (num_experts, in_dim // block_size, 1, out_dim)
+                w13_weight_scale=w13_grouped_sharding,
+                w13_groupbias=w13_grouped_sharding,
                 w13_bias=NamedSharding(
                     mesh,
                     P(None, None, ShardingAxisName.MLP_TENSOR),
@@ -457,6 +509,7 @@ def shard_moe_weights(
                 w2_weight_scale=NamedSharding(
                     mesh, w2_weight_scale_p_spec
                 ),  # (num_experts, in_dim // block_size, 1, out_dim)
+                w2_groupbias=NamedSharding(mesh, w2_groupbias_p_spec),
                 w2_bias=NamedSharding(
                     mesh,
                     P(None, None, None),
@@ -469,18 +522,22 @@ def shard_moe_weights(
                 w13_weight=Layout((0, 1, 2, 3)),
                 w13_weight_scale=Layout((0, 1, 2, 3, 4)),
                 w13_bias=Layout((0, 1, 2, 3)),
+                w13_groupbias=Layout((0, 1, 2, 3, 4)),
                 w2_weight=Layout((0, 1, 2)),
                 w2_weight_scale=Layout((0, 1, 2, 3)),
                 w2_bias=Layout((0, 1, 2)),
+                w2_groupbias=Layout((0, 1, 2, 3)),
             )
         case MoEBackend.GMM_TP | MoEBackend.GMM_EP:
             weight_layouts = FusedMoEWeights(
                 w13_weight=Layout((0, 1, 2)),
                 w13_weight_scale=Layout((0, 1, 2, 3)),
                 w13_bias=Layout((0, 1, 2)),
+                w13_groupbias=Layout((0, 1, 2, 3)),
                 w2_weight=Layout((0, 1, 2)),
                 w2_weight_scale=Layout((0, 1, 2, 3)),
                 w2_bias=Layout((0, 1, 2)),
+                w2_groupbias=Layout((0, 1, 2, 3)),
             )
 
     for field in fields(FusedMoEWeights):

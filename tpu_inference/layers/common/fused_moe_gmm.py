@@ -93,20 +93,38 @@ def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
+                rhs_groupbias,
                 rhs_bias,
                 group_sizes,
                 group_offset,
                 fuse_act=None,
                 preferred_element_type=None):
+    # The MLX affine path (rhs_groupbias is not None) reconstructs the weight
+    # per quant-block as ``w = scale*q + groupbias`` and uses fine-grained quant
+    # blocks (e.g. group_size=64 -> num_blocks>1 along the contraction dim). The
+    # quantized-lhs fast path in gmm_v2 strides the k-loop by the 512-wide lhs
+    # quant block and indexes the rhs scale/groupbias by ``start_k // rhs_block``
+    # -- so when the rhs block is finer than 512 the per-block scale/groupbias is
+    # mis-applied (collapses to b_id=0), silently corrupting the result. Keep the
+    # lhs full-precision for the affine path so each rhs quant block gets its own
+    # scale/groupbias (verified exact vs the load-time dequant; see the e2e gate
+    # and tests/kernels/megablox/test_gmm_v2_groupbias.py). The bf16 and
+    # symmetric per-channel (single-block) paths are unaffected and keep the
+    # quantized-lhs fast path.
+    maybe_quantize_lhs = rhs_groupbias is None
     gmm_res = gmm_v2(
         lhs=lhs,
         rhs=rhs,
         rhs_scale=rhs_scale,
+        # Per-quant-block affine bias (w = scale*q + groupbias). None for the
+        # bf16 / symmetric-int paths (zero overhead, like rhs_scale=None).
+        rhs_groupbias=rhs_groupbias,
         rhs_bias=rhs_bias,
         group_sizes=group_sizes,
         group_offset=group_offset[0],
         zero_initialize=False,
         fuse_act=fuse_act,
+        maybe_quantize_lhs=maybe_quantize_lhs,
         preferred_element_type=preferred_element_type,
     )
     return gmm_res
@@ -130,9 +148,11 @@ def moe_gmm_local(
     x: jax.Array,
     w1: jax.Array,
     w1_scale: jax.Array | None,
+    w1_groupbias: jax.Array | None,
     w1_bias: jax.Array | None,
     w2: jax.Array,
     w2_scale: jax.Array | None,
+    w2_groupbias: jax.Array | None,
     w2_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
@@ -157,6 +177,7 @@ def moe_gmm_local(
         x,
         w1,
         w1_scale,
+        w1_groupbias,
         w1_bias,
         group_sizes,
         group_offset,
@@ -186,6 +207,7 @@ def moe_gmm_local(
         gmm2_res = gmm_wrapper(gmm1_res,
                                w2,
                                w2_scale,
+                               w2_groupbias,
                                w2_bias,
                                group_sizes,
                                group_offset,
@@ -209,6 +231,7 @@ def moe_gmm_local(
         gmm2_res = gmm_wrapper(gmm1_res,
                                w2,
                                w2_scale,
+                               w2_groupbias,
                                w2_bias,
                                group_sizes,
                                group_offset,
@@ -249,9 +272,11 @@ def tensor_parallel_gmm(
     x: jax.Array,
     w1: jax.Array,
     w1_scale: jax.Array | None,
+    w1_groupbias: jax.Array | None,
     w1_bias: jax.Array | None,
     w2: jax.Array,
     w2_scale: jax.Array | None,
+    w2_groupbias: jax.Array | None,
     w2_bias: jax.Array | None,
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
@@ -271,12 +296,19 @@ def tensor_parallel_gmm(
 
     w1_scale_spec = (None if w1_scale is None else P(
         None, None, None, ShardingAxisName.MLP_TENSOR))
+    # groupbias rides the scale rails: same w1 spec (shard the out dim), and the
+    # same block-dim-aware w2 rule computed from its OWN block count.
+    w1_groupbias_spec = (None if w1_groupbias is None else P(
+        None, None, None, ShardingAxisName.MLP_TENSOR))
     w1_bias_spec = (None if w1_bias is None else P(
         None, None, ShardingAxisName.MLP_TENSOR))
 
     num_blocks = 1 if w2_scale is None else w2_scale.shape[1]
     w2_scale_spec = (None if num_blocks == 1 else P(
         None, ShardingAxisName.MLP_TENSOR, None, None))
+    num_gb_blocks = 1 if w2_groupbias is None else w2_groupbias.shape[1]
+    w2_groupbias_spec = (None if w2_groupbias is None or num_gb_blocks == 1 else
+                         P(None, ShardingAxisName.MLP_TENSOR, None, None))
     w2_bias_spec = None if w2_bias is None else P(None, None, None)
 
     return jax.shard_map(
@@ -293,9 +325,11 @@ def tensor_parallel_gmm(
             data_p_spec,
             w1_spec,
             w1_scale_spec,
+            w1_groupbias_spec,
             w1_bias_spec,
             w2_spec,
             w2_scale_spec,
+            w2_groupbias_spec,
             w2_bias_spec,
             data_p_spec,
             P(),
@@ -308,9 +342,11 @@ def tensor_parallel_gmm(
         x,
         w1,
         w1_scale,
+        w1_groupbias,
         w1_bias,
         w2,
         w2_scale,
+        w2_groupbias,
         w2_bias,
         group_sizes,
         group_offset,
@@ -323,9 +359,11 @@ def expert_parallel_gmm(
     x: jax.Array,
     w1: jax.Array,
     w1_scale: jax.Array | None,
+    w1_groupbias: jax.Array | None,
     w1_bias: jax.Array | None,
     w2: jax.Array,
     w2_scale: jax.Array | None,
+    w2_groupbias: jax.Array | None,
     w2_bias: jax.Array | None,
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
@@ -345,8 +383,12 @@ def expert_parallel_gmm(
     group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
 
     w1_scale_spec = None if w1_scale is None else ep_p_spec
+    # groupbias rides the scale rails: sharded on the leading expert axis, exactly
+    # like scale.
+    w1_groupbias_spec = None if w1_groupbias is None else ep_p_spec
     w1_bias_spec = None if w1_bias is None else ep_p_spec
     w2_scale_spec = None if w2_scale is None else ep_p_spec
+    w2_groupbias_spec = None if w2_groupbias is None else ep_p_spec
     w2_bias_spec = None if w2_bias is None else ep_p_spec
 
     return jax.shard_map(
@@ -363,9 +405,11 @@ def expert_parallel_gmm(
             data_p_spec,
             ep_p_spec,
             w1_scale_spec,
+            w1_groupbias_spec,
             w1_bias_spec,
             ep_p_spec,
             w2_scale_spec,
+            w2_groupbias_spec,
             w2_bias_spec,
             data_p_spec,
             ep_p_spec,
@@ -378,9 +422,11 @@ def expert_parallel_gmm(
         x,
         w1,
         w1_scale,
+        w1_groupbias,
         w1_bias,
         w2,
         w2_scale,
+        w2_groupbias,
         w2_bias,
         group_sizes,
         group_offset,
@@ -433,6 +479,9 @@ def fused_moe_func(
     w2_bias: jax.Array | None,
     gating_output: jax.Array,
     topk: int,
+    w1_groupbias: jax.Array | None = None,
+    w2_groupbias: jax.Array | None = None,
+    *,
     renormalize: bool,
     mesh: Mesh,
     use_ep: bool,
@@ -561,9 +610,11 @@ def fused_moe_func(
             x,
             w1,
             w1_scale,
+            w1_groupbias,
             w1_bias,
             w2,
             w2_scale,
+            w2_groupbias,
             w2_bias,
             group_sizes,
             topk_argsort_revert_indices,
@@ -579,9 +630,11 @@ def fused_moe_func(
             x,
             w1,
             w1_scale,
+            w1_groupbias,
             w1_bias,
             w2,
             w2_scale,
+            w2_groupbias,
             w2_bias,
             group_sizes,
             topk_argsort_revert_indices,
