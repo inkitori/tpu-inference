@@ -54,7 +54,7 @@ from tpu_inference.layers.vllm.quantization.unquantized import \
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product, t2j
 
-REQUANTIZED_BLOCK_SIZE = 512
+REQUANTIZED_BLOCK_SIZE = 32  # < v6e mxu_column_size (256) => dequant-in-VMEM bf16 path in gmm_v2; experts stay FP4 in HBM (see spec 3)
 
 P = PartitionSpec
 
