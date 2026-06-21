@@ -71,6 +71,7 @@ VOCAB = 256
 
 def build_synthetic_mlx_moe(dir: Path, *, layers=2, experts=8, hidden=128,
                             moe_inter=64, group_size=64, seed=0) -> dict:
+    dir = Path(dir)
     rng = np.random.default_rng(seed)
     tensors, golden = {}, {}
 
@@ -160,17 +161,23 @@ def build_bf16_reference_moe(dir: Path, golden: dict, *, layers=2, experts=8,
     exact same bf16 values, so the two forwards should agree to ~bf16 atol).
 
     Standard HF Qwen3-MoE layout (NOT MLX):
-      * attention/router/lm_head/embed weights: plain bf16 ``.weight`` [out, in]
-        (the standard JaxAutoWeightsLoader reshapes/transposes these to the
-        model kernel layout).
-      * experts: PER-EXPERT keys ``mlp.experts.{i}.{gate,up,down}_proj.weight``.
-        JaxMoE._load_weights does NOT transpose per-expert tensors (it reshapes
-        to (1,)+shape first, skipping the 2D-transpose branch) and stacks them
-        directly into the [E, in, out] kernels. The MLX golden is [out, in], so
-        each per-expert tensor must be stored TRANSPOSED to [in, out] to match
-        the [E, in, out] kernel the int4 path also produces (gate/up -> [D, F],
-        down -> [F, D]).
+      * attention/router/lm_head/embed weights: plain bf16 ``.weight`` [out, in].
+      * experts: PER-EXPERT keys ``mlp.experts.{i}.{gate,up,down}_proj.weight``,
+        stored in standard HF ``[out, in]`` orientation (NOT transposed).
+
+    Both this bf16 reference and the MLX 4-bit checkpoint are served, under
+    ``MODEL_IMPL_TYPE=vllm``, by vLLM's own torch ``Qwen3MoeForCausalLM`` (it is
+    a vLLM-preferred architecture), whose ``FusedMoE.weight_loader`` consumes
+    per-expert ``gate/up/down_proj.weight`` in HF ``[out, in]`` and packs them
+    into the stacked ``w13``/``w2`` buffers. The MLX path feeds exactly the same
+    ``[out, in]`` golden values (un-transposed, just uint32-packed along ``in``)
+    via ``transform_mlx_weights``. So the reference MUST store the golden weights
+    in their native ``[out, in]`` orientation -- transposing them to ``[in, out]``
+    only half-fills vLLM's ``torch.empty`` expert buffers (the loader silently
+    narrow-clips to the loaded shape), leaving the other half uninitialized
+    garbage that NaNs the whole forward.
     """
+    dir = Path(dir)
     import ml_dtypes
     tensors = {}
 
@@ -195,10 +202,11 @@ def build_bf16_reference_moe(dir: Path, golden: dict, *, layers=2, experts=8,
         for proj in ("gate_proj", "up_proj", "down_proj"):
             stacked = golden[f"{pre}.mlp.switch_mlp.{proj}"]  # [E, out, in]
             for e in range(experts):
-                # Transpose [out, in] -> [in, out] to match the [E, in, out]
-                # kernel that the int4 _dequantize produces (swapaxes).
+                # Store HF-standard [out, in] (un-transposed). vLLM's FusedMoE
+                # loader and the MLX path both consume per-expert weights in this
+                # orientation; the MLX golden is already [out, in].
                 tensors[f"{pre}.mlp.experts.{e}.{proj}.weight"] = _bf16(
-                    stacked[e].T)
+                    stacked[e])
 
     tensors["model.norm.weight"] = np.ones(hidden, dtype=ml_dtypes.bfloat16)
     # lm_head: HF [V, D]; the standard loader transposes (1,0) to the (D, V)
