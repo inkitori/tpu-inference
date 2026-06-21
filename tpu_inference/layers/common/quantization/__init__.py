@@ -268,6 +268,26 @@ def static_per_tensor_quantize_tensor(
     return jnp.clip(tensor / scale, dtype_min, dtype_max).astype(dtype)
 
 
+def mlx_unpack(packed: jax.Array, bits: int) -> jax.Array:
+    """uint32 packed -> int32 values, MLX order (element 0 = low bits)."""
+    per_word = 32 // bits
+    mask = (1 << bits) - 1
+    shifts = (jnp.arange(per_word, dtype=jnp.uint32) * bits)
+    vals = (packed[..., None] >> shifts) & jnp.uint32(mask)        # [..., n_words, per_word]
+    vals = vals.reshape(*packed.shape[:-1], -1)                    # [..., n]  (index = word*per_word + k)
+    return vals.astype(jnp.int32)
+
+
+def mlx_dequantize(packed: jax.Array, scales: jax.Array, biases: jax.Array,
+                   group_size: int, bits: int) -> jax.Array:
+    """MLX affine dequant. packed [..., out, n_words]; scales/biases [..., out, n_groups]."""
+    q = mlx_unpack(packed, bits)                                   # [..., out, in]
+    scales_e = jnp.repeat(scales, group_size, axis=-1)            # [..., out, in]
+    biases_e = jnp.repeat(biases, group_size, axis=-1)
+    w = q.astype(jnp.float32) * scales_e.astype(jnp.float32) + biases_e.astype(jnp.float32)
+    return w.astype(jnp.bfloat16)
+
+
 def quantize_kv(
     dtype: jnp.dtype,
     key: jax.Array,
