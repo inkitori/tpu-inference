@@ -44,12 +44,18 @@ def _quantize_affine(w: np.ndarray, group_size: int, force_negative_scale: bool)
         scale[:, flip, :] *= -1.0
         bias = np.where(flip[None, :, None], hi, lo)
     q = np.round((wg - bias) / scale).clip(0, 15).astype(np.uint32)
-    golden = (q.astype(np.float32) * scale + bias).reshape(out, in_)
     packed = pack_u4(q.reshape(out, in_))
     # store scales/biases as bf16 via ml_dtypes
     import ml_dtypes
     s_bf = scale.reshape(out, g).astype(ml_dtypes.bfloat16)
     b_bf = bias.reshape(out, g).astype(ml_dtypes.bfloat16)
+    # Golden is the dequant of the *stored* (bf16) scale/bias -- this is what a real
+    # MLX checkpoint ships and what any correct dequantizer must reproduce. Computing it
+    # from the full-precision scale/bias would make golden inconsistent with the bf16
+    # params returned here (off by a bf16 ulp).
+    scale_bf = s_bf.astype(np.float32).reshape(out, g, 1)
+    bias_bf = b_bf.astype(np.float32).reshape(out, g, 1)
+    golden = (q.astype(np.float32) * scale_bf + bias_bf).reshape(out, in_)
     return packed, s_bf, b_bf, golden.astype(ml_dtypes.bfloat16)
 
 

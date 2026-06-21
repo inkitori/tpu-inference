@@ -1,7 +1,24 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
+from tests.utils.mlx_synthetic import _quantize_affine
 from tpu_inference.layers.common.quantization import mlx_unpack, mlx_dequantize
+
+
+@pytest.mark.parametrize("force_neg", [False, True])
+def test_mlx_dequantize_matches_affine_golden(force_neg):
+    rng = np.random.default_rng(0)
+    out_features, in_features, group_size = 16, 128, 64
+    w = rng.standard_normal((out_features, in_features)).astype(np.float32)
+    packed, scales, biases, golden = _quantize_affine(w, group_size, force_neg)
+
+    got = np.asarray(mlx_dequantize(
+        jnp.asarray(packed), jnp.asarray(scales), jnp.asarray(biases),
+        group_size=group_size, bits=4)).astype(np.float32)
+
+    # Exact reconstruction of the *quantized* (golden) weights, modulo bf16 rounding.
+    np.testing.assert_allclose(got, golden.astype(np.float32), atol=1e-2, rtol=1e-2)
 
 
 def _pack_u4(vals_row):
