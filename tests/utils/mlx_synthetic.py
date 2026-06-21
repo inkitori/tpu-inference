@@ -129,9 +129,9 @@ def build_synthetic_mlx_moe(dir: Path, *, layers=2, experts=8, hidden=128,
 
     tensors["model.norm.weight"] = np.ones(hidden, dtype=ml_dtypes.bfloat16)
 
-    # lm_head: quantized (JaxEinsum -> Int4LinearMethod). HF/MLX store [V, D]
+    # lm_head: quantized (MLX 4-bit linear, dequant-in-XLA). HF/MLX store [V, D]
     # (out=V, in=D); the model kernel is "TD,DV->TV" (D,V), loaded with a
-    # (1,0) transpose on the standard path, but the int4 method keeps the
+    # (1,0) transpose on the standard path, but the MLX method keeps the
     # packed [out=V, in=D] layout and contracts in=D at apply-time.
     add_quant("lm_head", rng.standard_normal((VOCAB, hidden)).astype(np.float32), False)
 

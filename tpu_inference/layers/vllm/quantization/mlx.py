@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -97,7 +97,7 @@ class VllmMLXConfig(QuantizationConfig, VllmQuantConfig):
 
     def get_quant_method(
             self, layer: torch.nn.Module,
-            prefix: str) -> Optional[Union[QuantizeMethodBase]]:
+            prefix: str) -> Optional[QuantizeMethodBase]:
         match layer:
             case LinearBase():
                 linear_config = self.get_linear_config(layer)

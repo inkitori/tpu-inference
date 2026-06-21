@@ -1008,6 +1008,13 @@ def validate_inputs(
         assert rhs_groupbias.shape == (size_group, num_groupbias_blocks, 1,
                                        size_n)
         assert size_k % num_groupbias_blocks == 0
+        if rhs_scale is not None:
+            # Production always pairs scale + groupbias for the same quant
+            # blocks; a mismatch silently mis-dequantizes. Fail loudly.
+            assert rhs_scale.shape[1] == rhs_groupbias.shape[1], (
+                "rhs_scale and rhs_groupbias must share the same number of "
+                f"quant blocks, got {rhs_scale.shape[1]} (scale) vs "
+                f"{rhs_groupbias.shape[1]} (groupbias)")
 
     assert group_offset.shape == (1, )
 

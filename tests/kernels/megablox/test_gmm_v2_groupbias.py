@@ -86,7 +86,8 @@ def _bias_contribution(lhs, gbias, group_sizes, gs):
     return out
 
 
-@pytest.mark.skipif(not jax.devices(), reason="requires TPU")
+@pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),
+                    reason="requires TPU")
 def test_gmm_v2_groupbias_unquantized_lhs_matches_affine_reference():
     """Unquantized-lhs k-loop site: bit-exact affine equality, multi-block."""
     G, M, K, N, gs = 2, 128, 512, 256, 256
@@ -118,7 +119,8 @@ def test_gmm_v2_groupbias_unquantized_lhs_matches_affine_reference():
                                rtol=1e-1)
 
 
-@pytest.mark.skipif(not jax.devices(), reason="requires TPU")
+@pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),
+                    reason="requires TPU")
 def test_gmm_v2_groupbias_quantized_lhs_delta_matches_analytic_bias():
     """Quantized-lhs k-loop site: with-minus-without equals the analytic bias."""
     G, M, K, N = 2, 128, 512, 256

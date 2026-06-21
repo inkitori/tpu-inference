@@ -196,14 +196,45 @@ def test_weight_loader_unstacks_gate_up_into_w13_halves():
         assert (w13[e, I:] == 91 + e).all()  # w3 half = up
 
 
+def _reconstruct_w13_from_stored(codes, scale, groupbias):
+    """Reconstruct the dequantized w13 from the STORED Stage-2 layer params
+    EXACTLY as ``gmm_v2`` does in-kernel: ``w = codes * scale + groupbias``.
+
+    Stored layout (post ``process_weights_after_loading`` / GMM_TP):
+      * codes:     int4 [E, size_k, size_n]   (signed [-8, 7])
+      * scale:     f32  [E, num_blocks, 1, size_n]
+      * groupbias: f32  [E, num_blocks, 1, size_n]
+    ``size_k % num_blocks == 0``; each quant block spans ``size_k//num_blocks``
+    contracting rows, so broadcast scale/groupbias back over k by repeating each
+    block's row ``size_k//num_blocks`` times (the kernel indexes block =
+    k // (size_k // num_blocks)). Returns f32 [E, size_k, size_n]."""
+    codes = np.asarray(codes).astype(np.float32)
+    scale = np.asarray(scale).astype(np.float32)
+    groupbias = np.asarray(groupbias).astype(np.float32)
+    _, size_k, _ = codes.shape
+    num_blocks = scale.shape[1]
+    assert size_k % num_blocks == 0
+    rows_per_block = size_k // num_blocks
+    scale_full = np.repeat(scale[:, :, 0, :], rows_per_block, axis=1)
+    groupbias_full = np.repeat(groupbias[:, :, 0, :], rows_per_block, axis=1)
+    return codes * scale_full + groupbias_full
+
+
 def test_process_weights_dequant_matches_golden_experts():
-    """End-to-end: load per-expert 4-bit packs through the real weight_loaders,
-    run process_weights_after_loading (dequant + un-stack + GMM_TP processing),
-    and assert the resulting stacked w13/w2 match feeding the SAME golden bf16
-    experts through the SAME unquantized processing path. This isolates the new
-    MLX dequant + un-stacking from the shared (already-tested) GMM layout
-    transform, and is a real-behavior check (golden = bf16 the checkpoint
-    ships)."""
+    """End-to-end (Stage-2 hybrid): load per-expert 4-bit packs through the real
+    weight_loaders, run process_weights_after_loading, and assert the result
+    matches feeding the SAME golden bf16 experts through the SAME unquantized
+    processing path.
+
+    Stage-2 keeps w13 as SIGNED int4 CODES + per-group ``w13_weight_scale`` +
+    per-group affine ``w13_groupbias`` (in-kernel dequant via gmm_v2); the codes
+    are NOT bf16, so we cannot compare them to the bf16 golden directly. Instead
+    we RECONSTRUCT the dequantized w13 from the stored params exactly as the
+    kernel does (``codes * scale + groupbias``) and compare THAT to the golden.
+    w2 stays bf16 (dequant-at-load) and is compared directly. This isolates the
+    new MLX int4-keep + sign-fold + affine-bias logic from the shared (already
+    tested) GMM layout transform, and is a real-behavior check (golden = the
+    bf16 the checkpoint ships)."""
     mesh = test_utils.get_spmd_mesh(1)
     method, layer = _build_method_and_layer(mesh)
     assert method.moe_backend.name == "GMM_TP"  # single-device, no EP
@@ -232,13 +263,42 @@ def test_process_weights_dequant_matches_golden_experts():
                                         w13_bias=None,
                                         w2_weight=w2_gold,
                                         w2_bias=None), method.moe_backend, mesh)
-
-    got_w13 = np.asarray(jax_view(layer.w13_weight)).astype(np.float32)
-    got_w2 = np.asarray(jax_view(layer.w2_weight)).astype(np.float32)
     ref_w13 = np.asarray(ref.w13_weight).astype(np.float32)
     ref_w2 = np.asarray(ref.w2_weight).astype(np.float32)
 
-    assert got_w13.shape == ref_w13.shape
+    # --- w13: stored as SIGNED int4 codes + scale + affine groupbias ---
+    stored_codes = np.asarray(jax_view(layer.w13_weight))
+    stored_scale = np.asarray(jax_view(layer.w13_weight_scale))
+    stored_gbias = np.asarray(jax_view(layer.w13_groupbias))
+
+    # The codes must be SIGNED int4 (the -8 sign-fold was applied at load).
+    assert stored_codes.min() < 0, (
+        "w13 codes must be signed int4 ([-8,7]); a missing -8 sign-fold would "
+        "leave them unsigned [0,15]")
+    assert stored_codes.min() >= -8 and stored_codes.max() <= 7
+
+    # The affine groupbias must be PRESENT and non-zero (not dropped).
+    assert stored_gbias.shape == stored_scale.shape
+    assert np.abs(stored_gbias).max() > 0, "affine groupbias was dropped"
+
+    recon_w13 = _reconstruct_w13_from_stored(stored_codes, stored_scale,
+                                             stored_gbias)
+    assert recon_w13.shape == ref_w13.shape
+    np.testing.assert_allclose(recon_w13, ref_w13, atol=2e-2, rtol=2e-2)
+
+    # TEETH: a wrong sign-fold (codes left unsigned, i.e. +8 not folded out) and
+    # a dropped affine bias must BOTH break the match -- guards against a
+    # regression that silently drops the fold or the bias while still "passing".
+    recon_wrong_fold = _reconstruct_w13_from_stored(stored_codes + 8,
+                                                    stored_scale, stored_gbias)
+    assert not np.allclose(recon_wrong_fold, ref_w13, atol=2e-2, rtol=2e-2), (
+        "test has no teeth: a wrong (unsigned) sign-fold still matched")
+    recon_no_bias = _reconstruct_w13_from_stored(stored_codes, stored_scale,
+                                                 np.zeros_like(stored_gbias))
+    assert not np.allclose(recon_no_bias, ref_w13, atol=2e-2, rtol=2e-2), (
+        "test has no teeth: dropping the affine groupbias still matched")
+
+    # --- w2: dequantized to bf16 at load (Stage-1 behavior) ---
+    got_w2 = np.asarray(jax_view(layer.w2_weight)).astype(np.float32)
     assert got_w2.shape == ref_w2.shape
-    np.testing.assert_allclose(got_w13, ref_w13, atol=2e-2, rtol=2e-2)
     np.testing.assert_allclose(got_w2, ref_w2, atol=2e-2, rtol=2e-2)

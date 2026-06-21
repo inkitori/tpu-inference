@@ -252,13 +252,16 @@ class VllmModelWrapper:
             # string; the actual resolution happens once, in vllm_get_model.
             from tpu_inference.layers.vllm.quantization.mlx import \
                 is_mlx_quantized
-            if is_mlx_quantized(model_config_for_load.hf_config):
-                assert (vllm_config_for_load.load_config.load_format
-                        == "tpu_streaming_loader"), (
-                            "MLX checkpoint must load via the streaming loader "
-                            "(transform_mlx_weights), but load_format is "
-                            f"{vllm_config_for_load.load_config.load_format!r}. "
-                            "Expected 'tpu_streaming_loader'.")
+            load_format = vllm_config_for_load.load_config.load_format
+            # Dummy loads (random-weight profiling / bring-up) never read the
+            # checkpoint, so no MLX weight transform is needed -- exempt them
+            # from the streaming-loader requirement below.
+            if (is_mlx_quantized(model_config_for_load.hf_config)
+                    and load_format not in ("dummy", "pathways_dummy")):
+                assert load_format == "tpu_streaming_loader", (
+                    "MLX checkpoint must load via the streaming loader "
+                    "(transform_mlx_weights), but load_format is "
+                    f"{load_format!r}. Expected 'tpu_streaming_loader'.")
             vllm_model = vllm_get_model(vllm_config=vllm_config_for_load,
                                         model_config=model_config_for_load)
         lora_manager = None
