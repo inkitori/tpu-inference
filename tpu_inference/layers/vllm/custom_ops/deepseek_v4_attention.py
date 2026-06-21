@@ -308,6 +308,25 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
                 self.wo_a.weight_scale_inv.t().contiguous().view(
                     g, -1, self.wo_a.weight_scale_inv.shape[0]), r, d)
             self.wo_a_bf16 = (w * scale).to(torch.bfloat16)
+        elif hasattr(self.wo_a, "weight_scale"):
+            # Real TPU FP8 build: the FP8 linear PWAL deletes weight_scale_inv
+            # and re-stores a *requantized* per-output-channel scale as
+            # weight_scale (fp8.py:165-173 -> process_blockwise_fp8_linear_
+            # weights -> quantize_tensor squeezes to a 1D fp32 scale of length
+            # g*r, one per output column). The stored relationship is
+            # weight_value ~= code.float() * weight_scale (MULTIPLY -- confirmed
+            # vs quantize_tensor's returned `scale` and xla_quantized_matmul's
+            # `out *= w_scale`), with the scale per output channel and broadcast
+            # over the input axis d. weight is float8_e4m3fn TPU (in, out) =
+            # (d, g*r); .t() recovers (g*r, d), then the (g outer, r inner) view
+            # _o_proj's einsum("tgd,grd->tgr") consumes. weight_scale[g*r] is
+            # the per-output-channel scale -> reshape (g, r, 1) to broadcast over
+            # d. WITHOUT this scale the wo_a weights are off by their per-channel
+            # scale (finite but numerically wrong).
+            w = self.wo_a.weight.t().contiguous().view(g, r, d).to(
+                torch.float32)
+            s = self.wo_a.weight_scale.reshape(g, r, 1).to(torch.float32)
+            self.wo_a_bf16 = (w * s).to(torch.bfloat16)
         else:
             # Non-quantized (synthetic) build: transpose back to (g*r, d), then
             # view+cast.

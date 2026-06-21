@@ -196,6 +196,58 @@ def test_wo_a_fp8_ue8m0_dequant_matches_reference():
     torch.testing.assert_close(got, ref, atol=0.0, rtol=0.0)
 
 
+def test_wo_a_fp8_weight_scale_dequant_matches_reference():
+    """process_weights_after_loading dequant of the REAL TPU FP8-build wo_a.
+
+    On a real TPU FP8 build the FP8 linear PWAL (fp8.py) DELETES
+    weight_scale_inv and re-stores a *requantized* per-output-channel scale as
+    ``weight_scale`` (float32, shape [g*r]); the weight stays float8_e4m3fn in
+    the TPU (in, out) = (d, g*r) layout. The requant relationship is
+    ``weight_value ~= code.float() * weight_scale`` (MULTIPLY, confirmed against
+    fp8.process_blockwise_fp8_linear_weights / xla_quantized_matmul ``out *=
+    w_scale``), with the scale per output channel (broadcast over the input
+    axis d).
+
+    process_weights_after_loading must .t() the weight back to (g*r, d), view
+    (g, r, d), and multiply by the per-output-channel scale reshaped (g, r, 1).
+    This is the branch the live full-model TPU FP8 build actually reaches; the
+    weight_scale_inv branch above is only hit by hand-built ue8m0 parity stubs.
+    """
+    torch.manual_seed(0)
+    g, r, d = 2, 8, 16
+
+    # FP8 e4m3 weight, 2D TPU layout (d, g*r). Round random bf16 through fp8 so
+    # stored codes are exactly representable (no double rounding in the ref).
+    w3_full = torch.randn(g, r, d) * 0.5            # logical GPU [g, r, d]
+    w_gr_d = w3_full.reshape(g * r, d)              # GPU (g*r, d)
+    w_tpu = w_gr_d.t().contiguous()                 # TPU (d, g*r)
+    w_fp8 = w_tpu.to(torch.float8_e4m3fn)
+
+    # Per-output-channel float32 scale, one per output column (g*r). Positive.
+    weight_scale = (torch.rand(g * r) * 0.9 + 0.1).to(torch.float32)
+
+    wo_a = SimpleNamespace(
+        weight=w_fp8,
+        weight_scale=weight_scale,
+        bmm_batch_size=g,
+    )
+    stub = SimpleNamespace(wo_a=wo_a, o_lora_rank=r)
+
+    VllmDeepseekV4MLAAttention.process_weights_after_loading(stub)
+    got = stub.wo_a_bf16
+
+    # Hand-computed reference: code.float() * per-output-channel scale, with the
+    # scale broadcast over the input axis d. .t() recovers the GPU (g*r, d)
+    # orientation; reshape splits it (g outer, r inner) row-major.
+    w3 = w_fp8.t().contiguous().view(g, r, d).to(torch.float32)
+    s = weight_scale.view(g, r, 1).to(torch.float32)
+    ref = (w3 * s).to(torch.bfloat16)
+
+    assert got.shape == (g, r, d)
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got, ref, atol=0.0, rtol=0.0)
+
+
 def test_wo_a_dequant_else_branch_view_cast():
     """Non-quantized (synthetic) build with no weight_scale_inv: transpose + view + cast.
 

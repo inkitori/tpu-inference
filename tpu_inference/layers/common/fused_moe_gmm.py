@@ -17,6 +17,7 @@ from typing import Literal
 
 import jax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -118,6 +119,49 @@ def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
                 f"FusedMoE does not support {scoring_fn} scoring function")
 
 
+# v6e (and any pre-v7 TPU) cannot lower the in-Mosaic float4_e2m1fn -> bf16
+# convert that gmm_v2's dequant-in-VMEM path emits (gmm_v2.py:402, the
+# tiled_rhs.astype(bf16) after pltpu.bitcast(..., float4_e2m1fn)) -- it dies in
+# Mosaic on jax 0.10.1 / libtpu 0.0.41. On v7+ that convert (and the native FP4
+# matmul) works, so we keep the in-kernel path there. get_tpu_info() resolves
+# the device kind host-side (pure-Python device_kind string, @cache'd, no traced
+# array dependence), so generation is a concrete int evaluable at trace time --
+# we branch on it with a plain Python `if` while tracing, never as a traced
+# value. generation: v6e == 6, v7/v7x == 7.  (mxu_column_size is 256 on BOTH
+# v6e and v7 so it cannot discriminate; is_matmul_supported(bf16, float4) is
+# False on BOTH since float4 is absent from every MXU case -- neither is usable
+# as the gate. generation < 7 is the clean discriminator.)
+_TPU_IS_PRE_V7: bool = pltpu.get_tpu_info().generation < 7
+
+
+def _dequantize_fp4_rhs_to_bf16(rhs: jax.Array,
+                                rhs_scale: jax.Array) -> jax.Array:
+    """XLA-side FP4 -> bf16 dequant matching gmm_v2's in-VMEM dequant numerics.
+
+    The expert weight `rhs` is a NATIVE jnp.float4_e2m1fn array of shape
+    (E, K, N); `rhs_scale` is a float32 scale of shape (E, num_blocks, 1, N)
+    with one scale per (32-element K block, N column). gmm_v2's
+    should_dequantize_before_matmul path (gmm_v2.py:398-406) does, per K tile,
+    `tiled_rhs.astype(bf16).reshape(num_blocks, block, n) * scale.astype(bf16)`
+    -- both operands cast to the lhs (bf16) dtype BEFORE the multiply. We
+    reproduce that bit-for-bit over the full weight so the resulting bf16 rhs
+    fed to gmm_v2 (with rhs_scale=None) takes the Mosaic-safe unquantized
+    bf16 x bf16 path -- no float4 op ever enters Mosaic. XLA already performs
+    this exact convert at load time (quantization/dequantize_tensor); only
+    Mosaic chokes, so we move it just outside the kernel. The bf16 transient is
+    per-call (per layer's expert shard) and freed by XLA after the GMM; experts
+    stay FP4-resident in HBM.
+    """
+    e, k, n = rhs.shape
+    num_blocks = rhs_scale.shape[1]
+    block = k // num_blocks
+    rhs_bf16 = rhs.astype(jnp.bfloat16).reshape(e, num_blocks, block, n)
+    # scale (E, num_blocks, 1, N) -> bf16 broadcasts over the `block` axis,
+    # matching the kernel's `tiled_rhs_scale = get_scale().astype(lhs_dtype)`.
+    scale_bf16 = rhs_scale.astype(jnp.bfloat16)
+    return (rhs_bf16 * scale_bf16).reshape(e, k, n)
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -126,6 +170,16 @@ def gmm_wrapper(lhs,
                 group_offset,
                 fuse_act=None,
                 preferred_element_type=None):
+    # Servability workaround: on pre-v7 TPUs (v6e) the in-Mosaic FP4 dequant
+    # can't be lowered, so for FP4 experts dequant the rhs to bf16 in XLA here
+    # and take gmm_v2's unquantized bf16 x bf16 path (rhs_scale=None). GATE is
+    # the narrowest safe predicate: (rhs is native float4_e2m1fn) AND (there IS
+    # a scale) AND (pre-v7). This leaves fp8/int8/bf16 experts and all v7+
+    # hardware on the existing in-kernel path unchanged.
+    if (_TPU_IS_PRE_V7 and rhs_scale is not None
+            and rhs.dtype == jnp.float4_e2m1fn):
+        rhs = _dequantize_fp4_rhs_to_bf16(rhs, rhs_scale)
+        rhs_scale = None
     gmm_res = gmm_v2(
         lhs=lhs,
         rhs=rhs,
