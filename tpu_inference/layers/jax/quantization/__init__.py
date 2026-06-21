@@ -28,18 +28,31 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
         UnquantizedConfig
 
     model_config = copy.deepcopy(vllm_config.model_config)
+    from tpu_inference.layers.jax.quantization.int4 import Int4Config as _Int4Config
     method_to_config: dict[str | None, type] = {
         None: UnquantizedConfig,
         FP8: Fp8Config,
+        "int4": _Int4Config,
     }
+
+    hg_quant_config = getattr(model_config.hf_config, "quantization_config",
+                              {}) or {}
+    # Detect MLX int4 block: MLX checkpoints have no quant_method; they nest
+    # quantization params under a top-level "quantization" attribute on hf_config
+    # (or under "quantization" inside quantization_config). We short-circuit
+    # here so that MLX models with quantization=None are caught before the
+    # None->UnquantizedConfig dispatch.
+    mlx_block = getattr(model_config.hf_config, "quantization", None) \
+        or hg_quant_config.get("quantization")
+    if isinstance(mlx_block, dict) and "group_size" in mlx_block and "bits" in mlx_block:
+        from tpu_inference.layers.jax.quantization.int4 import Int4Config
+        return Int4Config.from_hf_quant_config(mlx_block)
 
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
             f"{model_config.quantization} quantization method not supported."
             f" Supported methods are {method_to_config.keys()}")
     quant_config = method_to_config[model_config.quantization]
-    hg_quant_config = getattr(model_config.hf_config, "quantization_config",
-                              {})
     # There are some cases to be supported in the future:
     # 1) Some vision model keep quantization config under text_config
     # 2) overriding through `--hf_overrides`
