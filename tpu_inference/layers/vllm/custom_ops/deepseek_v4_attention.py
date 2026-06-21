@@ -29,21 +29,52 @@ rebinds it on ``amd.model`` directly. It is invoked from
 ``_maybe_patch_for_deepseek_v4`` in ``vllm_model_wrapper`` while ``is_rocm`` is
 forced True and the package has been reloaded onto the AMD implementation.
 """
+import jax
 import jax.numpy as jnp
 import torch
 import torch.nn as nn
+from jax.sharding import PartitionSpec as P
 from torchax.interop import jax_view, torch_view
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.attention.attention import \
+    get_attention_context
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from tpu_inference.kernels.experimental.deepseek_v4.mla_swa import \
+    mla_sliding_window_ragged_paged_attention
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm.backends.flash_attn_mla import \
     PallasMLAttentionBackend
 from tpu_inference.logger import init_logger
+from tpu_inference.models.vllm.vllm_model_wrapper_context import \
+    get_vllm_model_wrapper_context
 
 logger = init_logger(__name__)
+
+
+def build_swa_ragged_metadata(attn_metadata):
+    """Map vLLM AttentionMetadata -> mla_swa kernel ragged args.
+
+    Straight pass-through (verified): the TPU runner already produces all four
+    fields in exactly the layout the kernel consumes, so no reshape and no
+    per-rank slicing is needed here. ``block_tables`` is ALREADY flat 1D
+    ``i32[max_seqs*pages_per_seq]`` on the TPU path (the runner does
+    ``.reshape(-1)``), and ``request_distribution`` / ``query_start_loc`` are
+    built GLOBAL (``i32[3*dp_size]`` / ``max_num_reqs + dp_size``) -- the
+    DP->local localization is done by SPMD sharding inside the ``forward_mqa``
+    shard_map, NOT by hand-slicing here.
+
+    attention_metadata.py fields:
+      seq_lens             -> kv_lens      i32[max_seqs]
+      block_tables         -> page_indices i32[max_seqs*pages_per_seq] (flat)
+      query_start_loc      -> cu_q_lens    i32[max_seqs+1]
+      request_distribution -> distribution i32[3] = [decode, prefill_bnd, total]
+    """
+    return (attn_metadata.seq_lens, attn_metadata.block_tables,
+            attn_metadata.query_start_loc, attn_metadata.request_distribution)
 
 
 class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
@@ -78,6 +109,12 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
         # ``get_kv_cache_spec`` reports the cache dtype string straight from
         # cache_config (base stores the resolved ``kv_cache_dtype`` separately).
         self.cache_dtype = vllm_config.cache_config.cache_dtype
+        # Logical KV page size = the vLLM cache block_size (a token count, not a
+        # byte size, and NOT the physical cache tensor shape). Stored here for
+        # the mla_swa kernel's required ``logical_page_size`` kwarg. Same proven
+        # pattern as ``self.cache_dtype`` above. ``block_size`` is a concrete int
+        # before layers are built.
+        self._kv_block_size = vllm_config.cache_config.block_size
 
     # Abstract platform hooks required to instantiate the DeepseekV4Attention
     # ABC; unused on the TPU pass-through path.
@@ -87,7 +124,103 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
 
     def forward_mqa(self, q: torch.Tensor, kv: torch.Tensor,
                     positions: torch.Tensor, output: torch.Tensor) -> None:
-        raise NotImplementedError
+        # Single ragged MLA+SWA kernel: it quantizes new_kv, writes the FP8 KV
+        # cache, and applies BOTH causal and sliding-window masks internally.
+        # There is NO Python decode/prefill branch -- the split is encoded in
+        # `distribution`. No sink (Phase 1).
+        #
+        # CRITICAL: the kernel MUST be entered through an explicit jax.shard_map
+        # with P(ATTN_DATA) on the four ragged-metadata args. On the production
+        # DP-attention mesh, `distribution`/`query_start_loc` arrive GLOBAL
+        # (i32[3*dp_size] / max_num_reqs+dp_size), but the kernel asserts the
+        # local distribution shape is (3,). The surrounding plain jax.jit (no
+        # in_shardings) does NOT localize a global array -- only entering a
+        # shard_map with in_specs=P(ATTN_DATA) does. Mirrors the production MLA
+        # path (attention_interface.mla_attention / sharded_ragged_paged_attention).
+        attn_metadata, _, _, _ = get_attention_context(self.prefix)
+        if attn_metadata is None:
+            # Warmup dummy: no metadata -> produce zeros.
+            output.zero_()
+            return
+        kv_lens, page_indices, cu_q_lens, distribution = \
+            build_swa_ragged_metadata(attn_metadata)
+
+        ctx = get_vllm_model_wrapper_context()
+        mesh = ctx.mesh
+        kv_cache_index = ctx.layer_name_to_kvcache_index[self.prefix]
+        cache_kv = ctx.kv_caches[kv_cache_index]  # donated uint8 4D FP8 pool
+
+        # q: [N, num_q_heads, head_dim] bf16; kv (new_kv): [N, head_dim] raw
+        # bf16 (the kernel quantizes it internally); cache_kv stays uint8.
+        q_j = jax_view(q.to(torch.bfloat16))
+        kv_j = jax_view(kv.to(torch.bfloat16))
+        cache_j = jax_view(cache_kv)
+
+        # in_specs mirror attention_interface.mla_attention:526-539 /
+        # sharded_ragged_paged_attention:366-379. q is token+head sharded; the
+        # four ragged-metadata args each carry P(ATTN_DATA) so the global arrays
+        # localize to the per-rank shard the kernel expects.
+        q_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+        kv_spec = P(ShardingAxisName.ATTN_DATA, None)
+        # Task 12: confirm the cache_kv pool sharding. DSv4 uses a SINGLE
+        # physical page pool shared across attention types (page_indices select
+        # into it), so a fully-replicated spec is the best-supported choice
+        # here; the R1 MLA path's P(BATCH) cache layout is a different (per-rank)
+        # cache and does not directly transfer. Confirm against the live KV
+        # pool allocation on the DP-attention mesh.
+        cache_spec = P()
+        out_spec = q_spec
+        # l/m are the lse/max aux returns, shape [N, num_q_heads]; mirror out's
+        # token+head sharding minus the trailing head_dim axis.
+        lm_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD)
+
+        in_specs = (
+            q_spec,  # q
+            kv_spec,  # new_kv
+            cache_spec,  # cache_kv (uint8 FP8 pool)
+            P(ShardingAxisName.ATTN_DATA),  # kv_lens
+            P(ShardingAxisName.ATTN_DATA),  # page_indices
+            P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
+            P(ShardingAxisName.ATTN_DATA),  # distribution
+        )
+        out_specs = (out_spec, cache_spec, lm_spec, lm_spec)
+
+        def _kernel(q, new_kv, cache, kv_lens, page_indices, cu_q_lens,
+                    distribution):
+            return mla_sliding_window_ragged_paged_attention(
+                q,
+                new_kv,
+                cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale=self.scale,
+                sliding_window=self.window_size,
+                logical_page_size=self._kv_block_size,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=8,
+            )
+
+        out_j, updated_cache, _l, _m = jax.jit(
+            jax.shard_map(
+                _kernel,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            ))(q_j, kv_j, cache_j, jax_view(kv_lens),
+               jax_view(page_indices), jax_view(cu_q_lens),
+               jax_view(distribution))
+
+        ctx.kv_caches[kv_cache_index] = torch_view(updated_cache)
+        output.copy_(torch_view(out_j))
+
+    def _mla_swa_logical_page_size(self, cache_kv) -> int:
+        # The logical page size == the vLLM KV-cache block_size (a logical token
+        # count, NOT a byte size, and NOT the physical cache_kv tensor shape).
+        # Stored on self in __init__ (self._kv_block_size). cache_kv is ignored.
+        return self._kv_block_size
 
     def _o_proj(self, o: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
