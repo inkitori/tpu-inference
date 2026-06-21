@@ -126,6 +126,29 @@ class VllmModelWrapper:
 
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config, self.mesh)
+
+        # MLX checkpoints (e.g. mlx-community/Qwen3-30B-A3B-4bit) need the
+        # streaming loader's get_all_weights override (transform_mlx_weights:
+        # un-stack switch_mlp, dequant MLX-only embed/lm_head, rename to vLLM's
+        # Qwen3MoeForCausalLM layout). Under a plain LLM(model=...) the
+        # load_format defaults to "auto" -> DefaultModelLoader, which never runs
+        # that override, so the un-transformed lm_head.biases / switch_mlp
+        # tensors reach the model and load fails. Auto-select the streaming
+        # loader here so production LLM(model=...) works without a hardcoded
+        # load_format. Respect an explicit non-auto override from the user.
+        from tpu_inference.layers.vllm.quantization.mlx import is_mlx_quantized
+        if is_mlx_quantized(self.vllm_config.model_config.hf_config):
+            if self.vllm_config.load_config.load_format == "auto":
+                logger.info(
+                    "MLX-quantized model detected; auto-selecting "
+                    "'tpu_streaming_loader' so the MLX weight transform runs.")
+                self.vllm_config.load_config.load_format = "tpu_streaming_loader"
+            else:
+                logger.info(
+                    "MLX-quantized model detected; load_format already set to "
+                    "'%s' (not overriding).",
+                    self.vllm_config.load_config.load_format)
+
         self._apply_pp_patch()
 
     def _apply_pp_patch(self):
@@ -215,6 +238,27 @@ class VllmModelWrapper:
         with load_context, jax_context, set_current_vllm_config(
                 self.vllm_config):
             model_config_for_load = vllm_config_for_load.speculative_config.draft_model_config if self.is_draft_model else vllm_config_for_load.model_config
+            # Guard the MLX auto-select wiring: vllm_get_model below resolves the
+            # loader from load_config.load_format, and only the streaming loader
+            # (IncrementalModelLoader) runs transform_mlx_weights. If the format
+            # is anything else the un-transformed MLX-only lm_head.biases /
+            # packed switch_mlp tensors reach the model and load fails with an
+            # opaque shape error -- so fail loudly here with the real reason.
+            # NB: do NOT call get_model_loader() to probe the loader class --
+            # constructing IncrementalModelLoader has the SIDE EFFECT of
+            # resetting load_config.load_format back to "auto"
+            # (vllm_model_loader.py:IncrementalModelLoader.__init__), which would
+            # make the real resolution fall back to DefaultModelLoader. Check the
+            # string; the actual resolution happens once, in vllm_get_model.
+            from tpu_inference.layers.vllm.quantization.mlx import \
+                is_mlx_quantized
+            if is_mlx_quantized(model_config_for_load.hf_config):
+                assert (vllm_config_for_load.load_config.load_format
+                        == "tpu_streaming_loader"), (
+                            "MLX checkpoint must load via the streaming loader "
+                            "(transform_mlx_weights), but load_format is "
+                            f"{vllm_config_for_load.load_config.load_format!r}. "
+                            "Expected 'tpu_streaming_loader'.")
             vllm_model = vllm_get_model(vllm_config=vllm_config_for_load,
                                         model_config=model_config_for_load)
         lora_manager = None

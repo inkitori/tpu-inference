@@ -24,11 +24,15 @@ import os
 import tempfile
 import time
 
+import pytest
+
 os.environ.setdefault("MODEL_IMPL_TYPE", "vllm")
 os.environ.setdefault("SKIP_JAX_PRECOMPILE", "1")
 
 from tests.utils.mlx_synthetic import (  # noqa: E402
     build_bf16_reference_moe, build_synthetic_mlx_moe)
+
+REAL_MLX_MODEL = "mlx-community/Qwen3-30B-A3B-4bit"
 
 # NOTE: do NOT import jax or call jax.devices() at module/collection scope.
 # Doing so initializes the TPU backend in this (parent) process before vLLM
@@ -75,3 +79,35 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference():
         print(f"MLX  tokens: {mlx_ids}")
         print(f"REF  tokens: {ref_ids}")
         assert mlx_ids == ref_ids
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_REAL_MLX") != "1",
+    reason="Real 30B MLX bring-up; set RUN_REAL_MLX=1 to run (needs the "
+    "downloaded mlx-community/Qwen3-30B-A3B-4bit weights and a TPU).")
+def test_real_mlx_30b_auto_loader_serves_coherently():
+    """Task 8 guard: a PLAIN ``LLM(model=...)`` with NO hardcoded load_format
+    must serve the real MLX 30B coherently.
+
+    This is the production path the synthetic test cannot exercise: with
+    ``load_format="auto"`` (the default), the MLX auto-select wiring in
+    ``VllmModelWrapper.__init__`` must force the streaming loader so the MLX
+    weight transform runs (otherwise load crashes on lm_head.biases /
+    un-unstacked switch_mlp). Greedy decode, one prompt, assert non-empty
+    ASCII-coherent output. tp defaults to 8 (override via RUN_REAL_MLX_TP);
+    the full multi-prompt perf/coherence run lives in the Task-8 report."""
+    from vllm import LLM, SamplingParams
+    tp = int(os.environ.get("RUN_REAL_MLX_TP", "8"))
+    # NO load_format -> exercises the auto-select wiring.
+    llm = LLM(model=REAL_MLX_MODEL, tensor_parallel_size=tp, max_model_len=2048,
+              dtype="bfloat16")
+    sp = SamplingParams(max_tokens=32, temperature=0.0)
+    out = llm.generate(["The capital of France is"], sp)
+    text = out[0].outputs[0].text
+    print(f"REAL MLX output: {text!r}")
+    assert text.strip(), "empty completion"
+    # Coherence proxy: output is printable ASCII and not a single repeated token.
+    assert all(31 < ord(c) < 127 or c.isspace() for c in text), \
+        f"non-ASCII/garbage output: {text!r}"
+    toks = text.split()
+    assert len(set(toks)) > 1, f"degenerate repeated output: {text!r}"

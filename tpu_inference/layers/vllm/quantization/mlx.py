@@ -47,7 +47,7 @@ from tpu_inference.layers.vllm.interface.moe import (
     MoEBackend, select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
-from tpu_inference.utils import t2j
+from tpu_inference.utils import get_mesh_shape_product, t2j
 
 
 def is_mlx_quantized(hf_config) -> bool:
@@ -189,6 +189,34 @@ class VllmMLXLinearMethod(QuantizeMethodBase):
         wsh = self.linear_config.weight_sharding
         output_sizes = self.linear_config.output_sizes
         n_shards = self.linear_config.n_shards
+        # tp=8 RowParallel input-dim sharding correctness (Task 8, Step 3).
+        # The same weight_sharding spec is device_put onto all three tensors.
+        # For RowParallelLinear it is P(None, ATTN_HEAD), which shards axis 1 --
+        # the INPUT dim, which for MLX is packed (weight: in//pf, one uint32 =
+        # pf=8 nibbles) AND grouped (scales/biases: in//gs, one affine pair per
+        # gs=64 inputs). The split is correct ONLY if each shard owns whole
+        # words AND whole groups for the SAME contiguous input range, i.e. both
+        # in//pf and in//gs are divisible by the axis-1 shard count. When they
+        # are, word and group boundaries align to the same per-shard input
+        # slice and per-shard dequant == the input-slice of the full dequant
+        # (verified numerically in test_mlx_linear_method.py::
+        # test_rowparallel_input_dim_sharding_dequant_consistency; for Qwen3-30B
+        # o_proj at tp=8: in=4096 -> in//8=512 (÷8 ✓), in//64=64 (÷8 ✓)).
+        # If axis 1 is replicated (None) the shard count is 1 and this is a
+        # no-op; we only need the guard when the input dim is actually sharded.
+        in_axis = wsh[1] if len(wsh) > 1 else None
+        in_shards = get_mesh_shape_product(mesh, in_axis)
+        if in_shards > 1:
+            pf = self.quant_config.pack_factor
+            gs = self.quant_config.group_size
+            n_words = layer.weight.shape[1]
+            n_groups = layer.scales.shape[1]
+            assert n_words % in_shards == 0 and n_groups % in_shards == 0, (
+                "MLX RowParallel input-dim sharding would split a uint32 word "
+                f"or a quant group across chips: packed dim in//{pf}={n_words} "
+                f"and grouped dim in//{gs}={n_groups} must both be divisible by "
+                f"the input shard count {in_shards}. Got remainders "
+                f"{n_words % in_shards}/{n_groups % in_shards}.")
         # MLX keeps a single packed Parameter per tensor and always uses the
         # fused-style apply (one dequant + einsum + slice). The split path
         # (per-projection ParameterLists, AWQ's _apply_split) is not built here,

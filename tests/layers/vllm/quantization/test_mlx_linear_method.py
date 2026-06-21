@@ -187,3 +187,56 @@ def test_apply_matches_golden(output_sizes, num_proj, n_shards, label):
 
     assert y.shape == (4, out)
     np.testing.assert_allclose(y, y_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("tp, in_features", [(2, 128), (8, 4096)])
+def test_rowparallel_input_dim_sharding_dequant_consistency(tp, in_features):
+    """Step-3 (Task 8): RowParallelLinear shards the INPUT dim via
+    ``weight_sharding = P(None, ATTN_HEAD)``. For MLX that input dim is BOTH
+    packed (``weight`` [out, in//8], one uint32 word = 8 nibbles) and grouped
+    (``scales``/``biases`` [out, in//64], one affine scale/bias per 64 inputs).
+    Splitting axis 1 of the packed weight by ``tp`` and axis 1 of the grouped
+    scales/biases by ``tp`` is only correct if each shard owns WHOLE words AND
+    WHOLE groups for the SAME contiguous input range -- otherwise a uint32 word
+    or a quant group is split across chips and the per-shard dequant is wrong.
+
+    This proves the math at the tensor level WITHOUT a TPU: it checks
+    dequant-then-shard == shard-then-dequant for the input-dim split. (in=4096,
+    tp=8 is the only Stage-1 packed RowParallel linear in Qwen3-30B: attn
+    o_proj, in = 32 heads * 128 head_dim.)"""
+    from tpu_inference.layers.common.quantization import mlx_dequantize
+    out = 96
+    assert in_features % PACK_FACTOR == 0 and in_features % GROUP_SIZE == 0
+    # Required for a clean shard: each chip must own whole words and whole groups.
+    assert (in_features // PACK_FACTOR) % tp == 0
+    assert (in_features // GROUP_SIZE) % tp == 0
+
+    rng = np.random.default_rng(in_features + tp)
+    w = rng.standard_normal((out, in_features)).astype(np.float32)
+    packed, scales, biases, _ = _quantize_affine(w, GROUP_SIZE,
+                                                  force_negative_scale=True)
+    packed_j = jnp.asarray(packed.astype(np.uint32))
+    scales_j = jnp.asarray(scales.astype(np.float32))
+    biases_j = jnp.asarray(biases.astype(np.float32))
+
+    # Full dequant -> [out, in].
+    full = np.asarray(
+        mlx_dequantize(packed_j, scales_j, biases_j, group_size=GROUP_SIZE,
+                       bits=BITS)).astype(np.float32)
+
+    words_per_shard = (in_features // PACK_FACTOR) // tp
+    groups_per_shard = (in_features // GROUP_SIZE) // tp
+    in_per_shard = in_features // tp
+    for s in range(tp):
+        # Shard axis 1 of packed weight (words) and of scales/biases (groups),
+        # exactly as P(None, ATTN_HEAD) does on the input dim.
+        p_s = packed_j[:, s * words_per_shard:(s + 1) * words_per_shard]
+        sc_s = scales_j[:, s * groups_per_shard:(s + 1) * groups_per_shard]
+        bi_s = biases_j[:, s * groups_per_shard:(s + 1) * groups_per_shard]
+        shard_dequant = np.asarray(
+            mlx_dequantize(p_s, sc_s, bi_s, group_size=GROUP_SIZE,
+                           bits=BITS)).astype(np.float32)
+        # Must equal the matching input slice of the full dequant.
+        expected = full[:, s * in_per_shard:(s + 1) * in_per_shard]
+        assert shard_dequant.shape == (out, in_per_shard)
+        np.testing.assert_array_equal(shard_dequant, expected)
