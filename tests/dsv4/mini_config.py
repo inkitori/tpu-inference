@@ -2,12 +2,24 @@
 
 Tiny dims so the model instantiates in seconds, but keeps:
   * all three attention regimes (dense / CSA ratio-4 / HCA ratio-128),
-  * the real quant formats (FP4 e2m1fn + MXFP4 experts); FP8 block-scaled linear
-    quantization is applied at load time via the model's quant pathway (Task 12),
+  * the real quant formats (FP4 e2m1fn + MXFP4 experts) AND the FP8 block-scaled
+    linear quant config (the nested ``quantization_config`` block below), which
+    makes the linears block-quantized FP8 with ue8m0 ``weight_scale_inv`` -- this
+    is what the MLA ``wo_a`` PWAL dequant reads (Task 12 / Task 10). Without it,
+    linears would be per-tensor FP8 (no ``weight_scale_inv``) and the wo_a dequant
+    diverges,
   * mesh-divisible dims for the DP-attention production mesh, whose head/group
     parallel `model` axis is size 4 (NOT 8): num_attention_heads % 4 == 0,
     n_routed_experts % 4 == 0, o_groups % 4 == 0 and o_groups | num_attention_heads,
   * head_dim == 512 (nope 448 + rope 64) — mla_swa.quantize_kv_inputs asserts this.
+
+The returned dict is fed to vLLM as ``hf_overrides`` (Task 12), which REPLACES the
+hub config's fields verbatim -- so it must carry every key vLLM reads directly
+(e.g. ``rope_scaling.rope_type``: vLLM's ``_get_and_verify_max_len`` indexes
+``rope_type`` and the transformers ``type``->``rope_type`` normalization
+(``patch_rope_parameters``) does NOT run on an override dict) and
+``quantization:"deepseek_v4_fp8"`` (selects ``VllmDeepseekV4Fp8Config`` =
+FP8 linears + FP4/mxfp4 experts).
 """
 from __future__ import annotations
 
@@ -56,7 +68,12 @@ def make_dsv4_mini_config() -> dict:
         "compress_rope_theta": 160000,
         "max_position_embeddings": 4096,
         "rope_scaling": {
+            # vLLM reads "rope_type" directly (the "type" alias is normalized by
+            # transformers' patch_rope_parameters, which does NOT run on an
+            # hf_overrides dict). Keep both so the config works as an override and
+            # via the normal HF path.
             "type": "yarn",
+            "rope_type": "yarn",
             "factor": 16,
             "beta_fast": 32,
             "beta_slow": 1,
@@ -64,9 +81,28 @@ def make_dsv4_mini_config() -> dict:
             "mscale_all_dim": 1.0,
             "original_max_position_embeddings": 256,
         },
-        # Quant: FP4 experts, FP8 block linears.
+        # Quant: FP4/MXFP4 experts + FP8 block-scaled linears.
+        # Top-level expert quant selectors:
         "expert_dtype": "fp4",
         "moe_quant_algo": "MXFP4",
+        # quantization="deepseek_v4_fp8" -> VllmDeepseekV4Fp8Config (FP8 linears +
+        # FP4/mxfp4 experts). Required so get_tpu_quantization_config picks the
+        # DSV4 quant method (Task 12 / quantization/__init__.py).
+        "quantization": "deepseek_v4_fp8",
+        # Nested FP8-linear quant config. Mirrors the real DeepSeek-V4-Flash
+        # quantization_config: block-quantized (weight_block_size) FP8 e4m3 with
+        # ue8m0 scale_fmt -> creates a 2D weight_scale_inv per linear, which the
+        # MLA wo_a PWAL dequant consumes. "activation_scheme" is REQUIRED
+        # (get_from_keys raises if absent). "moe_quant_algo" is read by the
+        # moe_quant_algo property of the quant config.
+        "quantization_config": {
+            "quant_method": "fp8",            # -> is_checkpoint_fp8_serialized
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",   # REQUIRED key
+            "weight_block_size": [128, 128],  # -> block_quant=True -> weight_scale_inv
+            "scale_fmt": "ue8m0",
+            "moe_quant_algo": "MXFP4",
+        },
         "vocab_size": 1280,
         "tie_word_embeddings": False,
         "torch_dtype": "bfloat16",
