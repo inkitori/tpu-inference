@@ -53,16 +53,29 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
     ) -> None:
-        nn.Module.__init__(self)
-        config = vllm_config.model_config.hf_config
-        self.prefix = prefix
-        self.head_dim = config.head_dim
+        # Build the full DeepseekV4Attention parameter manifest (attn_sink,
+        # fused_wqa_wkv, q_norm, wq_b, kv_norm, wo_a/wo_b, rotary_emb, plus the
+        # per-layer indexer/compressor sub-modules) by running the real base
+        # __init__, so the checkpoint loads with the correct FP8-block quant
+        # wiring. The only GPU-bound line in the base __init__ is
+        # ``self.ln_events = [torch.cuda.Event() ...]`` (CUDA stream ordering,
+        # irrelevant on TPU). ``torch.cuda.Stream`` is already neutralized by
+        # ``_maybe_patch_for_deepseek_v4`` in the wrapper; here we additionally
+        # neutralize ``torch.cuda.Event`` for the duration of construction.
+        _orig_event = torch.cuda.Event
+        torch.cuda.Event = lambda *args, **kwargs: None
+        try:
+            super().__init__(
+                vllm_config,
+                prefix,
+                topk_indices_buffer=topk_indices_buffer,
+                aux_stream_list=aux_stream_list,
+            )
+        finally:
+            torch.cuda.Event = _orig_event
+        # ``get_kv_cache_spec`` reports the cache dtype string straight from
+        # cache_config (base stores the resolved ``kv_cache_dtype`` separately).
         self.cache_dtype = vllm_config.cache_config.cache_dtype
-        layer_id = extract_layer_index(prefix)
-        if layer_id < config.num_hidden_layers:
-            self.compress_ratio = max(1, config.compress_ratios[layer_id])
-        else:
-            self.compress_ratio = 1
 
     # Abstract platform hooks required to instantiate the DeepseekV4Attention
     # ABC; unused on the TPU pass-through path.

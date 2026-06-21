@@ -13,11 +13,15 @@
 # limitations under the License.
 
 import torch
-import vllm.model_executor.kernels.mhc as mhc_kernels
-from vllm.model_executor.layers.mhc import (HCHeadOp, MHCFusedPostPreOp,
-                                            MHCPostOp, MHCPreOp)
-
+import torch.nn.functional as F
 from tpu_inference.logger import init_logger
+import vllm.model_executor.kernels.mhc as mhc_kernels
+from vllm.model_executor.layers.mhc import (
+    HCHeadOp,
+    MHCFusedPostPreOp,
+    MHCPostOp,
+    MHCPreOp,
+)
 
 logger = init_logger(__name__)
 
@@ -81,26 +85,42 @@ class VllmMHCPostOp(MHCPostOp):
 
 @HCHeadOp.register_oot
 class VllmHCHeadOp(HCHeadOp):
+    """TPU implementation of HCHeadOp."""
 
     @classmethod
     def enabled(cls) -> bool:
+        """Returns whether this operation is enabled."""
         return True
 
     def forward_tpu(
         self,
-        hidden_states: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
+        hidden_states: torch.Tensor,  # [batch_size, hc_mult, hidden_size]
+        hc_fn: torch.Tensor,  # [hc_mult, hc_mult * hidden_size]
+        hc_scale: torch.Tensor,  # [hc_mult]
+        hc_base: torch.Tensor,  # [hc_mult]
         rms_norm_eps: float,
         hc_eps: float,
     ) -> torch.Tensor:
-        logger.error(
-            "VllmHCHeadOp.forward_tpu is not implemented, just a pass-through for now"
+        """Applies the TPU forward pass for the op."""
+        # Using .flatten(start_dim=-2) avoids XLA contiguity RuntimeErrors.
+        hs_flat = hidden_states.flatten(start_dim=-2)
+
+        # Upcast to float32 for stable variance computation on TPUs.
+        hs_flat_fp32 = hs_flat.float()
+        variance = hs_flat_fp32.pow(2).mean(dim=-1, keepdim=True)
+        hs_norm = (hs_flat_fp32 * torch.rsqrt(variance + rms_norm_eps)).to(
+            hidden_states.dtype
         )
-        hc_mult, hidden_size = hidden_states.shape[-2:]
-        outer_shape = hidden_states.shape[:-2]
-        return hidden_states[..., 0, :].reshape(*outer_shape, hidden_size)
+
+        # Compute mixing gates, apply scale/base, and calculate sigmoid + epsilon.
+        gates = F.linear(hs_norm, hc_fn)
+        gates = torch.sigmoid((gates * hc_scale) + hc_base) + hc_eps
+
+        # Collapse multi-stream residuals into 1 stream via weighted sum.
+        gates = gates.unsqueeze(-1)
+        out = (hidden_states * gates).sum(dim=-2)
+
+        return out
 
 
 @MHCFusedPostPreOp.register_oot
@@ -110,6 +130,44 @@ class VllmMHCFusedPostPreOp(MHCFusedPostPreOp):
     def enabled(cls) -> bool:
         return True
 
-    def forward_tpu(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Native implementation of mhc_fused_post_pre is not available")
+    def forward_tpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # No fused TileLang kernel on TPU; the fused post+pre is exactly
+        # MHCPostOp followed by MHCPreOp on the updated residual streams. Both
+        # mhc_post_torch and mhc_pre_torch are pure-torch and lower cleanly
+        # through torchax (they already back VllmMHCPostOp / VllmMHCPreOp).
+        residual_cur = mhc_kernels.mhc_post_torch(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+        )
+        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_torch(
+            residual_cur,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
