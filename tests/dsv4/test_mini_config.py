@@ -1,5 +1,3 @@
-import numpy as np
-
 from tests.dsv4.mini_config import (MINI_NUM_EXPERTS, MINI_NUM_HEADS,
                                      MINI_NUM_LAYERS, make_dsv4_mini_config)
 

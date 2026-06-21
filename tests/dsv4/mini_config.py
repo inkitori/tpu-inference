@@ -2,7 +2,8 @@
 
 Tiny dims so the model instantiates in seconds, but keeps:
   * all three attention regimes (dense / CSA ratio-4 / HCA ratio-128),
-  * the real quant formats (FP4 e2m1 experts, FP8 e4m3 block linears),
+  * the real quant formats (FP4 e2m1fn + MXFP4 experts); FP8 block-scaled linear
+    quantization is applied at load time via the model's quant pathway (Task 12),
   * mesh-divisible dims for the DP-attention production mesh, whose head/group
     parallel `model` axis is size 4 (NOT 8): num_attention_heads % 4 == 0,
     n_routed_experts % 4 == 0, o_groups % 4 == 0 and o_groups | num_attention_heads,
