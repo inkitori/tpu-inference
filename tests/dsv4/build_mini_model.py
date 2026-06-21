@@ -252,12 +252,19 @@ def _attn_layers(vllm_config):
     return {name: i for i, name in enumerate(layers.keys())}
 
 
-def run_mini_forward(model, vllm_config, input_ids, positions):
-    """One eager forward returning logits for a single N-token prefill request.
+def build_mini_forward_args(model, vllm_config, input_ids, positions):
+    """Build the positional args tuple for ``model.model_fn`` (Task-12 contract).
+
+    Returns ``(model_fn, args, n)`` where ``model_fn`` is ``model.model_fn`` and
+    ``args`` is the exact positional tuple passed to it (the same one
+    ``run_mini_forward`` calls and the AOT gate lowers). Static positions of the
+    underlying jitted ``run_model`` are (6, 9, 10): the
+    ``layer_name_to_kvcache_index`` tuple, ``is_first_rank``, ``is_last_rank``.
 
     Builds the KV-cache pool to the mla_swa kernel contract (uint8, last-dim 640,
-    replicated) and the GLOBAL-shaped AttentionMetadata (the shard_map localizes
-    it per dp-rank). All values read off the live vllm_config -- not hardcoded.
+    REPLICATED ``P()``) and the GLOBAL-shaped AttentionMetadata (the shard_map
+    localizes it per dp-rank). All values read off the live vllm_config -- not
+    hardcoded. Single source of truth for both the eager forward and the AOT gate.
     """
     from tpu_inference.layers.common.attention_metadata import AttentionMetadata
     from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -346,23 +353,37 @@ def run_mini_forward(model, vllm_config, input_ids, positions):
     input_ids_sharded = _put_attn(input_ids_j)
     input_positions_sharded = _put_attn(input_positions)
 
-    # --- call the jitted model_fn (sets wrapper + forward contexts for free) ---
+    # --- model_fn positional args ---------------------------------------------
     # Signature mirrors tpu_runner.py: (params, kv_caches, input_ids, attn_md,
     # input_embeds, input_positions, layer_name_to_kvcache_index, lora_metadata,
-    # intermediate_tensors, is_first_rank, is_last_rank).
-    new_kv_caches, hidden_states, *_ = model.model_fn(
+    # intermediate_tensors, is_first_rank, is_last_rank). Positions 6/9/10 are the
+    # static args of the underlying jitted run_model.
+    args = (
         model.state_leaves,
         kv_caches,
         input_ids_sharded,
         attn_metadata,
         None,                          # input_embeds
         input_positions_sharded,
-        tuple(l2idx.items()),          # static
+        tuple(l2idx.items()),          # static (pos 6)
         None,                          # lora_metadata
         None,                          # intermediate_tensors
-        True,                          # is_first_rank
-        True,                          # is_last_rank
+        True,                          # is_first_rank   (static, pos 9)
+        True,                          # is_last_rank    (static, pos 10)
     )
+    return model.model_fn, args, n
+
+
+def run_mini_forward(model, vllm_config, input_ids, positions):
+    """One eager forward returning logits for a single N-token prefill request.
+
+    Thin wrapper over ``build_mini_forward_args`` (the single source of truth for
+    the model_fn args) + ``compute_logits_fn``.
+    """
+    model_fn, args, n = build_mini_forward_args(model, vllm_config, input_ids,
+                                                positions)
+    # --- call the jitted model_fn (sets wrapper + forward contexts for free) ---
+    new_kv_caches, hidden_states, *_ = model_fn(*args)
 
     logits = model.compute_logits_fn(model.state_leaves, hidden_states, None)
 
