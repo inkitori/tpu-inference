@@ -269,10 +269,104 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
         )
 
     def process_weights_after_loading(self, act_order: bool = False) -> None:
-        pass
+        # FP4 experts and FP8-block linears keep their quant; here we ONLY build
+        # the bf16 grouped wo_a weight that _o_proj's einsum("tgd,grd->tgr")
+        # consumes: [n_local_groups, o_lora_rank, heads_per_group*head_dim].
+        # self.wo_a.weight is 2D float8_e4m3fn (n_local_groups*o_lora_rank,
+        # heads_per_g*head_dim) with ue8m0 block scales in weight_scale_inv; the
+        # 2D->3D reshape the GPU does at load (deepgemm_post_process_fp8_weight_
+        # block) is CUDA-only, so do the dequant + reshape here. Mirrors
+        # rocm_aiter_mla_sparse._get_cached_wo_a_bf16:967-1001.
+        g = self.wo_a.bmm_batch_size          # == self.n_local_groups
+        r = self.o_lora_rank
+        d = self.wo_a.weight.shape[1]         # heads_per_group * head_dim
+        if hasattr(self.wo_a, "weight_scale_inv"):
+            w = self.wo_a.weight.view(g, r, d).to(torch.float32)
+            scale = self._expand_wo_a_block_scales(
+                self.wo_a.weight_scale_inv.view(
+                    g, -1, self.wo_a.weight_scale_inv.shape[-1]), r, d)
+            self.wo_a_bf16 = (w * scale).to(torch.bfloat16)
+        else:
+            # Non-quantized (synthetic) build: just view+cast.
+            self.wo_a_bf16 = self.wo_a.weight.view(g, r, d).to(torch.bfloat16)
+
+    def _expand_wo_a_block_scales(self, scale: torch.Tensor, r: int,
+                                  d: int) -> torch.Tensor:
+        # Decode ue8m0 -> fp32 then repeat_interleave each block up to (g, r, d).
+        # scale: [g, r_blocks, d_blocks] ue8m0 (float8_e8m0fnu or raw uint8).
+        # Mirrors rocm_aiter_mla_sparse._expand_2d_block_scales:863-874 +
+        # _decode_e8m0_scales:853-860, with one widening: rocm decodes ONLY
+        # float8_e8m0fnu via _upcast_e8m0_to_fp32 and value-casts everything
+        # else. Real DSV4 checkpoints store weight_scale_inv as float8_e8m0fnu,
+        # so that path is bit-identical to rocm. We additionally bit-reinterpret
+        # raw uint8 as the same biased-exponent byte (2**(byte-127)) so a uint8
+        # ue8m0 tensor (the synthetic-test format, and how some loaders surface
+        # e8m0 bytes) decodes correctly instead of being treated as an integer.
+        if scale.dtype == torch.float8_e8m0fnu or scale.dtype == torch.uint8:
+            # ue8m0 byte -> fp32 power-of-two (== _upcast_e8m0_to_fp32:
+            # exp_bits << 23, reinterpreted as float32).
+            s = (scale.view(torch.uint8).to(torch.int32) << 23).view(
+                torch.float32)
+        else:
+            s = scale.to(torch.float32)
+        # rocm uses ceil(dim / num_blocks) as the repeat factor (matches our
+        # r // r_blocks when blocks divide evenly, which they do for DSV4).
+        r_blocks, d_blocks = s.shape[-2], s.shape[-1]
+        block_r = -(-r // r_blocks)   # ceil
+        block_d = -(-d // d_blocks)   # ceil
+        s = torch.repeat_interleave(s, block_r, dim=-2)[..., :r, :]
+        s = torch.repeat_interleave(s, block_d, dim=-1)[..., :, :d]
+        return s
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return PallasMLAttentionBackend
+
+    @staticmethod
+    def _weighted_rmsnorm(x: torch.Tensor, w: torch.Tensor,
+                          eps: float) -> torch.Tensor:
+        # Pure-torch weighted RMSNorm, bit-algorithm-identical to the Triton
+        # fused_q_kv_rmsnorm kernel AND tests/dsv4/torch_ref.rmsnorm_with_weight:
+        # fp32 reduction over the last axis, weight multiplied in fp32 BEFORE the
+        # single cast back, eps inside rsqrt(mean(x^2)+eps), plain weight (no
+        # 1+w). We do NOT import fused_q_kv_rmsnorm: it is a @triton.jit kernel
+        # with no torch/meta fallback, untraceable by torchax on TPU.
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        return (xf * w.float()).to(x.dtype)
+
+    def _fused_qnorm_rope_kv_insert_q_only(self, q: torch.Tensor,
+                                           kv: torch.Tensor,
+                                           positions: torch.Tensor):
+        # q: [N, n_local_heads, head_dim]; kv: [N, head_dim].
+        # Replaces ONLY the q-side of the base CUDA _fused_qnorm_rope_kv_insert:
+        #   (a) per-head weight-free RMSNorm over head_dim (fp32, then cast),
+        #   (b) FORWARD GPT-J interleaved RoPE on the last rope_head_dim dims of
+        #       q AND of kv (+sin; the mirror of Task-8 _o_proj's inverse -sin).
+        # The kv fp8-quant + paged insert is left to the mla_swa kernel, so kv
+        # is returned rope-applied but NOT quantized. Norm+rope stay in fp32 and
+        # round once at the end (matches the base kernel's single store-round).
+        rope_dim = self.rope_head_dim
+        # weight-free per-head RMSNorm over head_dim (fp32 reduction).
+        qf = q.float()
+        q = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + self.eps)) \
+            .to(q.dtype)
+        cache = self.rotary_emb.cos_sin_cache  # [max_pos, rope_dim] = cat(cos,sin)
+        cs = cache[positions.long()].float()
+        half = rope_dim // 2
+        cos = cs[..., :half].repeat_interleave(2, dim=-1)
+        sin = cs[..., half:].repeat_interleave(2, dim=-1)
+
+        def _rope(t, cos_, sin_):
+            out = t.clone().float()
+            rot = out[..., -rope_dim:]
+            x1, x2 = rot[..., ::2], rot[..., 1::2]
+            rotated = torch.stack((-x2, x1), dim=-1).flatten(-2)
+            out[..., -rope_dim:] = rot * cos_ + rotated * sin_
+            return out.to(t.dtype)
+
+        q = _rope(q, cos.unsqueeze(-2), sin.unsqueeze(-2))  # broadcast over heads
+        kv = _rope(kv, cos, sin)                            # [N, head_dim]
+        return q, kv
 
     def forward(
         self,
@@ -280,10 +374,49 @@ class VllmDeepseekV4MLAAttention(DeepseekV4Attention):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logger.error(
-            "VllmDeepseekV4MLAAttention.forward is not implemented, just a pass-through for now"
-        )
-        return hidden_states
+        # Steps 0-4,6-7 of the attention dataflow; step 5 (compressor/indexer)
+        # skipped: every layer is forced dense through mla_swa (coherent <=128
+        # tokens). We deliberately do NOT inherit the base forward/attention_impl
+        # -- they pull in CUDA multi-stream machinery and the GPU fused
+        # qnorm/rope/kv-insert custom op, none of which run on TPU.
+        num_tokens = hidden_states.shape[0]
+        o_padded = torch.empty(
+            (num_tokens, self.padded_heads, self.head_dim),
+            dtype=hidden_states.dtype, device=hidden_states.device)
+
+        # Steps 1-2: fused WQA/WKV GEMM -> split -> fused q/kv RMSNorm.
+        # Call fused_wqa_wkv DIRECTLY (a MergedColumnParallelLinear, returns
+        # (qr_kv, None)), NOT attn_gemm_parallel_execute -- the latter drives
+        # CUDA multi-stream aux GEMMs (execute_in_parallel + ln_events) for the
+        # indexer/compressor, which Phase 1 skips. (attention.py:194-201,409-412)
+        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        # Split sizes are [q_lora_rank, head_dim] = [1024, 512] (attention.py:339);
+        # there is NO kv_lora_rank in DSV4 -- the KV latent dim IS head_dim (512).
+        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        # fused_q_kv_rmsnorm replaced by inline weighted RMSNorm (the Triton
+        # kernel is untraceable on TPU -- see _weighted_rmsnorm). Same math.
+        qr = self._weighted_rmsnorm(qr, self.q_norm.weight.data, self.eps)
+        kv = self._weighted_rmsnorm(kv, self.kv_norm.weight.data, self.eps)
+
+        # Step 3: wq_b -> [N, n_local_heads, head_dim].
+        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+
+        # Step 4: q-side weight-free RMSNorm + FORWARD GPT-J RoPE on q and kv.
+        # The kv fp8-quant + paged insert is done INSIDE the mla_swa kernel; we
+        # hand raw (rope-applied) bf16 kv to it.
+        q, kv = self._fused_qnorm_rope_kv_insert_q_only(q, kv, positions)
+
+        # Step 6: attention. The mla_swa kernel output is [N, n_local_heads,
+        # head_dim]; get_padded_num_q_heads returns num_heads unchanged so
+        # padded_heads == n_local_heads and o_padded matches the kernel output
+        # shape exactly (the slice below is then a no-op). If a future change
+        # makes padded_heads > n_local_heads, the kernel must still write into
+        # o_padded[:, :n_local_heads, :] (output.copy_ requires matching shapes).
+        self.forward_mqa(q, kv, positions, o_padded)
+        o = o_padded[:, :self.n_local_heads, :]
+
+        # Step 7: inverse-rope o_proj.
+        return self._o_proj(o, positions)
 
 
 def patch_deepseek_v4_mla_cls() -> None:
