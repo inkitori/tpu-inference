@@ -10,8 +10,8 @@
 Serve `mlx-community/Qwen3-30B-A3B-4bit` through the **torchax path** (`MODEL_IMPL_TYPE=vllm`) with accurate, coherent outputs. Weights stay **4-bit (packed uint32) + scales + biases in HBM**.
 
 **Staged delivery (user-confirmed):**
-1. **Correct baseline** — MoE experts dequant-at-load to bf16, run the existing unquantized grouped-matmul. Proves the whole pipeline (registration, weight transform, routing) and brings up the real 30B with coherent output. Experts bf16 in HBM (~7.6GB/chip, fits).
-2. **In-kernel optimized end-state** — experts kept as uint32-packed int4 + per-group scale + per-group bias in HBM (true 4-bit footprint, ~2GB/chip), dequantized **inside the `gmm_v2` grouped-matmul kernel** for only the routed experts (bandwidth- and compute-optimal). Attention linears stay dequant-in-`apply` (small, negligible).
+1. **Correctness milestone** — MoE experts dequant-at-load to bf16, run the existing unquantized grouped-matmul. Proves the whole pipeline (registration, weight transform, routing) and brings up the real 30B with coherent output. Experts bf16 in HBM (~7.6GB/chip, ~3.8× the packed footprint, dequants ALL experts/step). This is correct but NOT the production end-state.
+2. **Production end-state (in-kernel optimized)** — experts kept as uint32-packed int4 + per-group scale + per-group bias in HBM (true 4-bit footprint, ~2GB/chip), dequantized **inside the `gmm_v2` grouped-matmul kernel** for only the routed experts (bandwidth- and compute-optimal). Attention linears stay dequant-in-`apply` (small, negligible). **The production finish line (usable OpenRouter coding speed) = Stage 2, NOT Stage 1.**
 
 ### Key kernel finding (verified)
 `gmm_v2` **already** (a) bitcast-unpacks uint32-packed int4 weights in-kernel along K, and (b) applies a per-group `rhs_scale [G, num_blocks, 1, N]` inside the k-loop. The **only** missing piece for MLX affine is a **per-group additive bias**: the existing `rhs_bias [G,1,N]` is per-output-channel (a normal MLP bias), not per-group. We add a parallel `rhs_groupbias [G, num_blocks, 1, N]` and accumulate `acc_n += groupbias · groupsum(block_lhs)` in the k-loop before the fused activation (Approach B). This works for the fused w13 (gate/up+SiLU) and w2 calls; an outside-kernel correction (Approach A) does not, because w13's activation is fused inside the kernel.
@@ -24,6 +24,8 @@ Serve `mlx-community/Qwen3-30B-A3B-4bit` through the **torchax path** (`MODEL_IM
 ## Background
 
 ### The model (verified from the real checkpoint)
+> **Weights are NOT cached.** Only `config.json` + the safetensors index (~148K) are present; the ~17GB of shards must be downloaded first: `huggingface-cli download mlx-community/Qwen3-30B-A3B-4bit`. (Earlier drafts wrongly assumed "already cached.")
+
 `Qwen3MoeForCausalLM`: 48 layers (all MoE), 128 experts, top-8, `hidden=2048`, `moe_intermediate=768`, untied embeddings. MLX affine 4-bit, `group_size=64`, uniform (no per-module overrides). Quantized: attention q/k/v/o, the 128 experts (stored **stacked** as `mlp.switch_mlp.{gate,up,down}_proj`), router `mlp.gate`, `embed_tokens`, `lm_head`. Plain bf16: all norms.
 
 Each quantized tensor = `.weight` (uint32, 8 nibbles/word packed along the **input** dim) + `.scales` + `.biases` (bf16, `[out, in//64]`). Dequant is affine: `w = scale·q + bias` per group of 64 along the input dim. (`element 0 = low nibble`; flat input index = `word*8 + k`.)
@@ -61,9 +63,10 @@ Subclass `(QuantizationConfig, VllmQuantConfig)`, `@register_quantization_config
 - `process_weights_after_loading`: `jax_view` packed experts → dequant uint32→bf16 (jnp) → `process_moe_weights`/`shard_moe_weights` → store bf16 `w13_weight`/`w2_weight`.
 - `apply_monolithic`: mirror `VllmUnquantizedFusedMoEMethod.apply_monolithic` — pass bf16 weights + `w13_weight_scale=None` to `vllm_moe_apply`. Correct, serves; experts bf16 in HBM.
 
-**Stage 2 (in-kernel optimized):**
-- Extend `gmm_v2` with a per-group `rhs_groupbias [G, num_blocks, 1, N]` input (clone of the `rhs_scale` block-spec/index-map); accumulate `acc_n += groupbias · jnp.sum(block_lhs, axis=1, keepdims=True)` in the k-loop before `apply_act_fn` (hook points: scale loop `gmm_v2.py:457-462`, bias add `:471-474`, k-loop `:419`). Add a kernel-level unit test vs a numpy affine grouped-matmul reference.
-- `process_weights_after_loading`: lay out packed int4 weight + per-group scale + per-group bias in the `[G, num_blocks, 1, N]` form `process_moe_weights` produces for scale; shard; keep packed (true 4-bit in HBM).
+**Stage 2 (in-kernel optimized) — the PRODUCTION end-state.** This is NOT "one wiring edit": it is ~40+ edit sites across 5 files (gmm_v2 ~13, fused_moe_gmm chain ~17, moe.py 1–2, moe_weights.py ~10, producer 1+). See the plan (Tasks 9–10) for the exact site lists.
+- Extend `gmm_v2` with a per-group `rhs_groupbias [G, num_blocks, 1, N]` input (clone of the `rhs_scale` block-spec/index-map); accumulate `acc_n += groupbias · jnp.sum(block_lhs, axis=1, keepdims=True)` in the k-loop before `apply_act_fn`. **Apply at BOTH k-loop sites — `gmm_v2.py:386-391` (unquantized-lhs) AND `:457-462` (quantized-lhs)** — plus the `FusedWeightsRef` gate/up concat split `:134-137`. Add a kernel-level unit test vs a numpy affine grouped-matmul reference.
+- A **NEW `FusedMoEWeights.w13_groupbias`/`w2_groupbias` field** carries the affine bias end-to-end. The per-channel `w13_bias`/`w2_bias` `[E,1,out]` MLP bias is applied once post-matmul and is NOT interchangeable with the per-quant-block `[E,num_blocks,1,N]` affine bias — it cannot be repurposed.
+- `process_weights_after_loading`: lay out packed int4 weight + per-group scale + per-group groupbias in the `[E, num_blocks, 1, N]` form `process_moe_weights` produces for scale; shard; keep packed (true 4-bit in HBM). tp=8 caveat: `I/tp=96`, `96//64` non-integer → w2 scales/biases may not shard at group granularity; surface it (plan Task 10 Step 1b).
 - `apply_monolithic`: pass packed weight + scale + groupbias straight to `vllm_moe_apply`/`fused_moe_func` (no XLA dequant). Kernel unpacks int4, applies per-group scale + groupbias, fuses activation, computes only routed experts.
 - Confirm the active `MoEBackend` routes through `gmm_v2` (`GMM_EP`/`GMM_TP`), not the `DENSE_MAT`/`MEGABLX_GMM` cases that currently `raise NotImplementedError` in `process_moe_weights`.
 
