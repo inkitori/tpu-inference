@@ -20,8 +20,15 @@ import torch
 from einops import rearrange
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.gdn_linear_attn import \
-    GatedDeltaNetAttention
+try:
+    from vllm.model_executor.layers.mamba.gdn_linear_attn import \
+        GatedDeltaNetAttention
+except ModuleNotFoundError:
+    # vLLM moved GatedDeltaNetAttention from `mamba.gdn_linear_attn` to the
+    # `mamba.gdn` package (`mamba.gdn.base`). Support both layouts so model
+    # imports don't break across the pinned/nightly vLLM skew.
+    from vllm.model_executor.layers.mamba.gdn.base import \
+        GatedDeltaNetAttention
 
 from tpu_inference import envs
 from tpu_inference.layers.common.gdn_attention import (

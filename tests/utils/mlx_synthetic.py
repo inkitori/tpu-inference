@@ -53,6 +53,16 @@ def _quantize_affine(w: np.ndarray, group_size: int, force_negative_scale: bool)
     return packed, s_bf, b_bf, golden.astype(ml_dtypes.bfloat16)
 
 
+# A small head layout that keeps q/k/v/o_proj == [hidden, hidden] and avoids
+# TPU head-dim/num-head padding on a single-device "model" axis:
+#   num_attention_heads == num_key_value_heads == 2 (no GQA), head_dim == 64
+#   (get_padded_head_dim(64) == 64, get_padded_num_heads(2, 1) == 2).
+# So num_heads * head_dim == hidden == 128 for the default hidden.
+NUM_HEADS = 2
+HEAD_DIM = 64
+VOCAB = 256
+
+
 def build_synthetic_mlx_moe(dir: Path, *, layers=2, experts=8, hidden=128,
                             moe_inter=64, group_size=64, seed=0) -> dict:
     rng = np.random.default_rng(seed)
@@ -76,14 +86,29 @@ def build_synthetic_mlx_moe(dir: Path, *, layers=2, experts=8, hidden=128,
         golden[name] = np.stack(gs)
 
     import ml_dtypes
+    head_dim = HEAD_DIM
+
+    # Embedding: quantized in real MLX repos; JaxEmbed has no int4 method in
+    # phase 1, so it must load as plain bf16. We emit a plain bf16 embedding and
+    # record golden so the bf16-reference builder reuses the EXACT same values.
+    emb = rng.standard_normal((VOCAB, hidden)).astype(np.float32)
+    tensors["model.embed_tokens.weight"] = emb.astype(ml_dtypes.bfloat16)
+    golden["model.embed_tokens"] = np.asarray(
+        tensors["model.embed_tokens.weight"]).astype(np.float32)
+
     for L in range(layers):
         pre = f"model.layers.{L}"
-        # attention (dense linears)
+        # attention (dense linears, quantized)
         add_quant(f"{pre}.self_attn.q_proj", rng.standard_normal((hidden, hidden)).astype(np.float32), L == 0)
         add_quant(f"{pre}.self_attn.k_proj", rng.standard_normal((hidden, hidden)).astype(np.float32), False)
         add_quant(f"{pre}.self_attn.v_proj", rng.standard_normal((hidden, hidden)).astype(np.float32), False)
         add_quant(f"{pre}.self_attn.o_proj", rng.standard_normal((hidden, hidden)).astype(np.float32), False)
-        # norms (bf16, not quantized)
+        # q/k norms (bf16, per-head_dim) + layer norms (bf16) -- not quantized
+        for nm in ["self_attn.q_norm", "self_attn.k_norm"]:
+            w = rng.standard_normal(head_dim).astype(np.float32)
+            tensors[f"{pre}.{nm}.weight"] = w.astype(ml_dtypes.bfloat16)
+            golden[f"{pre}.{nm}"] = np.asarray(
+                tensors[f"{pre}.{nm}.weight"]).astype(np.float32)
         for nm in ["input_layernorm", "post_attention_layernorm"]:
             tensors[f"{pre}.{nm}.weight"] = np.ones(hidden, dtype=ml_dtypes.bfloat16)
         # router gate (quantized) + stacked experts
@@ -97,14 +122,91 @@ def build_synthetic_mlx_moe(dir: Path, *, layers=2, experts=8, hidden=128,
 
     tensors["model.norm.weight"] = np.ones(hidden, dtype=ml_dtypes.bfloat16)
 
+    # lm_head: quantized (JaxEinsum -> Int4LinearMethod). HF/MLX store [V, D]
+    # (out=V, in=D); the model kernel is "TD,DV->TV" (D,V), loaded with a
+    # (1,0) transpose on the standard path, but the int4 method keeps the
+    # packed [out=V, in=D] layout and contracts in=D at apply-time.
+    add_quant("lm_head", rng.standard_normal((VOCAB, hidden)).astype(np.float32), False)
+
     save_file(tensors, str(dir / "model.safetensors"), metadata={"format": "mlx"})
     cfg = {
         "architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
         "hidden_size": hidden, "num_hidden_layers": layers, "num_experts": experts,
         "num_experts_per_tok": min(2, experts), "moe_intermediate_size": moe_inter,
-        "vocab_size": 256, "tie_word_embeddings": False,
+        "num_attention_heads": NUM_HEADS, "num_key_value_heads": NUM_HEADS,
+        "vocab_size": VOCAB, "tie_word_embeddings": False,
+        "decoder_sparse_step": 1, "mlp_only_layers": [],
         "quantization": {"group_size": group_size, "bits": 4},
         "quantization_config": {"group_size": group_size, "bits": 4},
     }
     (dir / "config.json").write_text(json.dumps(cfg))
     return {"golden": golden}
+
+
+def build_bf16_reference_moe(dir: Path, golden: dict, *, layers=2, experts=8,
+                             hidden=128, moe_inter=64) -> None:
+    """Write a PLAIN bf16 (unquantized) Qwen3-MoE checkpoint from the SAME golden
+    weights that ``build_synthetic_mlx_moe`` produced.
+
+    This is the reference oracle for the e2e test: loading these bf16 tensors
+    into an unquantized ``Qwen3MoeForCausalLM`` and running the same forward
+    gives the logits the int4 path must match (the int4 path dequantizes to the
+    exact same bf16 values, so the two forwards should agree to ~bf16 atol).
+
+    Standard HF Qwen3-MoE layout (NOT MLX):
+      * attention/router/lm_head/embed weights: plain bf16 ``.weight`` [out, in]
+        (the standard JaxAutoWeightsLoader reshapes/transposes these to the
+        model kernel layout).
+      * experts: PER-EXPERT keys ``mlp.experts.{i}.{gate,up,down}_proj.weight``.
+        JaxMoE._load_weights does NOT transpose per-expert tensors (it reshapes
+        to (1,)+shape first, skipping the 2D-transpose branch) and stacks them
+        directly into the [E, in, out] kernels. The MLX golden is [out, in], so
+        each per-expert tensor must be stored TRANSPOSED to [in, out] to match
+        the [E, in, out] kernel the int4 path also produces (gate/up -> [D, F],
+        down -> [F, D]).
+    """
+    import ml_dtypes
+    tensors = {}
+
+    def _bf16(arr):
+        return np.asarray(arr).astype(ml_dtypes.bfloat16)
+
+    # Embedding -- plain bf16, identical values to the MLX checkpoint's embed.
+    tensors["model.embed_tokens.weight"] = _bf16(golden["model.embed_tokens"])
+
+    for L in range(layers):
+        pre = f"model.layers.{L}"
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            tensors[f"{pre}.self_attn.{proj}.weight"] = _bf16(
+                golden[f"{pre}.self_attn.{proj}"])
+        for nm in ("q_norm", "k_norm"):
+            tensors[f"{pre}.self_attn.{nm}.weight"] = _bf16(
+                golden[f"{pre}.self_attn.{nm}"])
+        for nm in ("input_layernorm", "post_attention_layernorm"):
+            tensors[f"{pre}.{nm}.weight"] = np.ones(hidden,
+                                                    dtype=ml_dtypes.bfloat16)
+        tensors[f"{pre}.mlp.gate.weight"] = _bf16(golden[f"{pre}.mlp.gate"])
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            stacked = golden[f"{pre}.mlp.switch_mlp.{proj}"]  # [E, out, in]
+            for e in range(experts):
+                # Transpose [out, in] -> [in, out] to match the [E, in, out]
+                # kernel that the int4 _dequantize produces (swapaxes).
+                tensors[f"{pre}.mlp.experts.{e}.{proj}.weight"] = _bf16(
+                    stacked[e].T)
+
+    tensors["model.norm.weight"] = np.ones(hidden, dtype=ml_dtypes.bfloat16)
+    # lm_head: HF [V, D]; the standard loader transposes (1,0) to the (D, V)
+    # kernel. Golden lm_head is the dequantized [out=V, in=D] = [V, D] matrix.
+    tensors["lm_head.weight"] = _bf16(golden["lm_head"])
+
+    save_file(tensors, str(dir / "model.safetensors"))
+    cfg = {
+        "architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
+        "hidden_size": hidden, "num_hidden_layers": layers,
+        "num_experts": experts, "num_experts_per_tok": min(2, experts),
+        "moe_intermediate_size": moe_inter,
+        "num_attention_heads": NUM_HEADS, "num_key_value_heads": NUM_HEADS,
+        "vocab_size": VOCAB, "tie_word_embeddings": False,
+        "decoder_sparse_step": 1, "mlp_only_layers": [],
+    }
+    (dir / "config.json").write_text(json.dumps(cfg))
