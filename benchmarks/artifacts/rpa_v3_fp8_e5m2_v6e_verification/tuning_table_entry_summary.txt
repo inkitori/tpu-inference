@@ -1,0 +1,17 @@
+## HEAD~1
+TPU v6e	page=128	q_bfloat16_kv_bfloat16	head_keys=50	entries=350
+TPU v6e	page=128	q_bfloat16_kv_float8_e4m3fn	head_keys=38	entries=266
+TPU v6e	page=256	q_bfloat16_kv_bfloat16	head_keys=50	entries=300
+TPU v6e	page=256	q_bfloat16_kv_float8_e4m3fn	head_keys=38	entries=228
+
+## HEAD
+TPU v6e	page=128	q_bfloat16_kv_bfloat16	head_keys=50	entries=350
+TPU v6e	page=128	q_bfloat16_kv_float8_e4m3fn	head_keys=38	entries=266
+TPU v6e	page=128	q_bfloat16_kv_float8_e5m2	head_keys=38	entries=266
+TPU v6e	page=256	q_bfloat16_kv_bfloat16	head_keys=50	entries=300
+TPU v6e	page=256	q_bfloat16_kv_float8_e4m3fn	head_keys=38	entries=228
+TPU v6e	page=256	q_bfloat16_kv_float8_e5m2	head_keys=38	entries=228
+
+## added TPU v6e float8_e5m2 keys in HEAD
+page=128	head_keys=38	entries=266
+page=256	head_keys=38	entries=228

@@ -1,0 +1,20 @@
+........
+=============================== warnings summary ===============================
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_attention0
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_attention1
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_kv_cache0
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_kv_cache1
+  /tmp/rpa_v3_verify_venv/lib/python3.11/site-packages/jax/_src/interpreters/mlir.py:1272: UserWarning: Some donated buffers were not usable: float8_e5m2[512,8,128], float8_e5m2[512,8,128].
+  See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    warnings.warn("Some donated buffers were not usable:"
+
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_attention2
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_attention3
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_kv_cache2
+tests/kernels/ragged_paged_attention_kernel_v3_test.py::RaggedPagedAttentionKernelTest::test_ragged_paged_attention_quantized_kv_cache3
+  /tmp/rpa_v3_verify_venv/lib/python3.11/site-packages/jax/_src/interpreters/mlir.py:1272: UserWarning: Some donated buffers were not usable: float8_e4m3fn[512,8,128], float8_e4m3fn[512,8,128].
+  See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    warnings.warn("Some donated buffers were not usable:"
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8 passed, 53 deselected, 8 warnings in 80.88s (0:01:20)

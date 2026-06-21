@@ -1,0 +1,35 @@
+## RPA v3 tests present in HEAD~1
+tests/kernels/ragged_paged_attention_kernel_v3_hd64_test.py
+tests/kernels/ragged_paged_attention_kernel_v3_test.py
+
+## RPA v3 benchmark-like files present in HEAD~1
+.buildkite/kernel_microbenchmarks/generic_ragged_paged_attention_v3/w16a16.yml
+.buildkite/kernel_microbenchmarks/generic_ragged_paged_attention_v3/w4a16.yml
+.buildkite/kernel_microbenchmarks/generic_ragged_paged_attention_v3/w4a4.yml
+.buildkite/kernel_microbenchmarks/generic_ragged_paged_attention_v3/w4a8.yml
+.buildkite/kernel_microbenchmarks/generic_ragged_paged_attention_v3/w8a16.yml
+.buildkite/kernel_microbenchmarks/generic_ragged_paged_attention_v3/w8a8.yml
+.buildkite/kernel_microbenchmarks/ragged_paged_attention_v3_head_dim_64/w16a16.yml
+.buildkite/kernel_microbenchmarks/ragged_paged_attention_v3_head_dim_64/w4a16.yml
+.buildkite/kernel_microbenchmarks/ragged_paged_attention_v3_head_dim_64/w4a4.yml
+.buildkite/kernel_microbenchmarks/ragged_paged_attention_v3_head_dim_64/w4a8.yml
+.buildkite/kernel_microbenchmarks/ragged_paged_attention_v3_head_dim_64/w8a16.yml
+.buildkite/kernel_microbenchmarks/ragged_paged_attention_v3_head_dim_64/w8a8.yml
+docs/rpa_v3_e5m2_tuning_recovery.md
+scripts/rpa_v3_e5m2_resume_sweep.sh
+scripts/rpa_v3_e5m2_snapshot_checkpoint.py
+tests/kernels/ragged_paged_attention_kernel_v2_test.py
+tests/kernels/ragged_paged_attention_kernel_v3_hd64_test.py
+tests/kernels/ragged_paged_attention_kernel_v3_test.py
+tests/scripts/run_rpa_v3_tests.sh
+tpu_inference/kernels/ragged_paged_attention/__init__.py
+tpu_inference/kernels/ragged_paged_attention/v2/__init__.py
+tpu_inference/kernels/ragged_paged_attention/v2/kernel.py
+tpu_inference/kernels/ragged_paged_attention/v2/ragged_kv_cache_update.py
+tpu_inference/kernels/ragged_paged_attention/v2/tuned_block_sizes.py
+tpu_inference/kernels/ragged_paged_attention/v3/__init__.py
+tpu_inference/kernels/ragged_paged_attention/v3/kernel.py
+tpu_inference/kernels/ragged_paged_attention/v3/kernel_hd64.py
+tpu_inference/kernels/ragged_paged_attention/v3/tuned_block_sizes.py
+tpu_inference/kernels/ragged_paged_attention/v3/tuned_block_sizes_hd64.py
+tpu_inference/kernels/ragged_paged_attention/v3/util.py

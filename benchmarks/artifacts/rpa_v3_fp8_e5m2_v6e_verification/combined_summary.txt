@@ -1,0 +1,3 @@
+fallback_path_geomean_speedup=0.990330
+valid_for_tuned_table_claim=false
+reason=actual_kernel_block_source remained fallback_default_get_default_block_sizes in both revisions

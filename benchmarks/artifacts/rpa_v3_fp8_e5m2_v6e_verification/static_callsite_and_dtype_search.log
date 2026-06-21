@@ -1,0 +1,237 @@
+## rg get_tuned_block_sizes
+benchmarks/rpa_v3_fp8_e5m2_verify.py:260:    tuned_block = tuned.get_tuned_block_sizes(
+tests/kernels/quantized_matmul_kernel_test.py:15:get_tuned_block_sizes = tuned_block_sizes.get_tuned_block_sizes
+tpu_inference/kernels/collectives/all_gather_matmul.py:630:        all_gather_matmul_tuned_block_sizes.get_tuned_block_sizes(
+tpu_inference/kernels/collectives/all_gather_matmul_tuned_block_sizes.py:62:def get_tuned_block_sizes(m, n, k, dtype_name, tp_size):
+tests/layers/common/test_attention_interface.py:314:    1. It correctly calculates block sizes using `get_tuned_block_sizes`
+tpu_inference/kernels/megablox/tuned_block_sizes.py:362:def get_tuned_block_sizes(
+tpu_inference/kernels/megablox/gmm.py:29:    get_tuned_block_sizes
+tpu_inference/kernels/megablox/gmm.py:392:        tiling = get_tuned_block_sizes(
+tpu_inference/kernels/quantized_matmul/kernel.py:13:    TunedValue, get_device_vmem_limit, get_tuned_block_sizes)
+tpu_inference/kernels/quantized_matmul/kernel.py:167:        tuned_value = get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v3/tuned_block_sizes_hd64.py:427:def get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v3/kernel_hd64.py:28:    get_tuned_block_sizes
+tpu_inference/kernels/ragged_paged_attention/v3/kernel_hd64.py:1453:        bkv_p, bq_sz = get_tuned_block_sizes(
+tpu_inference/kernels/quantized_matmul/blockwise_kernel.py:11:    TunedValue, get_device_vmem_limit, get_tuned_block_sizes)
+tpu_inference/kernels/quantized_matmul/blockwise_kernel.py:64:        tuned_value = get_tuned_block_sizes(
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:666:def get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v3/tuned_block_sizes.py:4989:def get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v2/kernel.py:30:    get_tuned_block_sizes
+tpu_inference/kernels/ragged_paged_attention/v2/kernel.py:780:        num_kv_pages_per_blk, num_q_per_blk = get_tuned_block_sizes(
+tpu_inference/kernels/fused_moe/v1/kernel.py:26:    get_tuned_block_sizes
+tpu_inference/kernels/fused_moe/v1/kernel.py:1331:        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c = get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v2/tuned_block_sizes.py:1440:def get_tuned_block_sizes(
+tpu_inference/kernels/fused_moe/v1/tuned_block_sizes.py:391:def get_tuned_block_sizes(
+
+## rg tuned_block_sizes imports in RPA v3
+tests/kernels/quantized_matmul_kernel_test.py:9:                                                    tuned_block_sizes, util)
+tests/kernels/quantized_matmul_kernel_test.py:15:get_tuned_block_sizes = tuned_block_sizes.get_tuned_block_sizes
+tests/kernels/quantized_matmul_kernel_test.py:16:TunedValue = tuned_block_sizes.TunedValue
+tests/kernels/quantized_matmul_kernel_test.py:194:    def test_quantized_matmul_use_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v3/kernel_hd64.py:27:from tpu_inference.kernels.ragged_paged_attention.v3.tuned_block_sizes_hd64 import \
+tpu_inference/kernels/ragged_paged_attention/v3/kernel_hd64.py:28:    get_tuned_block_sizes
+tpu_inference/kernels/ragged_paged_attention/v3/kernel_hd64.py:1453:        bkv_p, bq_sz = get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v3/tuned_block_sizes_hd64.py:427:def get_tuned_block_sizes(
+tpu_inference/kernels/ragged_paged_attention/v3/tuned_block_sizes.py:4989:def get_tuned_block_sizes(
+
+## rg fp8_e5m2 dtype aliases
+tests/test_utils.py:195:    assert get_jax_dtype_from_str_dtype("fp8") == jnp.float8_e4m3fn
+tests/test_utils.py:196:    assert get_jax_dtype_from_str_dtype("fp8_e4m3") == jnp.float8_e4m3fn
+tests/test_utils.py:197:    assert get_jax_dtype_from_str_dtype("fp8_e5m2") == jnp.float8_e5m2
+tests/test_utils.py:207:    (torch.float8_e4m3fn, jnp.float8_e4m3fn),
+tests/test_utils.py:208:    (torch.float8_e4m3fnuz, jnp.float8_e4m3fnuz),
+tests/test_utils.py:209:    (torch.float8_e5m2, jnp.float8_e5m2),
+tests/test_utils.py:210:    (torch.float8_e5m2fnuz, jnp.float8_e5m2fnuz),
+tests/test_envs.py:236:    assert envs.REQUANTIZE_WEIGHT_DTYPE == "float8_e4m3fn"
+tests/test_envs.py:237:    assert envs.MOE_REQUANTIZE_WEIGHT_DTYPE == "float8_e4m3fn"
+tpu_inference/utils.py:38:    "fp8": jnp.float8_e4m3fn.dtype,
+tpu_inference/utils.py:39:    "fp8_e4m3": jnp.float8_e4m3fn.dtype,
+tpu_inference/utils.py:40:    "fp8_e5m2": jnp.float8_e5m2.dtype,
+tpu_inference/utils.py:72:    torch.float8_e4m3fn: jnp.float8_e4m3fn,
+tpu_inference/utils.py:73:    torch.float8_e4m3fnuz: jnp.float8_e4m3fnuz,
+tpu_inference/utils.py:74:    torch.float8_e5m2: jnp.float8_e5m2,
+tpu_inference/utils.py:75:    torch.float8_e5m2fnuz: jnp.float8_e5m2fnuz,
+tpu_inference/envs.py:32:    REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+tpu_inference/envs.py:34:    MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+tpu_inference/envs.py:226:    lambda: os.getenv("REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+tpu_inference/envs.py:229:    lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+tests/platforms/test_tpu_platform.py:46:        ("v6e", torch.float8_e5m2),
+tests/platforms/test_tpu_platform.py:47:        ("v5e", torch.float8_e4m3fn),
+tests/runner/test_kv_cache_manager.py:798:        self.runner.kv_cache_dtype = torch.float8_e4m3fn
+tests/runner/test_kv_cache_manager.py:869:        self.runner.kv_cache_dtype = torch.float8_e4m3fn
+tests/models/jax/test_qwen3.py:119:            "weight_qtype": "float8_e4m3fn",
+tests/models/jax/test_qwen3.py:120:            "act_qtype": "float8_e4m3fn"
+tests/models/jax/test_qwen3.py:204:            cache_dtype=jnp.float8_e4m3fn
+tests/models/jax/test_llama_eagle3.py:158:            cache_dtype=jnp.float8_e4m3fn
+tests/models/jax/test_llama3.py:170:            cache_dtype=jnp.float8_e4m3fn
+tests/models/jax/test_qwen2.py:180:            cache_dtype=jnp.float8_e4m3fn
+tests/layers/vllm/test_compressed_tensors_w4a8_fp8.py:63:    x_q, x_s = test_utils.ref_quantize_fp8(x, dtype=torch.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:335:        # DeepSeek V3 weights are often float8_e4m3fn
+tests/models/jax/test_deepseek_v3.py:337:        weight = torch.randn(weight_shape).to(torch.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:339:        # 2. Mock model parameters to expect jnp.float8_e4m3fn
+tests/models/jax/test_deepseek_v3.py:341:        mock_var = MockVariable(weight_shape, dtype=jnp.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:361:                                                     dtype=jnp.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:379:            assert mock_var.value.dtype == jnp.float8_e4m3fn
+tests/models/jax/test_deepseek_v3.py:489:        weight = torch.randn(weight_shape).to(torch.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:490:        scale = torch.ones(scale_shape, dtype=torch.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:492:        mock_var = MockVariable(weight_shape, dtype=jnp.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:512:                    return jnp.zeros(shape, dtype=jnp.float8_e4m3fn)
+tests/models/jax/test_deepseek_v3.py:685:            kv_dtype = jnp.float8_e4m3fn if kv_cache_str == "fp8" else jnp.bfloat16
+tests/models/jax/test_deepseek_v3.py:773:            kv_dtype = jnp.float8_e4m3fn if kv_cache_str == "fp8" else jnp.bfloat16
+tests/layers/vllm/test_compressed_tensors_moe.py:87:                                               torch.float8_e4m3fn,
+tests/layers/vllm/test_compressed_tensors_moe.py:99:                                             torch.float8_e4m3fn,
+tests/layers/vllm/test_compressed_tensors_moe.py:153:                          params_dtype=torch.float8_e4m3fn)
+tests/layers/vllm/test_compressed_tensors_w8a8_fp8.py:120:            jnp.float8_e4m3fn,
+tests/layers/vllm/test_compressed_tensors_w8a8_fp8.py:174:            weight, torch.float8_e4m3fn, axis=quant_axis)
+tests/layers/vllm/test_fp8.py:71:        dtype: torch.dtype = torch.float8_e4m3fn) -> torch.Tensor:
+tests/layers/vllm/test_fp8.py:97:    quant_method.requant_weight_dtype = jax.numpy.float8_e4m3fn
+tests/layers/vllm/test_fp8.py:103:    x_deq = ref_fp8_activation(input_tensor, torch.float8_e4m3fn)
+tests/layers/vllm/test_fp8.py:181:    layer.quant_method.linear_config.requant_weight_dtype = jax.numpy.float8_e4m3fn
+tests/layers/vllm/test_fp8.py:191:                                                    torch.float8_e4m3fn)
+tests/layers/vllm/test_fp8.py:467:        w1, block_m, block_n, torch.float8_e4m3fn)
+tests/layers/vllm/test_fp8.py:469:        w2, block_m, block_n, torch.float8_e4m3fn)
+tests/layers/vllm/test_fp8.py:504:                         (jax.numpy.float8_e4m3fn, jax.numpy.float4_e2m1fn))
+tests/layers/vllm/test_mla_attention.py:95:        assert attn.kv_cache_quantized_dtype == jnp.float8_e4m3fn
+tests/kernels/fused_moe_v1_test.py:366:        w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn], )
+tests/kernels/fused_moe_v1_test.py:369:                jnp.float8_e5m2,
+tests/kernels/fused_moe_v1_test.py:401:    @parameterized.product(w_dtype=[jnp.int8, jnp.float8_e5m2], )
+tests/layers/vllm/backends/test_flash_attn_mla.py:272:        layer.kv_cache_quantized_dtype = jnp.float8_e4m3fn
+tests/layers/vllm/backends/test_flash_attn_mla.py:278:            mesh, kv_dtype=jnp.float8_e4m3fn)
+tests/layers/vllm/backends/test_flash_attn_mla.py:325:        layer.kv_cache_quantized_dtype = jnp.float8_e4m3fn
+tests/layers/vllm/backends/test_flash_attn_mla.py:331:            mesh, kv_dtype=jnp.float8_e4m3fn)
+tests/kernels/gmm_test.py:179:        weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+tests/kernels/gmm_test.py:244:        weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+tests/kernels/gmm_test.py:306:        weight_dtype=[jnp.int4, jnp.int8, jnp.float8_e4m3fn],
+tests/kernels/gmm_test.py:365:        weight_dtype=[jnp.int4, jnp.uint4, jnp.int8, jnp.float8_e4m3fn],
+tests/kernels/gmm_test.py:467:        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+tests/kernels/ragged_paged_attention_kernel_v3_test.py:235:        kv_dtype=[jnp.float8_e5m2, jnp.float8_e4m3fn],
+tests/kernels/ragged_paged_attention_kernel_v3_test.py:263:        kv_dtype=[jnp.float8_e5m2, jnp.float8_e4m3fn],
+tests/layers/vllm/backends/test_flash_attn.py:244:            mesh, kv_dtype=jnp.float8_e4m3fn)
+tests/layers/vllm/backends/test_flash_attn.py:271:            mesh, kv_dtype=jnp.float8_e4m3fn)
+tests/kernels/quantized_matmul_kernel_test.py:132:        q_dtype=[jnp.int8, jnp.float8_e4m3fn],
+tests/kernels/quantized_matmul_kernel_test.py:159:        q_dtype=[jnp.int8, jnp.float8_e4m3fn],
+tests/kernels/quantized_matmul_kernel_test.py:228:            jnp.float8_e4m3fn,
+tests/kernels/quantized_matmul_kernel_test.py:235:            x_q_dtype=jnp.float8_e4m3fn,
+tests/kernels/quantized_matmul_kernel_test.py:268:            x_q_dtype=jnp.float8_e4m3fn,
+tests/kernels/quantized_matmul_kernel_test.py:301:            x_q_dtype=jnp.float8_e4m3fn,
+tpu_inference/kernels/megablox/gmm_v2.py:1065:                lhs_q_dtype = jnp.float8_e4m3fn.dtype
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:351:    (7, 1024, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'):
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:353:    (7, 1024, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'):
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:355:    (7, 1024, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'):
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:357:    (7, 1024, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'):
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:359:    (7, 1024, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 3072,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:361:    (7, 1024, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:363:    (7, 1024, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:365:    (7, 1024, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:367:    (7, 1024, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 5120, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:369:    (7, 1024, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:371:    (7, 1024, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:373:    (7, 1024, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:375:    (7, 1024, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:377:    (7, 1024, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 5120, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:379:    (7, 1024, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 5120, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:380:    (7, 1024, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2048,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:382:    (7, 1024, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:384:    (7, 128, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 3584, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:385:    (7, 128, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (128, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:387:    (7, 128, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:389:    (7, 128, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1792, 8192),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:390:    (7, 128, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1536, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:391:    (7, 128, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1024, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:392:    (7, 128, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1024, 7168),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:393:    (7, 128, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (128, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:395:    (7, 128, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:397:    (7, 128, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 512, 25600),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:398:    (7, 128, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (128, 2560, 2048,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:400:    (7, 128, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 5120, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:402:    (7, 128, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (128, 5120, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:404:    (7, 128, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:406:    (7, 128, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 5120, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:407:    (7, 128, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:409:    (7, 128, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 4096, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:410:    (7, 16, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 3584, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:411:    (7, 16, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (16, 12800, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:413:    (7, 16, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 1024, 5120,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:415:    (7, 16, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 2048, 8192),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:416:    (7, 16, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 1536, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:417:    (7, 16, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 4096, 1024),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:418:    (7, 16, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 4096, 1792),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:419:    (7, 16, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (16, 1024, 12800,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:421:    (7, 16, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 5120, 512, 4),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:422:    (7, 16, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 640, 25600),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:423:    (7, 16, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (16, 1024, 4096, 2),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:424:    (7, 16, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 2560, 4096, 2),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:425:    (7, 16, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (16, 5120, 1024, 1),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:426:    (7, 16, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 1024, 5120, 1),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:427:    (7, 16, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 1280, 8192),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:428:    (7, 16, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 8192, 1024),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:429:    (7, 16, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (16, 2048, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:430:    (7, 2048, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2048,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:432:    (7, 2048, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:434:    (7, 2048, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 5120, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:436:    (7, 2048, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:438:    (7, 2048, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 1536,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:440:    (7, 2048, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2048,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:442:    (7, 2048, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:444:    (7, 2048, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:446:    (7, 2048, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 2560, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:448:    (7, 2048, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:450:    (7, 2048, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:452:    (7, 2048, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:454:    (7, 2048, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:456:    (7, 2048, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 5120, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:458:    (7, 2048, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:460:    (7, 2048, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:462:    (7, 2048, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2048,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:464:    (7, 256, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 2048, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:465:    (7, 256, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (256, 25600, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:467:    (7, 256, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 2560, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:469:    (7, 256, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 7168, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:470:    (7, 256, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 3072, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:471:    (7, 256, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 2048, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:472:    (7, 256, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 1024, 7168),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:473:    (7, 256, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (256, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:475:    (7, 256, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:477:    (7, 256, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 2560),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:478:    (7, 256, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (256, 2560, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:480:    (7, 256, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (128, 5120, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:482:    (7, 256, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (256, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:484:    (7, 256, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 2560, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:486:    (7, 256, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 1280, 8192),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:487:    (7, 256, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 8192, 1792),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:488:    (7, 256, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 2048, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:489:    (7, 32, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 1792, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:490:    (7, 32, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (32, 2560, 5120,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:492:    (7, 32, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 25600, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:494:    (7, 32, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 2048, 8192),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:495:    (7, 32, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 3072, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:496:    (7, 32, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 1024, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:497:    (7, 32, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 2048, 7168),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:498:    (7, 32, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (32, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:500:    (7, 32, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 2560, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:502:    (7, 32, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 640, 25600),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:503:    (7, 32, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (32, 5120, 2048, 4),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:504:    (7, 32, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 5120, 2048, 1),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:505:    (7, 32, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (32, 2560, 2560, 1),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:506:    (7, 32, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 2560, 2560, 2),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:507:    (7, 32, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 2560, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:508:    (7, 32, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 2048, 7168),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:509:    (7, 32, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (32, 4096, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:510:    (7, 4096, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 3584,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:512:    (7, 4096, 25600, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 6400, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:514:    (7, 4096, 25600, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 6400, 512,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:516:    (7, 4096, 28672, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:518:    (7, 4096, 3072, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 3072, 4096),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:519:    (7, 4096, 4096, 2048, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 4096, 2048),
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:520:    (7, 4096, 4096, 7168, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:522:    (7, 4096, 5120, 12800, 'float8_e4m3fn', 'float4_e2m1fn'): (1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:524:    (7, 4096, 5120, 12800, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:526:    (7, 4096, 5120, 25600, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:528:    (7, 4096, 5120, 4096, 'float8_e4m3fn', 'float4_e2m1fn'): (256, 5120, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:530:    (7, 4096, 5120, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:532:    (7, 4096, 5120, 5120, 'float8_e4m3fn', 'float4_e2m1fn'): (512, 5120, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:534:    (7, 4096, 5120, 5120, 'float8_e4m3fn', 'float8_e4m3fn'): (256, 5120, 5120,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:536:    (7, 4096, 5120, 8192, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 2560,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:538:    (7, 4096, 8192, 14336, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 4096,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:540:    (7, 4096, 8192, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (1024, 1024,
+tpu_inference/kernels/quantized_matmul/tuned_block_sizes.py:542:    (7, 512, 14336, 4096, 'float8_e4m3fn', 'float8_e4m3fn'): (512, 2048, 4096),
