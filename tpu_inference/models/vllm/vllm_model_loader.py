@@ -85,6 +85,29 @@ class IncrementalModelLoader(DefaultModelLoader):
         load_config.load_format = "auto"
         super().__init__(load_config)
 
+    def get_all_weights(self, model_config, model):
+        """Stream raw weights, applying the MLX weight transform for MLX
+        checkpoints.
+
+        MLX checkpoints (e.g. ``Qwen3-30B-A3B-4bit``) name/lay out weights
+        differently than vLLM's ``Qwen3MoeForCausalLM`` expects, so we rewrite
+        the ``(name, tensor)`` stream before ``model.load_weights`` consumes it.
+        Non-MLX checkpoints pass through the base iterator unchanged.
+        """
+        weights = super().get_all_weights(model_config, model)
+        hf_config = model_config.hf_config
+        from tpu_inference.layers.vllm.quantization.mlx import is_mlx_quantized
+        if is_mlx_quantized(hf_config):
+            from tpu_inference.models.vllm.mlx_weight_transform import \
+                transform_mlx_weights
+            q = (getattr(hf_config, "quantization_config", None)
+                 or getattr(hf_config, "quantization"))
+            return transform_mlx_weights(weights,
+                                         group_size=q["group_size"],
+                                         bits=q["bits"],
+                                         num_experts=hf_config.num_experts)
+        return weights
+
     def load_model(self,
                    vllm_config: VllmConfig,
                    model_config: ModelConfig,
