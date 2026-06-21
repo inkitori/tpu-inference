@@ -108,9 +108,15 @@ def gmm_wrapper(lhs,
     # mis-applied (collapses to b_id=0), silently corrupting the result. Keep the
     # lhs full-precision for the affine path so each rhs quant block gets its own
     # scale/groupbias (verified exact vs the load-time dequant; see the e2e gate
-    # and tests/kernels/megablox/test_gmm_v2_groupbias.py). The bf16 and
-    # symmetric per-channel (single-block) paths are unaffected and keep the
-    # quantized-lhs fast path.
+    # and tests/kernels/megablox/test_gmm_v2_groupbias.py).
+    #
+    # Every non-affine path (bf16 and the symmetric W4A8 int4 path) passes
+    # rhs_groupbias=None, so this conditional leaves their maybe_quantize_lhs=True
+    # BYTE-IDENTICAL and they keep the quantized-lhs fast path. (W4A8 is NOT safe
+    # because it is single-block -- it is grouped/multi-block in general; the
+    # group_size==hidden_size unit test merely happens to be single-block. The
+    # reason it is unaffected is solely that it never sets rhs_groupbias, so it
+    # never enters the affine reconstruction this branch guards.)
     maybe_quantize_lhs = rhs_groupbias is None
     gmm_res = gmm_v2(
         lhs=lhs,

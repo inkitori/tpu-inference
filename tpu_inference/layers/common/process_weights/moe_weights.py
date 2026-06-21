@@ -305,6 +305,16 @@ def process_moe_weights(
 
     match moe_backend:
         case MoEBackend.FUSED_MOE:
+            # The FUSED_MOE transform reshapes w13_weight_scale to 5-D but has no
+            # groupbias reshape, so a non-None groupbias would stay 4-D and
+            # silently mis-shape downstream. Affine groupbias is only ever set by
+            # the MLX GMM_TP/EP path today; fail loudly if it ever reaches here
+            # rather than corrupting the result. (Full FUSED_MOE affine support
+            # would need 5-D groupbias reshape + pad mirroring w13_weight_scale.)
+            assert w13_groupbias is None and w2_groupbias is None, (
+                "FUSED_MOE + affine groupbias not supported: the FUSED_MOE "
+                "transform does not reshape groupbias to 5-D. Use GMM_TP/GMM_EP "
+                "for affine-quantized (MLX) MoE weights.")
             # Kernel expects:
             # w13: (num_experts, 2, hidden_size, intermediate_size)
             # w2: (num_experts, intermediate_size, hidden_size)

@@ -42,7 +42,52 @@ REAL_MLX_MODEL = "mlx-community/Qwen3-30B-A3B-4bit"
 # TPU, so no eager device guard is needed.
 
 
-def test_synthetic_mlx_moe_logits_match_bf16_reference():
+# tp values to exercise. tp=1 is the original gate. tp=2 forces the w13 GMM_TP
+# path to ACTUALLY SHARD across the model axis (P(...,MLP_TENSOR) on the w13
+# out_dim), which is the only way the w13 ``groupbias`` sharding spec -- identical
+# to ``w13_weight_scale`` -- is numerically proven against a reference. With the
+# synthetic dims (moe_inter=64), the GMM_TP reorder assert ``moe_inter % tp == 0``
+# holds for tp in {1, 2}, and the padded w13 out_dim
+# (= 2*align_to(moe_inter//tp,128)*tp) is divisible by tp by construction, so tp=2
+# hits the real sharded path (not a divisibility error).
+#
+# tp=8 (the production config) is NOT parametrized here: this synthetic model has
+# num_attention_heads=2 (NUM_HEADS, chosen so head_dim=64 dodges TPU head padding
+# and q/k/v/o_proj stay [hidden,hidden]), and vLLM hard-rejects tp>num_heads at
+# config-validation time ("attention heads (2) must be divisible by tensor
+# parallel size") BEFORE any MoE weight is loaded or sharded -- so tp=8 cannot
+# exercise the groupbias path on this model at all. Reaching tp=8 would require
+# bumping the model to >=8 heads (hidden=512), which adds no NEW groupbias
+# coverage: tp=8 shards the identical w13 out_dim axis the identical way as tp=2.
+# tp=2 is the real, divisible, sharded numeric gate; the production tp=8 path is
+# covered by the RUN_REAL_MLX 30B coherence test below.
+TP_VALUES = [1, 2]
+
+
+@pytest.mark.parametrize("tensor_parallel_size", TP_VALUES)
+def test_synthetic_mlx_moe_logits_match_bf16_reference(tensor_parallel_size):
+    """MLX-4bit vs bf16-reference EXACT greedy-token match.
+
+    At tp>1 the w13 packed codes + per-group scale + per-group ``groupbias`` are
+    sharded across the model axis via ``shard_moe_weights`` (groupbias rides the
+    same ``P(None,None,None,MLP_TENSOR)`` rails as ``w13_weight_scale``). The MLX
+    path reconstructs ``w = q*scale + groupbias`` IN-KERNEL per shard, so an exact
+    token match against the unquantized bf16 reference proves the sharded
+    groupbias is applied correctly. If groupbias were replicated or sharded on the
+    wrong axis while the weight is sharded on out_dim, the per-shard
+    reconstruction would be wrong and this exact-match would FAIL.
+    """
+    # Skip rather than spuriously fail when the box has too few chips. Use the
+    # JAX-free chip counter (glob over /dev/accel*//dev/vfio) -- calling
+    # jax.devices()/jax.device_count() here would initialize the TPU backend in
+    # this parent process and then DEADLOCK vLLM's EngineCore fork (see the
+    # module NOTE). get_num_chips() never touches JAX.
+    from tpu_inference.tpu_info import get_num_chips
+    n_dev = get_num_chips()
+    if tensor_parallel_size > n_dev:
+        pytest.skip(
+            f"tensor_parallel_size={tensor_parallel_size} > {n_dev} chips")
+
     from vllm import LLM, SamplingParams
     with tempfile.TemporaryDirectory() as mlx_dir, \
             tempfile.TemporaryDirectory() as ref_dir:
@@ -61,14 +106,16 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference():
         # never applies the transform), so the MLX path must request this
         # loader explicitly; otherwise the un-transformed quantized
         # lm_head/switch_mlp tensors reach the model and fail to load.
-        mlx = LLM(model=mlx_dir, tensor_parallel_size=1, max_model_len=64,
+        mlx = LLM(model=mlx_dir,
+                  tensor_parallel_size=tensor_parallel_size, max_model_len=64,
                   enforce_eager=True, dtype="bfloat16",
                   load_format="tpu_streaming_loader")
         out_mlx = mlx.generate({"prompt_token_ids": prompt_ids}, sp)
         del mlx
         time.sleep(10)  # Wait for the TPU to be released before the next LLM.
 
-        ref = LLM(model=ref_dir, tensor_parallel_size=1, max_model_len=64,
+        ref = LLM(model=ref_dir,
+                  tensor_parallel_size=tensor_parallel_size, max_model_len=64,
                   enforce_eager=True, dtype="bfloat16")
         out_ref = ref.generate({"prompt_token_ids": prompt_ids}, sp)
         del ref
@@ -76,9 +123,11 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference():
 
         mlx_ids = list(out_mlx[0].outputs[0].token_ids)
         ref_ids = list(out_ref[0].outputs[0].token_ids)
-        print(f"MLX  tokens: {mlx_ids}")
-        print(f"REF  tokens: {ref_ids}")
-        assert mlx_ids == ref_ids
+        print(f"[tp={tensor_parallel_size}] MLX  tokens: {mlx_ids}")
+        print(f"[tp={tensor_parallel_size}] REF  tokens: {ref_ids}")
+        assert mlx_ids == ref_ids, (
+            f"tp={tensor_parallel_size}: MLX 4-bit (sharded w13 groupbias) "
+            f"diverged from bf16 reference: {mlx_ids} != {ref_ids}")
 
 
 @pytest.mark.skipif(
