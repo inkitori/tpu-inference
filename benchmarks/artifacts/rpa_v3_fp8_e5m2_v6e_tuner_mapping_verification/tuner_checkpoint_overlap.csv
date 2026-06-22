@@ -1,0 +1,5 @@
+q_dtype,kv_dtype,page_size,num_q_heads,num_kv_heads,head_dim,max_model_len,sliding_window,shape_key,seq_key,baseline_bkv_p,baseline_bq_sz,baseline_status,baseline_latency_us,winner_bkv_p,winner_bq_sz,winner_latency_us,winner_source,speedup_vs_successful_baseline
+bfloat16_from_checkpoint_metadata,float8_e5m2_from_checkpoint_metadata,128,32,8,128,2048,,q_head-32_kv_head-8_head-128,max_model_len-2048-sw-None,16,32,SUCCESS,625,8,32,617,main_exhaustive,1.012965964343598
+bfloat16_from_checkpoint_metadata,float8_e5m2_from_checkpoint_metadata,128,32,8,128,8192,,q_head-32_kv_head-8_head-128,max_model_len-8192-sw-None,16,32,SUCCESS,1695,32,32,1687,main_exhaustive,1.004742145820984
+bfloat16_from_checkpoint_metadata,float8_e5m2_from_checkpoint_metadata,128,64,8,128,2048,,q_head-64_kv_head-8_head-128,max_model_len-2048-sw-None,16,32,SUCCESS,869,16,16,622,main_exhaustive,1.3971061093247588
+bfloat16_from_checkpoint_metadata,float8_e5m2_from_checkpoint_metadata,128,64,8,128,8192,,q_head-64_kv_head-8_head-128,max_model_len-8192-sw-None,16,32,SUCCESS,2640,32,16,1691,main_exhaustive,1.5612063867534003
