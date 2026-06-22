@@ -1,0 +1,5 @@
+case_id,old_fallback_sha,new_wired_sha,old_fallback_median_ms,new_tuned_median_ms,speedup,percent_change,new_actual_kernel_block_source,new_correctness,notes
+decode_gqa_32q8kv_ctx2048_p128,691fcc89aa52818598b30d76c6de969427c29a8e,514dedf3a6647a993d23c8681853ba116db13423,0.241479953,0.240099966,1.005748,0.571,tuned_table,pass,representative same-matrix comparison; not production-proven
+decode_gqa_32q8kv_ctx8192_p128,691fcc89aa52818598b30d76c6de969427c29a8e,514dedf3a6647a993d23c8681853ba116db13423,0.307430048,0.300670043,1.022483,2.199,tuned_table,pass,representative same-matrix comparison; not production-proven
+decode_gqa_64q8kv_ctx2048_p128,691fcc89aa52818598b30d76c6de969427c29a8e,514dedf3a6647a993d23c8681853ba116db13423,0.234709936,0.237069908,0.990045,-1.005,tuned_table,pass,representative same-matrix comparison; not production-proven
+decode_gqa_64q8kv_ctx8192_p128,691fcc89aa52818598b30d76c6de969427c29a8e,514dedf3a6647a993d23c8681853ba116db13423,0.309180003,0.301230000,1.026392,2.571,tuned_table,pass,representative same-matrix comparison; not production-proven

@@ -1,0 +1,11 @@
+wired_sha=514dedf3a6647a993d23c8681853ba116db13423
+comparison_fallback_sha=691fcc89aa52818598b30d76c6de969427c29a8e
+device=TPU v6e, 8 chips
+q_dtype=bfloat16
+kv_dtype=float8_e5m2
+iterations=9
+warmups=3
+representative_geomean_speedup_vs_691fcc8_fallback=1.011063
+all_new_cases_actual_kernel_block_source=tuned_table
+all_new_cases_correctness=pass
+production_proven=false
