@@ -208,13 +208,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         num_q_heads = 32
         num_kv_heads = 8
         head_dim = 128
-        tuned_kv_pages_per_block = 3
-        tuned_queries_per_block = 5
+        tuned_kv_pages_per_block = 4
+        tuned_queries_per_block = 64
         fallback_block_sizes = {
             "bq_sz": 11,
             "bkv_sz": 7 * page_size,
-            "bq_csz": 1,
-            "bkv_csz": page_size,
+            "bq_csz": 64,
+            "bkv_csz": 4 * page_size,
         }
         lookup_key = (
             "TPU v6e",
@@ -355,6 +355,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         for block_sizes in observed_block_sizes:
             self.assertEqual(block_sizes["bq_sz"], tuned_queries_per_block)
             self.assertEqual(block_sizes["bkv_sz"], expected_bkv_sz)
+            self.assertEqual(block_sizes["bq_csz"], 32)
+            self.assertEqual(block_sizes["bkv_csz"], page_size)
 
     @parameterized.product(
         dtype=[jnp.float32, jnp.bfloat16],

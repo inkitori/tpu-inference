@@ -127,6 +127,23 @@ def _align_to(x: int, a: int) -> int:
     return _cdiv(x, a) * a
 
 
+def _decode_heavy_lens(max_num_tokens: int, max_model_len: int,
+                       actual_num_seqs: int) -> tuple[list[int], list[int]]:
+    assert max_num_tokens >= actual_num_seqs
+    if actual_num_seqs == 1:
+        cu_q_lens = [0, max_num_tokens]
+    else:
+        cu_q_lens = list(range(actual_num_seqs))
+        prefill_q_len = max_num_tokens - (actual_num_seqs - 1)
+        cu_q_lens.append(cu_q_lens[-1] + prefill_q_len)
+
+    kv_lens = []
+    for seq_idx in range(actual_num_seqs):
+        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
+        kv_lens.append(max_model_len if q_len == 1 else q_len)
+    return cu_q_lens, kv_lens
+
+
 def _block_until_ready(tree):
     import jax
 
@@ -149,7 +166,7 @@ def _git_sha(repo_path: Path) -> str:
         ["git", "-C", str(repo_path), "rev-parse", "HEAD"], text=True).strip()
 
 
-def _make_inputs(case: Case, *, copies: int, seed: int):
+def _make_inputs(case: Case, *, copies: int, seed: int, args):
     import jax.numpy as jnp
     import numpy as np
     from tpu_inference.kernels.ragged_paged_attention.v3.util import (
@@ -158,10 +175,46 @@ def _make_inputs(case: Case, *, copies: int, seed: int):
     rng = np.random.default_rng(seed)
     q_dtype = jnp.bfloat16
     kv_dtype = jnp.float8_e5m2
-    max_num_tokens = align_to(case.num_seqs, 128)
-    max_num_seqs = align_to(case.num_seqs, 8)
     pages_per_seq = cdiv(case.max_model_len, case.page_size)
-    total_pages = case.num_seqs * pages_per_seq
+    if args.workload == "decode":
+        actual_num_seqs = case.num_seqs
+        max_num_tokens = align_to(actual_num_seqs, 128)
+        max_num_seqs = align_to(actual_num_seqs, 8)
+        total_pages = actual_num_seqs * pages_per_seq
+        cu_q_lens_np = np.arange(actual_num_seqs + 1, dtype=np.int32)
+        kv_lens_np = np.full((actual_num_seqs, ),
+                             case.max_model_len,
+                             dtype=np.int32)
+        page_indices_np = np.arange(total_pages, dtype=np.int32).reshape(
+            actual_num_seqs, pages_per_seq)
+        page_indices_np = np.pad(
+            page_indices_np,
+            ((0, max_num_seqs - actual_num_seqs), (0, 0)),
+        ).reshape(-1)
+        distribution_values = [actual_num_seqs, actual_num_seqs, actual_num_seqs]
+    elif args.workload == "tuner_mixed":
+        actual_num_seqs = args.tuner_actual_num_seqs
+        max_num_tokens = args.tuner_max_num_tokens
+        max_num_seqs = args.tuner_max_num_seqs
+        total_pages = args.tuner_total_num_pages
+        cu_q_lens, kv_lens = _decode_heavy_lens(max_num_tokens,
+                                                case.max_model_len,
+                                                actual_num_seqs)
+        cu_q_lens_np = np.asarray(cu_q_lens, dtype=np.int32)
+        kv_lens_np = np.asarray(kv_lens, dtype=np.int32)
+        page_indices_np = (np.arange(max_num_seqs * pages_per_seq,
+                                     dtype=np.int32) % total_pages)
+        distribution_values = [0, 0, actual_num_seqs]
+    else:
+        raise ValueError(f"Unsupported workload {args.workload!r}")
+
+    if max_num_tokens < int(cu_q_lens_np[-1]):
+        raise ValueError(f"{max_num_tokens=} is too small for {cu_q_lens_np[-1]=}")
+    if max_num_seqs < actual_num_seqs:
+        raise ValueError(f"{max_num_seqs=} is too small for {actual_num_seqs=}")
+    if total_pages < 1:
+        raise ValueError(f"{total_pages=} must be positive")
+
     padded_head_dim = align_to(case.head_dim, 128)
     kv_packing = get_dtype_packing(kv_dtype)
     num_kv_heads_x2 = align_to(case.kv_heads * 2, kv_packing)
@@ -192,26 +245,25 @@ def _make_inputs(case: Case, *, copies: int, seed: int):
     correctness_kv_cache = random_array(kv_cache_shape, kv_dtype)
     timing_kv_cache = random_array(kv_cache_shape, kv_dtype)
     kv_lens = jnp.pad(
-        jnp.full((case.num_seqs,), case.max_model_len, dtype=jnp.int32),
-        (0, max_num_seqs - case.num_seqs),
+        jnp.asarray(kv_lens_np, dtype=jnp.int32),
+        (0, max_num_seqs - actual_num_seqs),
     )
-    page_indices = jnp.arange(total_pages, dtype=jnp.int32).reshape(
-        case.num_seqs, pages_per_seq)
-    page_indices = jnp.pad(
-        page_indices,
-        ((0, max_num_seqs - case.num_seqs), (0, 0)),
-    ).reshape(-1)
     cu_q_lens = jnp.pad(
-        jnp.arange(case.num_seqs + 1, dtype=jnp.int32),
-        (0, max_num_seqs + 1 - (case.num_seqs + 1)),
+        jnp.asarray(cu_q_lens_np, dtype=jnp.int32),
+        (0, max_num_seqs + 1 - (actual_num_seqs + 1)),
     )
-    distribution = jnp.array([case.num_seqs, case.num_seqs, case.num_seqs],
-                             dtype=jnp.int32)
+    page_indices = jnp.asarray(page_indices_np, dtype=jnp.int32)
+    distribution = jnp.array(distribution_values, dtype=jnp.int32)
     static = {
+        "workload": args.workload,
+        "actual_num_seqs": actual_num_seqs,
+        "actual_num_tokens": int(cu_q_lens_np[actual_num_seqs]),
         "max_num_tokens": max_num_tokens,
         "max_num_seqs": max_num_seqs,
         "pages_per_seq": pages_per_seq,
+        "total_pages": total_pages,
         "kv_cache_shape": kv_cache_shape,
+        "distribution": repr(distribution_values),
         "q_dtype": str(jnp.dtype(q_dtype)),
         "kv_dtype": str(jnp.dtype(kv_dtype)),
     }
@@ -238,7 +290,7 @@ def _run_case(case: Case, args, modules) -> dict[str, object]:
     copies = 1 + args.warmups + args.iterations + 1
     (q_list, k_list, v_list, correctness_kv_cache, timing_kv_cache, kv_lens,
      page_indices, cu_q_lens, distribution, static) = _make_inputs(
-         case, copies=copies, seed=args.seed)
+         case, copies=copies, seed=args.seed, args=args)
 
     kwargs = {
         "use_causal_mask": True,
@@ -335,8 +387,8 @@ def _run_case(case: Case, args, modules) -> dict[str, object]:
         output, updated_kv_cache = rpa_kernel.ragged_paged_attention(
             q_list[0], k_list[0], v_list[0], correctness_kv_cache, kv_lens,
             page_indices, cu_q_lens, distribution, **kwargs)
-        expected = _block_until_ready(expected[:case.num_seqs])
-        output = _block_until_ready(output[:case.num_seqs])
+        expected = _block_until_ready(expected[:static["actual_num_tokens"]])
+        output = _block_until_ready(output[:static["actual_num_tokens"]])
         kv_cache_equal = bool(
             np.asarray(
                 _block_until_ready(jnp.all(updated_kv_cache == expected_kv_cache))))
@@ -433,6 +485,13 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--atol", type=float, default=0.2)
     parser.add_argument("--rtol", type=float, default=0.2)
+    parser.add_argument("--workload",
+                        choices=("decode", "tuner_mixed"),
+                        default="decode")
+    parser.add_argument("--tuner-actual-num-seqs", type=int, default=35)
+    parser.add_argument("--tuner-max-num-tokens", type=int, default=128)
+    parser.add_argument("--tuner-max-num-seqs", type=int, default=128)
+    parser.add_argument("--tuner-total-num-pages", type=int, default=128)
     args = parser.parse_args()
 
     repo_path = args.repo_path.resolve()
@@ -462,6 +521,12 @@ def main() -> int:
     print(f"VERSIONS={versions}")
     print("KV_DTYPE=float8_e5m2")
     print("Q_DTYPE=bfloat16")
+    print(f"WORKLOAD={args.workload}")
+    if args.workload == "tuner_mixed":
+        print(f"TUNER_ACTUAL_NUM_SEQS={args.tuner_actual_num_seqs}")
+        print(f"TUNER_MAX_NUM_TOKENS={args.tuner_max_num_tokens}")
+        print(f"TUNER_MAX_NUM_SEQS={args.tuner_max_num_seqs}")
+        print(f"TUNER_TOTAL_NUM_PAGES={args.tuner_total_num_pages}")
     print("MATRIX=" + json.dumps([asdict(case) for case in _matrix()]))
 
     if jax.default_backend() != "tpu":

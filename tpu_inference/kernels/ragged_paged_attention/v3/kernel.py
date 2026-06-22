@@ -1563,7 +1563,7 @@ def _get_tuned_block_sizes_or_none(
     sliding_window,
     default_block_sizes,
 ) -> dict[str, int] | None:
-    """Get tuned fetch sizes, preserving default compute sizes when available."""
+    """Get block sizes using the same tuple reconstruction as the tuner."""
     keys = tuned_block_sizes.get_lookup_keys(
         page_size,
         q_dtype,
@@ -1593,11 +1593,10 @@ def _get_tuned_block_sizes_or_none(
         sliding_window,
     )
     bkv_sz = bkv_p * page_size
-    bq_csz = _largest_divisor_at_most(bq_sz,
-                                      min(default_block_sizes["bq_csz"],
-                                          bq_sz))
-    bkv_csz = page_size * _largest_divisor_at_most(
-        bkv_p, min(default_block_sizes["bkv_csz"], bkv_sz) // page_size)
+    del default_block_sizes
+
+    bq_csz = _largest_divisor_at_most(bq_sz, min(32, bq_sz))
+    bkv_csz = page_size
     return {
         "bq_sz": bq_sz,
         "bkv_sz": bkv_sz,
