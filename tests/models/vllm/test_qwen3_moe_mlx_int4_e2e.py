@@ -46,10 +46,18 @@ REAL_MLX_MODEL = "mlx-community/Qwen3-30B-A3B-4bit"
 # path to ACTUALLY SHARD across the model axis (P(...,MLP_TENSOR) on the w13
 # out_dim), which is the only way the w13 ``groupbias`` sharding spec -- identical
 # to ``w13_weight_scale`` -- is numerically proven against a reference. With the
-# synthetic dims (moe_inter=64), the GMM_TP reorder assert ``moe_inter % tp == 0``
-# holds for tp in {1, 2}, and the padded w13 out_dim
-# (= 2*align_to(moe_inter//tp,128)*tp) is divisible by tp by construction, so tp=2
-# hits the real sharded path (not a divisibility error).
+# synthetic dims (moe_inter=128, group_size=64 -> w2 has 128/64=2 quant blocks),
+# the GMM_TP reorder assert ``moe_inter % tp == 0`` holds for tp in {1, 2}, and the
+# padded w13 out_dim (= 2*align_to(moe_inter//tp,128)*tp) is divisible by tp by
+# construction, so tp=2 hits the real sharded path (not a divisibility error).
+#
+# moe_inter=128 (not 64) is deliberate: w2 is ALSO kept int4 now, and w2 stays
+# int4 only when its block count (moe_inter/group_size) divides the MLP tensor
+# degree. 128/64=2 is divisible by tp=2, so at tp=2 the w2 per-group scale AND
+# groupbias shard on the block dim (P(None, MLP_TENSOR)) -- this test then also
+# proves w2 groupbias sharding, not just w13's. (At moe_inter=64 -> 1 block, w2
+# would fall back to bf16 at tp=2 and the w2-int4 sharding path would go
+# unexercised.)
 #
 # tp=8 (the production config) is NOT parametrized here: this synthetic model has
 # num_attention_heads=2 (NUM_HEADS, chosen so head_dim=64 dodges TPU head padding
@@ -76,6 +84,16 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference(tensor_parallel_size):
     groupbias is applied correctly. If groupbias were replicated or sharded on the
     wrong axis while the weight is sharded on out_dim, the per-shard
     reconstruction would be wrong and this exact-match would FAIL.
+
+    w2 is ALSO kept int4 now (down_proj experts: signed int4 codes + per-group
+    scale + ``w2_groupbias``). With moe_inter=128, group_size=64 -> 2 quant
+    blocks, so at tp=2 the w2 scale AND groupbias shard on the block dim
+    (``P(None, MLP_TENSOR)``); the kernel reconstructs ``w2 = q*scale +
+    groupbias`` per shard. So this exact-match ALSO proves w2 groupbias sharding.
+    Because the bf16 reference's down_proj golden IS the int4-affine dequant
+    (golden = q*scale_bf + bias_bf, see ``_quantize_affine``), both sides see the
+    SAME dequantized w2 -- this stays an exact-match test of the SHARDING/kernel,
+    not of int4 quant error.
     """
     # Skip rather than spuriously fail when the box has too few chips. Use the
     # JAX-free chip counter (glob over /dev/accel*//dev/vfio) -- calling
@@ -91,10 +109,12 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference(tensor_parallel_size):
     from vllm import LLM, SamplingParams
     with tempfile.TemporaryDirectory() as mlx_dir, \
             tempfile.TemporaryDirectory() as ref_dir:
+        # moe_inter=128 (group_size=64 -> w2 has 2 quant blocks) so w2 stays int4
+        # and its block-dim shard is divisible at tp=2 (see TP_VALUES comment).
         meta = build_synthetic_mlx_moe(mlx_dir, layers=2, experts=8, hidden=128,
-                                       moe_inter=64)
+                                       moe_inter=128)
         build_bf16_reference_moe(ref_dir, meta["golden"], layers=2, experts=8,
-                                 hidden=128, moe_inter=64)
+                                 hidden=128, moe_inter=128)
 
         sp = SamplingParams(max_tokens=8, temperature=0.0, logprobs=5)
         prompt_ids = [1, 5, 9, 13, 2, 7]

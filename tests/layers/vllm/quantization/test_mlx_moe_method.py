@@ -92,6 +92,12 @@ class _FakeFusedMoE(FusedMoE):
         torch.nn.Module.__init__(self)
         self.num_experts = num_experts
         self.expert_map_manager = _IdentityExpertMap()
+        # Newer vLLM's FusedMoE.weight_loader maps the global->local expert id
+        # via ``_map_global_expert_id_to_local_expert_id``, which reads
+        # ``self._expert_map`` (None == no expert-parallel, identity mapping).
+        # We run single-rank with no EP, so None gives the identity behavior the
+        # old ``_IdentityExpertMap`` provided.
+        self._expert_map = None
         self.activation = MoEActivation.from_str("silu")
         self.quant_config = None  # FusedMoE.weight_loader reads .quant_config
         # hidden_size / intermediate_size_per_partition are read off moe_config;
@@ -220,21 +226,34 @@ def _reconstruct_w13_from_stored(codes, scale, groupbias):
     return codes * scale_full + groupbias_full
 
 
+def _reconstruct_w2_from_stored(codes, scale, groupbias):
+    """Reconstruct the dequantized w2 from the STORED Stage-2 layer params, the
+    same ``w = codes * scale + groupbias`` fold the kernel does in-kernel.
+
+    w2 has the SAME stored layout as w13 after ``process_moe_weights`` (GMM_TP):
+    codes int4 [E, size_k=I, size_n=H], scale/groupbias f32
+    [E, num_blocks=I//gs, 1, size_n=H]. Only the dim sizes differ (contraction
+    is the intermediate dim, output is the hidden dim), so the reconstruction is
+    identical to ``_reconstruct_w13_from_stored``."""
+    return _reconstruct_w13_from_stored(codes, scale, groupbias)
+
+
 def test_process_weights_dequant_matches_golden_experts():
     """End-to-end (Stage-2 hybrid): load per-expert 4-bit packs through the real
     weight_loaders, run process_weights_after_loading, and assert the result
     matches feeding the SAME golden bf16 experts through the SAME unquantized
     processing path.
 
-    Stage-2 keeps w13 as SIGNED int4 CODES + per-group ``w13_weight_scale`` +
-    per-group affine ``w13_groupbias`` (in-kernel dequant via gmm_v2); the codes
-    are NOT bf16, so we cannot compare them to the bf16 golden directly. Instead
-    we RECONSTRUCT the dequantized w13 from the stored params exactly as the
-    kernel does (``codes * scale + groupbias``) and compare THAT to the golden.
-    w2 stays bf16 (dequant-at-load) and is compared directly. This isolates the
-    new MLX int4-keep + sign-fold + affine-bias logic from the shared (already
-    tested) GMM layout transform, and is a real-behavior check (golden = the
-    bf16 the checkpoint ships)."""
+    Stage-2 keeps BOTH w13 AND w2 as SIGNED int4 CODES + per-group
+    ``{w13,w2}_weight_scale`` + per-group affine ``{w13,w2}_groupbias`` (in-kernel
+    dequant via gmm_v2); the codes are NOT bf16, so we cannot compare them to the
+    bf16 golden directly. Instead we RECONSTRUCT the dequantized weight from the
+    stored params exactly as the kernel does (``codes * scale + groupbias``) and
+    compare THAT to the golden, for w13 AND w2. (At tp=1 / single CPU device,
+    ``w13_reorder_size == 1`` so the w2-int4 gate is always taken -- w2 is int4
+    here.) This isolates the new MLX int4-keep + sign-fold + affine-bias logic
+    from the shared (already tested) GMM layout transform, and is a real-behavior
+    check (golden = the bf16 the checkpoint ships)."""
     mesh = test_utils.get_spmd_mesh(1)
     method, layer = _build_method_and_layer(mesh)
     assert method.moe_backend.name == "GMM_TP"  # single-device, no EP
@@ -298,7 +317,42 @@ def test_process_weights_dequant_matches_golden_experts():
     assert not np.allclose(recon_no_bias, ref_w13, atol=2e-2, rtol=2e-2), (
         "test has no teeth: dropping the affine groupbias still matched")
 
-    # --- w2: dequantized to bf16 at load (Stage-1 behavior) ---
-    got_w2 = np.asarray(jax_view(layer.w2_weight)).astype(np.float32)
-    assert got_w2.shape == ref_w2.shape
-    np.testing.assert_allclose(got_w2, ref_w2, atol=2e-2, rtol=2e-2)
+    # --- w2: ALSO stored as SIGNED int4 codes + scale + affine groupbias ---
+    # (At single-device tp=1 the w2-int4 gate is always taken.) Mirror the w13
+    # checks: the scale/groupbias params must now exist, the codes must be
+    # signed, the groupbias must be present, and the in-kernel fold must
+    # reconstruct the golden bf16 w2.
+    assert method._w2_int4, (
+        "at single-device tp=1 (w13_reorder_size==1) w2 must be kept int4")
+    assert hasattr(layer, "w2_weight_scale") and hasattr(layer, "w2_groupbias"), (
+        "process_weights must register w2_weight_scale / w2_groupbias when w2 "
+        "is kept int4")
+
+    w2_codes = np.asarray(jax_view(layer.w2_weight))
+    w2_scale = np.asarray(jax_view(layer.w2_weight_scale))
+    w2_gbias = np.asarray(jax_view(layer.w2_groupbias))
+
+    # The w2 codes must be SIGNED int4 (the -8 sign-fold was applied at load).
+    assert w2_codes.min() < 0, (
+        "w2 codes must be signed int4 ([-8,7]); a missing -8 sign-fold would "
+        "leave them unsigned [0,15]")
+    assert w2_codes.min() >= -8 and w2_codes.max() <= 7
+
+    # The affine groupbias must be PRESENT and non-zero (not dropped).
+    assert w2_gbias.shape == w2_scale.shape
+    assert np.abs(w2_gbias).max() > 0, "w2 affine groupbias was dropped"
+
+    recon_w2 = _reconstruct_w2_from_stored(w2_codes, w2_scale, w2_gbias)
+    assert recon_w2.shape == ref_w2.shape
+    np.testing.assert_allclose(recon_w2, ref_w2, atol=2e-2, rtol=2e-2)
+
+    # TEETH: the same wrong-sign-fold and dropped-bias controls must BOTH break
+    # the w2 match -- proving the int4-w2 fold is what makes the test pass.
+    recon_w2_wrong_fold = _reconstruct_w2_from_stored(w2_codes + 8, w2_scale,
+                                                      w2_gbias)
+    assert not np.allclose(recon_w2_wrong_fold, ref_w2, atol=2e-2, rtol=2e-2), (
+        "test has no teeth: a wrong (unsigned) sign-fold still matched w2")
+    recon_w2_no_bias = _reconstruct_w2_from_stored(w2_codes, w2_scale,
+                                                   np.zeros_like(w2_gbias))
+    assert not np.allclose(recon_w2_no_bias, ref_w2, atol=2e-2, rtol=2e-2), (
+        "test has no teeth: dropping the w2 affine groupbias still matched")

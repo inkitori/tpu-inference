@@ -90,6 +90,42 @@ def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
                 f"FusedMoE does not support {scoring_fn} scoring function")
 
 
+def compute_moe_routing(gating_output,
+                        topk,
+                        *,
+                        scoring_fn,
+                        renormalize,
+                        e_score_correction_bias=None,
+                        routed_scaling_factor=1.0):
+    """Return (topk_weights, topk_indices) replicating vLLM grouped_topk/
+    fused_topk_bias: bias affects selection only; weights gathered from unbiased
+    scores; then renormalize (+1e-20) and scale. bias=None & rsf=1.0 is an exact
+    no-op vs plain top_k.
+
+    Replicate vLLM's grouped_topk / fused_topk_bias gating semantics:
+      scores = scoring_fn(logits)
+      selection scores add the per-expert correction bias (bias affects which
+        experts are chosen, NOT the routing weights),
+      routing weights are gathered from the UNBIASED scores,
+      then optionally renormalized and scaled by routed_scaling_factor.
+    With bias=None and routed_scaling_factor=1.0 this is an exact no-op vs. the
+    previous plain top_k path (e.g. Qwen3 softmax routing).
+    """
+    scores = apply_scoring_fn(scoring_fn, gating_output)
+    if e_score_correction_bias is not None:
+        selection_scores = scores + e_score_correction_bias[None, :]
+    else:
+        selection_scores = scores
+    _, topk_indices = jax.lax.top_k(selection_scores, k=topk)
+    topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
+    if renormalize:
+        topk_weights = topk_weights / (
+            topk_weights.sum(axis=-1, keepdims=True) + 1e-20)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights, topk_indices
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -471,6 +507,7 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "use_ep",
     "activation",
     "scoring_fn",
+    "routed_scaling_factor",
     "sc_kernel_threshold",
     "sc_kernel_col_chunk_size",
     "all_gather_fp8",
@@ -487,12 +524,14 @@ def fused_moe_func(
     topk: int,
     w1_groupbias: jax.Array | None = None,
     w2_groupbias: jax.Array | None = None,
+    e_score_correction_bias: jax.Array | None = None,
     *,
     renormalize: bool,
     mesh: Mesh,
     use_ep: bool,
     activation: str,
     scoring_fn: str,
+    routed_scaling_factor: float = 1.0,
     sc_kernel_threshold: int,
     sc_kernel_col_chunk_size: int,
     all_gather_fp8: bool = False,
@@ -528,10 +567,13 @@ def fused_moe_func(
 
     assert gating_output.shape == (num_tokens, global_num_experts)
 
-    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
-    topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    topk_weights, topk_indices = compute_moe_routing(
+        gating_output,
+        topk,
+        scoring_fn=scoring_fn,
+        renormalize=renormalize,
+        e_score_correction_bias=e_score_correction_bias,
+        routed_scaling_factor=routed_scaling_factor)
     # All gathering topk_indices and topk_weights if attention dp is used.
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(

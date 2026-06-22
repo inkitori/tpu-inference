@@ -78,6 +78,8 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
+    e_score_correction_bias: jax.Array | None = None,
+    routed_scaling_factor: float | None = None,
 ) -> jax.Array:
 
     with jax.named_scope(layer._get_name()):
@@ -140,6 +142,7 @@ def moe_apply(
                     w2_bias=weights.w2_bias,
                     w1_groupbias=weights.w13_groupbias,
                     w2_groupbias=weights.w2_groupbias,
+                    e_score_correction_bias=e_score_correction_bias,
                     gating_output=gating_output,
                     topk=layer.top_k,
                     renormalize=layer.renormalize,
@@ -147,6 +150,8 @@ def moe_apply(
                     use_ep=layer.use_ep,
                     activation=activation,
                     scoring_fn=layer.scoring_func,
+                    routed_scaling_factor=(1.0 if routed_scaling_factor is None
+                                           else float(routed_scaling_factor)),
                     sc_kernel_threshold=envs.SC_KERNEL_THRESHOLD,
                     sc_kernel_col_chunk_size=envs.SC_KERNEL_COL_CHUNK_SIZE,
                     all_gather_fp8=all_gather_fp8,

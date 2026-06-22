@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+import torchax
 from torchax.interop import jax_view, torch_view
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -77,6 +78,25 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
     assert isinstance(quant_method_instance, FusedMoEMethodBase)
     assert isinstance(weights, FusedMoEWeights)
 
+    # DeepSeek-V3 style routing (e.g. Hy3): the per-expert selection bias and the
+    # routed scaling factor live on the FusedMoE layer. Move the bias parameter
+    # onto the JAX device (jax_view is a no-copy view of the torchax tensor) and
+    # plumb both into the TPU gating recompute. Both default to no-op (None / 1.0)
+    # for models without them (e.g. Qwen3 softmax routing).
+    e_score_correction_bias = getattr(layer, "e_score_correction_bias", None)
+    if e_score_correction_bias is not None:
+        # vLLM's FusedMoE stores e_score_correction_bias as a plain attribute
+        # alias to the parent module's nn.Parameter (no register_parameter), so
+        # it escapes functional_call's reparametrization and arrives here as a
+        # raw, un-moved nn.Parameter rather than a torchax tensor. Move it onto
+        # the JAX device (the torchax env is active in this forward) before
+        # taking a jax view. Guard so an already-torchax tensor is left alone.
+        if not isinstance(e_score_correction_bias,
+                          (torchax.tensor.Tensor, torchax.tensor.View)):
+            e_score_correction_bias = e_score_correction_bias.to(device="jax")
+        e_score_correction_bias = jax_view(e_score_correction_bias)
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor", None)
+
     return torch_view(
         moe_apply(
             layer=layer,
@@ -86,4 +106,6 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
             extra_backend_kwargs=quant_method_instance.extra_backend_kwargs,
+            e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         ))

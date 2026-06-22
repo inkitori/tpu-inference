@@ -121,6 +121,100 @@ def test_gmm_v2_groupbias_unquantized_lhs_matches_affine_reference():
 
 @pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),
                     reason="requires TPU")
+def test_gmm_v2_groupbias_w2_shaped_matches_affine_reference():
+    """w2 (down_proj) layout: contraction K = moe_intermediate, output N =
+    hidden, with many quant blocks (gs=64 -> 24 blocks for K=1536). Proves the
+    per-group ``rhs_groupbias`` affine fold holds for the w2-shaped GMM too
+    (Stage-2 keeps w2 int4), not just the w13-shaped case above. Unquantized-lhs
+    k-loop site: bit-exact affine equality vs a numpy reference.
+
+    K=1536/gs=64 mirrors Hy3's down_proj contraction (moe_intermediate=1536,
+    24 quant blocks); N=2048 is a representative hidden out_dim."""
+    G, M, K, N, gs = 2, 64, 1536, 2048, 64
+    num_blocks = K // gs  # 24
+    rng = np.random.default_rng(3)
+
+    lhs = rng.uniform(-1.0, 1.0, size=(M, K)).astype(np.float32)
+    q = rng.integers(-8, 8, size=(G, K, N)).astype(np.int32)
+    scale = (rng.uniform(-1.0, 1.0, size=(G, num_blocks, 1, N)) *
+             0.05).astype(np.float32)
+    gbias = (rng.uniform(-1.0, 1.0, size=(G, num_blocks, 1, N)) *
+             0.5).astype(np.float32)
+    group_sizes = jnp.array([M // 2, M - M // 2], dtype=jnp.int32)
+
+    ref = _affine_reference(lhs, q, scale, gbias, np.asarray(group_sizes), gs)
+
+    out = gmm_v2(
+        jnp.asarray(lhs, dtype=jnp.float32),
+        jnp.asarray(q, dtype=jnp.int4),
+        group_sizes,
+        rhs_scale=jnp.asarray(scale),
+        rhs_groupbias=jnp.asarray(gbias),
+        maybe_quantize_lhs=False,
+    )
+
+    np.testing.assert_allclose(np.asarray(out, dtype=np.float32),
+                               ref,
+                               atol=1e-1,
+                               rtol=1e-1)
+
+
+@pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),
+                    reason="requires TPU")
+def test_gmm_v2_groupbias_non_lane_multiple_size_k_is_finite_and_correct():
+    """Regression: size_k NOT a multiple of num_lanes (128) must not read the
+    per-group scale/groupbias out of bounds.
+
+    This mirrors the real failure at tensor_parallel_size=8: the MoE w2
+    (down_proj) per-shard contraction is moe_intermediate/tp = 1536/8 = 192,
+    which is NOT a multiple of 128. ``calculate_tiling`` over-aligns the tile to
+    ``tile_k = align_to(192, 128) = 256`` and (for a tiny rhs) the tile-shrink
+    loops never fire, so ``num_quant_blocks_per_tile_k = cdiv(256, 64) = 4``
+    while the per-shard scale/groupbias axis only has ``cdiv(192, 64) = 3`` real
+    quant blocks. The scale/groupbias BlockSpec then DMAs block range [0:4] from
+    a 3-long axis (disable_bounds_checks=True) and the inner loop reads the OOB
+    block 3 -> NaN/garbage scale & groupbias inject sparse NaNs into specific
+    (token, n) accumulator entries.
+
+    Asserts the gmm_v2 output is (a) finite everywhere and (b) close to a
+    dequant-then-grouped-matmul reference. Pre-fix this FAILS (NaN / large diff);
+    post-fix the over-aligned tail block must contribute exactly zero (the k-tail
+    mask already zeros its matmul value and lhs sum)."""
+    # size_k=192 is NOT a multiple of num_lanes(128) -> over-alignment trip.
+    # gs=64 -> 3 real quant blocks; tile_k=256 -> 4 blocks read (1 OOB).
+    G, M, K, N, gs = 2, 16, 192, 256, 64
+    num_blocks = K // gs  # 3
+    rng = np.random.default_rng(7)
+
+    lhs = rng.uniform(-1.0, 1.0, size=(M, K)).astype(np.float32)
+    q = rng.integers(-8, 8, size=(G, K, N)).astype(np.int32)
+    scale = (rng.uniform(-1.0, 1.0, size=(G, num_blocks, 1, N)) *
+             0.05).astype(np.float32)
+    gbias = (rng.uniform(-1.0, 1.0, size=(G, num_blocks, 1, N)) *
+             0.5).astype(np.float32)
+    group_sizes = jnp.array([M // 2, M - M // 2], dtype=jnp.int32)
+
+    ref = _affine_reference(lhs, q, scale, gbias, np.asarray(group_sizes), gs)
+
+    out = gmm_v2(
+        jnp.asarray(lhs, dtype=jnp.float32),
+        jnp.asarray(q, dtype=jnp.int4),
+        group_sizes,
+        rhs_scale=jnp.asarray(scale),
+        rhs_groupbias=jnp.asarray(gbias),
+        maybe_quantize_lhs=False,
+    )
+    out_np = np.asarray(out, dtype=np.float32)
+
+    assert np.isfinite(out_np).all(), (
+        "gmm_v2 produced non-finite values (NaN/Inf) for non-lane-multiple "
+        f"size_k={K}: {np.count_nonzero(~np.isfinite(out_np))} bad entries "
+        "(out-of-bounds per-group scale/groupbias read).")
+    np.testing.assert_allclose(out_np, ref, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),
+                    reason="requires TPU")
 def test_gmm_v2_groupbias_quantized_lhs_delta_matches_analytic_bias():
     """Quantized-lhs k-loop site: with-minus-without equals the analytic bias."""
     G, M, K, N = 2, 128, 512, 256

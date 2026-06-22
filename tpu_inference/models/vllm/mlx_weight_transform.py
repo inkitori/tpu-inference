@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Load-time weight-stream transform bridging MLX checkpoints to vLLM's
-``Qwen3MoeForCausalLM`` parameter layout.
+"""Load-time weight-stream transform bridging MLX checkpoints to vLLM's MoE
+parameter layout (``Qwen3MoeForCausalLM``, ``HYV3ForCausalLM``).
 
-The ``mlx-community/Qwen3-30B-A3B-4bit`` checkpoint differs from what vLLM
-expects in two ways this transform fixes, while leaving everything else
-untouched:
+MLX-stacked checkpoints differ from what vLLM expects in a few ways this
+transform fixes, while leaving everything else untouched:
 
   * ``...mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`` arrive as a
     single STACKED ``[E, out, in*]`` tensor. vLLM's MoE expects PER-EXPERT keys
@@ -28,8 +27,25 @@ untouched:
     plain ``bf16`` ``.weight``. We buffer the triplet and emit one dequantized
     ``bf16`` weight (via ``mlx_dequantize``), dropping scales/biases.
 
-Everything else (attention q/k/v/o, ``mlp.gate``, norms) passes through
-unchanged.
+Hy3-specific (``HYV3ForCausalLM``) fixes:
+
+  * ``...mlp.router.gate.{weight,scales,biases}`` is an 8-bit affine triplet
+    (per-module quant override), but vLLM's ``GateLinear`` is forced unquantized
+    (fp32). We dequant the tiny ``[num_experts, hidden]`` gate to ``bf16`` at
+    load (vLLM later strips ``router.`` -> ``mlp.gate``). Triplet integrity is
+    enforced (incomplete -> raise).
+  * ``...mlp.router.expert_bias`` (plain fp32 ``[num_experts]``) is renamed to
+    ``...mlp.expert_bias`` -- vLLM registers the selection-bias parameter there
+    (and shares it with ``FusedMoE.e_score_correction_bias``) but only remaps
+    ``router.gate``, so without this rename the bias would KeyError at load.
+  * ``...mlp.shared_mlp.{gate,up,down}_proj.{...}`` (the single shared expert,
+    4-bit) keeps its ``shared_mlp.`` infix -- vLLM's ``HYV3MoEFused`` registers
+    the shared expert as ``self.shared_mlp`` (an ``HYV3FeedForward``), so the
+    param path is ``...mlp.shared_mlp.{gate,up,down}_proj.*`` (gate/up then merge
+    into ``gate_up_proj`` via vLLM's stacked-params mapping). Stays 4-bit.
+
+Everything else (attention q/k/v/o, qk_norm, dense-layer mlp, norms) passes
+through unchanged.
 """
 
 import re
@@ -45,6 +61,16 @@ from tpu_inference.utils import t2j
 _SWITCH = re.compile(
     r"^(.*)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$"
 )
+# Shared expert (Hy3): strip the ``shared_mlp.`` infix to the bare ``mlp.`` name
+# vLLM's HYV3FeedForward registers; weight stays 4-bit-packed.
+_SHARED = re.compile(
+    r"^(.*)\.mlp\.shared_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$"
+)
+# Router gate (Hy3): 8-bit affine triplet, dequantized to bf16 at load.
+_ROUTER_GATE = re.compile(r"^(.*\.mlp\.router\.gate)\.(weight|scales|biases)$")
+# The router gate is the only per-module 8-bit override (VllmMLXConfig.from_config
+# validates this fail-fast), so its dequant bit-width is fixed at 8.
+_ROUTER_GATE_BITS = 8
 _DEQUANT_PREFIXES = ("model.embed_tokens", "lm_head")
 
 
@@ -103,6 +129,39 @@ def transform_mlx_weights(weights: Iterable[tuple[str, torch.Tensor]], *,
                        tensor[e].contiguous())
             continue
 
+        sh = _SHARED.match(name)
+        if sh is not None:
+            prefix, proj, suffix = sh.group(1), sh.group(2), sh.group(3)
+            # Shared expert: KEEP the ``shared_mlp.`` infix. vLLM's HYV3MoEFused
+            # registers the shared expert as ``self.shared_mlp`` (an
+            # HYV3FeedForward), so the parameter path is
+            # ``...mlp.shared_mlp.{gate,up,down}_proj.{weight,scales,biases}``.
+            # (The bare ``...mlp.{proj}`` name only exists on the dense layers
+            # < first_k_dense_replace, which never carry a ``shared_mlp`` infix.)
+            # Stays 4-bit-packed; vLLM applies the MLX quant method and merges
+            # gate/up into gate_up_proj via its stacked-params mapping.
+            yield (f"{prefix}.mlp.shared_mlp.{proj}.{suffix}", tensor)
+            continue
+
+        rg = _ROUTER_GATE.match(name)
+        if rg is not None:
+            rg_base, suffix = rg.group(1), rg.group(2)
+            slot = pending.setdefault(rg_base, {})
+            slot[suffix] = tensor
+            if {"weight", "scales", "biases"} <= slot.keys():
+                # 8-bit affine triplet -> bf16 (the gate is unquantized in vLLM).
+                yield (f"{rg_base}.weight",
+                       _dequant_to_bf16(slot["weight"], slot["scales"],
+                                        slot["biases"], group_size,
+                                        _ROUTER_GATE_BITS))
+                del pending[rg_base]
+            continue
+
+        if name.endswith(".mlp.router.expert_bias"):
+            # Rename to the param name vLLM registers (it only remaps router.gate).
+            yield (name[:-len(".router.expert_bias")] + ".expert_bias", tensor)
+            continue
+
         base = next((p for p in _DEQUANT_PREFIXES
                      if name.startswith(p)
                      and name[len(p):] in (".weight", ".scales", ".biases")),
@@ -120,7 +179,14 @@ def transform_mlx_weights(weights: Iterable[tuple[str, torch.Tensor]], *,
         yield (name, tensor)
 
     # Any embed/lm_head that was already plain bf16 (no scales/biases shipped)
-    # never completed a triplet; pass its buffered parts through unchanged.
+    # never completed a triplet; pass its buffered parts through unchanged. A
+    # router gate, however, always ships a full triplet -- an incomplete one is a
+    # corrupt checkpoint, so fail loudly rather than emit a packed uint32 weight
+    # into the unquantized GateLinear.
     for base, slot in pending.items():
+        if _ROUTER_GATE.match(f"{base}.weight"):
+            raise ValueError(
+                f"MLX router gate {base!r} has an incomplete quant triplet "
+                f"(present: {sorted(slot)}); expected weight+scales+biases.")
         for suffix, tensor in slot.items():
             yield (f"{base}.{suffix}", tensor)
