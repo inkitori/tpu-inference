@@ -292,6 +292,35 @@ def _run_case(case: Case, args, modules) -> dict[str, object]:
         static["pages_per_seq"],
         case=rpa_kernel.RpaCase.MIXED,
     )
+    decode_selected = rpa_kernel.get_selected_block_sizes(
+        jnp.bfloat16,
+        jnp.float8_e5m2,
+        case.q_heads,
+        case.kv_heads,
+        case.head_dim,
+        case.page_size,
+        static["max_num_tokens"],
+        static["max_num_seqs"],
+        static["pages_per_seq"],
+        case=rpa_kernel.RpaCase.DECODE,
+        sliding_window=case.sliding_window,
+    )
+    mixed_selected = rpa_kernel.get_selected_block_sizes(
+        jnp.bfloat16,
+        jnp.float8_e5m2,
+        case.q_heads,
+        case.kv_heads,
+        case.head_dim,
+        case.page_size,
+        static["max_num_tokens"],
+        static["max_num_seqs"],
+        static["pages_per_seq"],
+        case=rpa_kernel.RpaCase.MIXED,
+        sliding_window=case.sliding_window,
+    )
+    selected_source = ("tuned_table"
+                       if has_table_entry else
+                       "fallback_default_get_default_block_sizes")
 
     correctness = "not_run"
     max_abs_err = None
@@ -364,9 +393,11 @@ def _run_case(case: Case, args, modules) -> dict[str, object]:
         "lookup_key": repr(lookup_key),
         "tuned_table_has_entry": has_table_entry,
         "tuned_table_block_bkv_pages_bq": repr(tuned_block),
-        "actual_kernel_block_source": "fallback_default_get_default_block_sizes",
-        "actual_decode_block_sizes": repr(decode_default),
-        "actual_mixed_block_sizes": repr(mixed_default),
+        "actual_kernel_block_source": selected_source,
+        "actual_decode_block_sizes": repr(decode_selected),
+        "actual_mixed_block_sizes": repr(mixed_selected),
+        "default_decode_block_sizes": repr(decode_default),
+        "default_mixed_block_sizes": repr(mixed_default),
         "correctness": correctness,
         "correctness_wall_ms": correctness_wall_ms,
         "updated_kv_cache_equal_ref": kv_cache_equal,

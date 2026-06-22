@@ -28,6 +28,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tpu_inference.kernels.ragged_paged_attention.v3 import tuned_block_sizes
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
 
@@ -1542,6 +1543,111 @@ def get_default_block_sizes(
     }
 
 
+def _largest_divisor_at_most(x: int, limit: int) -> int:
+    limit = min(x, limit)
+    for i in range(limit, 0, -1):
+        if x % i == 0:
+            return i
+    raise AssertionError("unreachable")
+
+
+def _get_tuned_block_sizes_or_none(
+    q_dtype,
+    kv_dtype,
+    actual_num_q_heads,
+    actual_num_kv_heads,
+    head_dim,
+    page_size,
+    max_num_tokens,
+    pages_per_seq,
+    sliding_window,
+    default_block_sizes,
+) -> dict[str, int] | None:
+    """Get tuned fetch sizes, preserving default compute sizes when available."""
+    keys = tuned_block_sizes.get_lookup_keys(
+        page_size,
+        q_dtype,
+        kv_dtype,
+        actual_num_q_heads,
+        actual_num_kv_heads,
+        head_dim,
+        page_size * pages_per_seq,
+        sliding_window,
+    )
+    device, tuned_page_size, dtypes, head_dims, extra = keys
+    try:
+        tuned_block_sizes.TUNED_BLOCK_SIZES[device][tuned_page_size][dtypes][
+            head_dims][extra]
+    except KeyError:
+        return None
+
+    bkv_p, bq_sz = tuned_block_sizes.get_tuned_block_sizes(
+        q_dtype,
+        kv_dtype,
+        actual_num_q_heads,
+        actual_num_kv_heads,
+        head_dim,
+        page_size,
+        max_num_tokens,
+        pages_per_seq,
+        sliding_window,
+    )
+    bkv_sz = bkv_p * page_size
+    bq_csz = _largest_divisor_at_most(bq_sz,
+                                      min(default_block_sizes["bq_csz"],
+                                          bq_sz))
+    bkv_csz = page_size * _largest_divisor_at_most(
+        bkv_p, min(default_block_sizes["bkv_csz"], bkv_sz) // page_size)
+    return {
+        "bq_sz": bq_sz,
+        "bkv_sz": bkv_sz,
+        "bq_csz": bq_csz,
+        "bkv_csz": bkv_csz,
+    }
+
+
+def get_selected_block_sizes(
+    q_dtype,
+    kv_dtype,
+    actual_num_q_heads,
+    actual_num_kv_heads,
+    head_dim,
+    page_size,
+    max_num_tokens,
+    max_num_seqs,
+    pages_per_seq,
+    *,
+    case: RpaCase = RpaCase.MIXED,
+    sliding_window=None,
+):
+    default_block_sizes = get_default_block_sizes(
+        q_dtype,
+        kv_dtype,
+        actual_num_q_heads,
+        actual_num_kv_heads,
+        head_dim,
+        page_size,
+        max_num_tokens,
+        max_num_seqs,
+        pages_per_seq,
+        case=case,
+    )
+    tuned_block_sizes_or_none = _get_tuned_block_sizes_or_none(
+        q_dtype,
+        kv_dtype,
+        actual_num_q_heads,
+        actual_num_kv_heads,
+        head_dim,
+        page_size,
+        max_num_tokens,
+        pages_per_seq,
+        sliding_window,
+        default_block_sizes,
+    )
+    return (tuned_block_sizes_or_none
+            if tuned_block_sizes_or_none is not None else default_block_sizes)
+
+
 @jax.jit(
     static_argnames=(
         "use_causal_mask",
@@ -1862,7 +1968,7 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            return get_selected_block_sizes(
                 q.dtype,
                 kv_cache.dtype,
                 actual_num_q_heads,
@@ -1873,6 +1979,7 @@ def ragged_paged_attention(
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
+                sliding_window=sliding_window,
             )
         return {
             "bq_sz": block_sizes[0],

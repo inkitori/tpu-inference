@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import ExitStack
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,6 +22,8 @@ from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
 
+from tpu_inference.kernels.ragged_paged_attention.v3 import kernel as rpa_kernel
+from tpu_inference.kernels.ragged_paged_attention.v3 import tuned_block_sizes
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
@@ -194,6 +199,162 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+
+    def test_default_non_hd64_v6e_fp8_e5m2_uses_tuned_block_sizes(self):
+        page_size = 128
+        pages_per_seq = 16
+        max_num_tokens = 128
+        max_num_seqs = 8
+        num_q_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        tuned_kv_pages_per_block = 3
+        tuned_queries_per_block = 5
+        fallback_block_sizes = {
+            "bq_sz": 11,
+            "bkv_sz": 7 * page_size,
+            "bq_csz": 1,
+            "bkv_csz": page_size,
+        }
+        lookup_key = (
+            "TPU v6e",
+            page_size,
+            "q_bfloat16_kv_float8_e5m2",
+            "q_head-32_kv_head-8_head-128",
+            "max_model_len-2048-sw-None",
+        )
+        tuned_table = {
+            lookup_key[0]: {
+                lookup_key[1]: {
+                    lookup_key[2]: {
+                        lookup_key[3]: {
+                            lookup_key[4]: (tuned_kv_pages_per_block,
+                                            tuned_queries_per_block),
+                        },
+                    },
+                },
+            },
+        }
+        observed_block_sizes = []
+
+        q = jnp.zeros((max_num_tokens, num_q_heads, head_dim), jnp.bfloat16)
+        k = jnp.zeros((max_num_tokens, num_kv_heads, head_dim),
+                      jnp.float8_e5m2)
+        v = jnp.zeros_like(k)
+        kv_cache = jnp.zeros(
+            rpa_kernel.get_kv_cache_shape(
+                max_num_seqs * pages_per_seq,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                jnp.float8_e5m2,
+            ),
+            jnp.float8_e5m2,
+        )
+        kv_lens = jnp.full((max_num_seqs, ), page_size * pages_per_seq,
+                           jnp.int32)
+        page_indices = jnp.arange(max_num_seqs * pages_per_seq,
+                                  dtype=jnp.int32)
+        cu_q_lens = jnp.arange(max_num_seqs + 1, dtype=jnp.int32)
+        distribution = jnp.array([max_num_seqs, max_num_seqs, max_num_seqs],
+                                 dtype=jnp.int32)
+
+        def fake_get_tuned_block_sizes(q_dtype, kv_dtype, actual_num_q_heads,
+                                       actual_num_kv_heads, actual_head_dim,
+                                       actual_page_size,
+                                       actual_max_num_tokens,
+                                       actual_pages_per_seq, sliding_window):
+            self.assertEqual(jnp.dtype(q_dtype), jnp.dtype(jnp.bfloat16))
+            self.assertEqual(jnp.dtype(kv_dtype), jnp.dtype(jnp.float8_e5m2))
+            self.assertEqual(actual_num_q_heads, num_q_heads)
+            self.assertEqual(actual_num_kv_heads, num_kv_heads)
+            self.assertEqual(actual_head_dim, head_dim)
+            self.assertEqual(actual_page_size, page_size)
+            self.assertEqual(actual_max_num_tokens, max_num_tokens)
+            self.assertEqual(actual_pages_per_seq, pages_per_seq)
+            self.assertIsNone(sliding_window)
+            return tuned_kv_pages_per_block, tuned_queries_per_block
+
+        def fake_get_default_block_sizes(*args, **kwargs):
+            del args, kwargs
+            return fallback_block_sizes
+
+        def fake_pallas_call(kernel, **kwargs):
+            del kwargs
+            observed_block_sizes.append({
+                "bq_sz": kernel.keywords["bq_sz"],
+                "bkv_sz": kernel.keywords["bkv_sz"],
+                "bq_csz": kernel.keywords["bq_csz"],
+                "bkv_csz": kernel.keywords["bkv_csz"],
+            })
+
+            def fake_kernel(*kernel_args):
+                return kernel_args[-3], kernel_args[-1]
+
+            return fake_kernel
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(rpa_kernel, "get_tpu_version",
+                                  return_value=6))
+            stack.enter_context(
+                mock.patch.object(rpa_kernel,
+                                  "get_default_block_sizes",
+                                  side_effect=fake_get_default_block_sizes))
+            stack.enter_context(
+                mock.patch.object(tuned_block_sizes,
+                                  "get_lookup_keys",
+                                  return_value=lookup_key))
+            stack.enter_context(
+                mock.patch.object(tuned_block_sizes, "TUNED_BLOCK_SIZES",
+                                  tuned_table))
+            stack.enter_context(
+                mock.patch.object(tuned_block_sizes,
+                                  "get_tuned_block_sizes",
+                                  side_effect=fake_get_tuned_block_sizes))
+            stack.enter_context(
+                mock.patch.object(rpa_kernel.pl,
+                                  "pallas_call",
+                                  side_effect=fake_pallas_call))
+            stack.enter_context(
+                mock.patch.object(rpa_kernel.pltpu,
+                                  "VMEM",
+                                  side_effect=lambda shape, dtype:
+                                  ("VMEM", shape, dtype)))
+            stack.enter_context(
+                mock.patch.object(
+                    rpa_kernel.pltpu,
+                    "PrefetchScalarGridSpec",
+                    side_effect=lambda **kwargs:
+                    ("PrefetchScalarGridSpec", kwargs),
+                ))
+            stack.enter_context(
+                mock.patch.object(
+                    rpa_kernel.pltpu,
+                    "CompilerParams",
+                    side_effect=lambda **kwargs: ("CompilerParams", kwargs),
+                ))
+            wrapped_ragged_paged_attention = getattr(ragged_paged_attention,
+                                                     "__wrapped__",
+                                                     ragged_paged_attention)
+            wrapped_ragged_paged_attention(
+                q,
+                k,
+                v,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale=head_dim**-0.5,
+                vmem_limit_bytes=100 * 1024 * 1024,
+            )
+
+        expected_bkv_sz = tuned_kv_pages_per_block * page_size
+        self.assertNotEmpty(observed_block_sizes)
+        for block_sizes in observed_block_sizes:
+            self.assertEqual(block_sizes["bq_sz"], tuned_queries_per_block)
+            self.assertEqual(block_sizes["bkv_sz"], expected_bkv_sz)
 
     @parameterized.product(
         dtype=[jnp.float32, jnp.bfloat16],
