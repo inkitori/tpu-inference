@@ -519,10 +519,14 @@ against this vLLM checkout, `v0.20.1rc0-36-g75a7cf2c1`, which *already ships* v4
 
 ## 8. Cross-cutting facts for the v4 effort
 
-1. **Weight absorption is mandatory and external to the kernel.** v4 must split
-   `kv_b_proj` → `W_UK`/`W_UV` and run attention in `kv_lora_rank` latent space. The
-   kernel never sees full per-head K/V. (`mla_attention.py:151-203`,
-   `vllm/.../mla_attention.py:840-903`.)
+1. **Weight absorption is mandatory and external to the kernel — in the V3 path.** The
+   existing v2 latent-MLA kernel never sees full per-head K/V: the V3 op splits
+   `kv_b_proj` → `W_UK`/`W_UV` and runs attention in `kv_lora_rank` latent space
+   (`mla_attention.py:151-203`, `vllm/.../mla_attention.py:840-903`). ⚠️ **This does
+   *not* carry over to v4 as-is:** vLLM's shipped v4 has **no** `kv_b_proj`/`W_UK`/`W_UV`
+   (grep-clean) — it uses a fused `fused_wqa_wkv` down-projection plus two-stage
+   output-LoRA (`wo_a`/`wo_b`), so a v4 latent kernel needs its *own* factorization,
+   not this absorption. See doc 09 §3/§5.
 2. **The v2 kernel's input contract is fixed:** `(q_TNA in latent, q_pe rope,
    kv_c_normed latent, k_pe rope)`, output in latent width `kv_lora_rank`. **vLLM's shipped
    v4 already breaks this contract** — `DeepseekV4...Wrapper.forward(self, q, kv, ...)`
