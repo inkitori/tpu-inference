@@ -211,6 +211,33 @@ class GmmConfigs:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
 
     @property
+    def num_quant_blocks(self) -> int:
+        """Number of REAL per-group quant blocks on the scale/groupbias axis."""
+        return pl.cdiv(self.dims.size_k, self.rhs_cfgs.quant_block_size)
+
+    @property
+    def num_quant_blocks_per_tile_k_read(self) -> int:
+        """Quant blocks actually DMA'd/indexed per k tile, clamped to the real
+        block count.
+
+        ``tile_k`` is lane-aligned (a multiple of ``num_lanes``), so when
+        ``size_k`` is NOT a multiple of ``num_lanes`` the tile over-aligns past
+        ``size_k`` and ``num_quant_blocks_per_tile_k`` can exceed the real
+        number of quant blocks (e.g. size_k=192, tile_k=256, qbs=64 ->
+        ``cdiv(256, 64)=4`` vs ``cdiv(192, 64)=3``). Reading 4 from a 3-long
+        scale/groupbias axis is out of bounds. When there is a single k tile
+        (``tile_k >= size_k``) the whole axis fits in one read, so clamp the read
+        count to ``num_quant_blocks``; the over-aligned tail block's matmul value
+        and lhs sum are already zeroed by the k-tail mask, so dropping it changes
+        no result. With multiple k tiles the per-tile stride must stay
+        ``num_quant_blocks_per_tile_k`` (each tile is fully lane- and
+        block-aligned), so no clamp is applied there.
+        """
+        if self.tiles.tile_k >= self.dims.size_k:
+            return min(self.num_quant_blocks_per_tile_k, self.num_quant_blocks)
+        return self.num_quant_blocks_per_tile_k
+
+    @property
     def out_size_n(self) -> int:
         if self.fuse_act is None:
             return self.dims.size_n
@@ -306,14 +333,14 @@ def generate_block_specs(
         )
     if cfgs.rhs_cfgs.has_scale:
         rhs_scale_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (None, cfgs.num_quant_blocks_per_tile_k_read, 1, cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
         )
     if cfgs.rhs_cfgs.has_groupbias:
         # groupbias shares the same [G, num_blocks, 1, N] layout and per-block
         # index map as scale.
         rhs_groupbias_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (None, cfgs.num_quant_blocks_per_tile_k_read, 1, cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
         )
 
@@ -408,6 +435,17 @@ def inner_kernel(
                     k_start = b_id * rhs_qbs
                     k_end = k_start + rhs_qbs
 
+                    # tile_k is lane-aligned and may over-align past size_k, so
+                    # the scale/groupbias buffer holds only
+                    # num_quant_blocks_per_tile_k_read real blocks (<= b_id range
+                    # when size_k is not a multiple of num_lanes). Clamp the
+                    # block index into the buffer so the over-aligned tail reads
+                    # an in-bounds (real) block instead of out of bounds; that
+                    # block's matmul value and lhs sum are already zeroed by the
+                    # k-tail mask, so its scaled/biased contribution is 0.
+                    b_id_read = min(b_id,
+                                    cfgs.num_quant_blocks_per_tile_k_read - 1)
+
                     block_acc = jnp.matmul(
                         tiled_lhs[:, k_start:k_end],
                         tiled_rhs[k_start:k_end, start_n:end_n],
@@ -416,7 +454,7 @@ def inner_kernel(
 
                     if cfgs.rhs_cfgs.has_scale:
                         tiled_rhs_scale = tiled_rhs_ref.get_scale()
-                        block_acc *= tiled_rhs_scale[b_id, :,
+                        block_acc *= tiled_rhs_scale[b_id_read, :,
                                                      start_n:end_n].astype(
                                                          acc_ref.dtype)
 
@@ -429,7 +467,7 @@ def inner_kernel(
                                                 axis=1,
                                                 keepdims=True)
                         block_acc += (
-                            tiled_rhs_gbias[b_id, :, start_n:end_n] *
+                            tiled_rhs_gbias[b_id_read, :, start_n:end_n] *
                             block_lhs_sum).astype(acc_ref.dtype)
 
                     acc_n += block_acc
@@ -496,9 +534,15 @@ def inner_kernel(
 
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
-                    # Apply rhs subchannel scale per quant block.
+                    # Apply rhs subchannel scale per quant block. Clamp the
+                    # block index to the real blocks held in the buffer: tile_k
+                    # may over-align past size_k (when size_k is not a multiple
+                    # of num_lanes), so the scale/groupbias buffer holds only
+                    # num_quant_blocks_per_tile_k_read blocks. The over-aligned
+                    # tail's rhs/lhs are already zeroed by the k-tail mask.
                     if cfgs.rhs_cfgs.has_scale:
-                        b_id = start_k // cfgs.rhs_cfgs.quant_block_size
+                        b_id = min(start_k // cfgs.rhs_cfgs.quant_block_size,
+                                   cfgs.num_quant_blocks_per_tile_k_read - 1)
                         rhs_scale_slice = tiled_rhs_ref.get_scale()
                         block_acc *= rhs_scale_slice[b_id, :,
                                                      start_n:end_n].astype(
@@ -508,7 +552,8 @@ def inner_kernel(
                     # Use the full-precision block_lhs (not block_lhs_q) for the
                     # sum_k lhs[t, k] term; added before fuse_act.
                     if cfgs.rhs_cfgs.has_groupbias:
-                        b_id = start_k // cfgs.rhs_cfgs.quant_block_size
+                        b_id = min(start_k // cfgs.rhs_cfgs.quant_block_size,
+                                   cfgs.num_quant_blocks_per_tile_k_read - 1)
                         rhs_gbias_slice = tiled_rhs_ref.get_groupbias()
                         block_lhs_sum = jnp.sum(block_lhs,
                                                 axis=1,
@@ -1177,7 +1222,7 @@ def make_gmm_configs(
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
 
-    return GmmConfigs(
+    cfgs = GmmConfigs(
         dims=dims,
         tiles=tiles,
         lhs_cfgs=lhs_cfgs,
@@ -1187,6 +1232,20 @@ def make_gmm_configs(
         zero_init=zero_initialize,
         fuse_act=fuse_act,
     )
+
+    if has_scale or has_groupbias:
+        # Invariant: the per-quant-block scale/groupbias DMA/index count must
+        # never exceed the real blocks on the scale/groupbias axis, else the
+        # BlockSpec over-reads adjacent HBM (disable_bounds_checks=True) and
+        # injects NaN. num_quant_blocks_per_tile_k_read enforces this; assert it
+        # so any future tiling change that breaks it fails loudly here.
+        assert cfgs.num_quant_blocks_per_tile_k_read <= cfgs.num_quant_blocks, (
+            "scale/groupbias quant-block over-read: "
+            f"{cfgs.num_quant_blocks_per_tile_k_read} > {cfgs.num_quant_blocks} "
+            f"(tile_k={tiles.tile_k}, size_k={dims.size_k}, "
+            f"quant_block_size={rhs_cfgs.quant_block_size})")
+
+    return cfgs
 
 
 def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:

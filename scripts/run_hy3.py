@@ -81,7 +81,14 @@ def main() -> None:
         print(f"PROMPT: {prompt}")
         print(f"COMPLETION: {completion}")
     print("\n" + "=" * 80)
+    print("HY3_RUN_COMPLETE", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("HY3_RUN_FAILED", flush=True)
+        raise

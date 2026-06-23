@@ -48,7 +48,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.megablox.gmm_v2 import (calculate_tiling, gmm_v2,
+                                                   make_gmm_configs)
 
 
 def _affine_reference(lhs, q, scale, gbias, group_sizes, gs):
@@ -157,6 +158,58 @@ def test_gmm_v2_groupbias_w2_shaped_matches_affine_reference():
                                ref,
                                atol=1e-1,
                                rtol=1e-1)
+
+
+@pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),
+                    reason="requires TPU")
+def test_gmm_v2_non_lane_multiple_size_k_does_not_overread_quant_blocks():
+    """Deterministic OOB-trip guard for non-lane-multiple ``size_k``.
+
+    The runtime symptom (NaN) only fires when the out-of-bounds per-group
+    scale/groupbias read lands on a NaN bit pattern in adjacent HBM, which is
+    not deterministic at the kernel level. The *root cause* IS deterministic:
+    the per-quant-block DMA count ``num_quant_blocks_per_tile_k`` must never
+    exceed the number of real quant blocks on the scale/groupbias axis
+    (``rhs_scale.shape[1]``), otherwise the BlockSpec DMAs (and the inner loop
+    indexes) one block past the end.
+
+    For w2 (down_proj) at tp=8: per-shard ``size_k = 1536/8 = 192`` (NOT a
+    multiple of 128). ``calculate_tiling`` over-aligns ``tile_k`` to 256, so
+    ``num_quant_blocks_per_tile_k = cdiv(256, 64) = 4`` while the scale axis has
+    only ``cdiv(192, 64) = 3`` blocks. Pre-fix this assertion FAILS (4 > 3),
+    proving the over-read; post-fix the DMA/index count is clamped to the real
+    remaining blocks so the invariant holds."""
+    G, M, K, N, gs = 2, 16, 192, 256, 64
+    num_blocks = K // gs  # 3
+    rng = np.random.default_rng(7)
+
+    lhs = jnp.asarray(rng.uniform(-1.0, 1.0, size=(M, K)).astype(np.float32))
+    q = jnp.asarray(rng.integers(-8, 8, size=(G, K, N)).astype(np.int32),
+                    dtype=jnp.int4)
+    scale = jnp.asarray((rng.uniform(-1.0, 1.0, size=(G, num_blocks, 1, N)) *
+                         0.05).astype(np.float32))
+    gbias = jnp.asarray((rng.uniform(-1.0, 1.0, size=(G, num_blocks, 1, N)) *
+                         0.5).astype(np.float32))
+    group_sizes = jnp.array([M // 2, M - M // 2], dtype=jnp.int32)
+    group_offset = jnp.array([0], dtype=jnp.int32)
+
+    cfgs = make_gmm_configs(
+        lhs, q, scale, gbias, None, group_sizes, group_offset,
+        tile_info=calculate_tiling, vmem_limit_bytes=128 * 1024 * 1024,
+        out_dtype=None, acc_dtype=None, maybe_quantize_lhs=False,
+        zero_initialize=True, fuse_act=None)
+
+    real_blocks = scale.shape[1]  # 3
+    # The unclamped tile-block count over-aligns (tile_k=256 -> 4 blocks) and is
+    # still used only for index-map STRIDE math. The count that actually bounds
+    # the BlockSpec DMA and the inner-loop scale/groupbias index is
+    # num_quant_blocks_per_tile_k_read; it MUST not exceed the real blocks.
+    assert cfgs.num_quant_blocks_per_tile_k_read <= real_blocks, (
+        "scale/groupbias over-read: num_quant_blocks_per_tile_k_read="
+        f"{cfgs.num_quant_blocks_per_tile_k_read} > real quant blocks="
+        f"{real_blocks} (tile_k={cfgs.tiles.tile_k}, size_k={cfgs.dims.size_k}, "
+        f"quant_block_size={cfgs.rhs_cfgs.quant_block_size}). The per-quant-"
+        "block DMA/index count must be clamped to the real remaining blocks.")
 
 
 @pytest.mark.skipif(not any(d.platform == "tpu" for d in jax.devices()),

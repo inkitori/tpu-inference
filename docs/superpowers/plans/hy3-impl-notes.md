@@ -71,8 +71,18 @@ switch_mlp->experts ALREADY done by transform. embed/lm_head dequant ALREADY don
 ##   gmm_v2.py: 210-211, 309/316, 407/419/432, 944, 965-967, 1372.
 ## FIX: gmm_v2 keep tile_k lane-aligned(256) but BOUND quant-block DMA/index to real blocks (no over-read);
 ##   tail block -> 0 via k-mask. Escape hatch: w2_keep_int4=False (mlx.py:476-479) -> w2 bf16 (w13 int4 stays).
-## ACTION: kernel-fix agent — failing gmm_v2 test (size_k=192 grouped) RED -> fix -> GREEN + W4A8/e2e regression
-##   (shared kernel). FAST loop (seconds, no model load). Then ONE full tp=8 run = acceptance (coherence).
+## FIX DONE + VERIFIED: gmm_v2.py (+75/-9) new num_quant_blocks_per_tile_k_read clamps scale/groupbias DMA+index
+##   to real blocks when tile_k over-aligns past size_k (single-tile case); no-op for 128-aligned size_k so
+##   tp<=4 + W4A8 are byte-identical. tail block contributes 0 via existing k-mask. +assert in make_gmm_configs.
+##   REGRESSIONS PASS: gmm_v2_groupbias 5, gmm_test wq 10/3skip, W4A8 4, mlx e2e tp=1&2 STILL exact-match.
+##   CAVEAT: unit test can't deterministically repro the NaN (OOB read is HBM-content dependent) -> the invariant
+##   assert is the deterministic guard; the tp=8 model run is the real e2e proof.
+## DONE — ACCEPTANCE PASSED (2026-06-23): tp=8 greedy run yields COHERENT English on all 4 prompts
+##   ("capital of France is **Paris**", correct sky-is-blue physics, etc). Constant-`!` garbage GONE. Clean
+##   exit. The gmm_v2 OOB fix resolved it end-to-end. (One earlier launch failed only on a TPU collision with
+##   a duplicate run from the kernel-fix agent — not a code issue; relaunched single-owner -> success.)
+## REMAINING: commit (branch hy3, identity inkitori) once user approves; full diff = gating + w2-int4 +
+##   transform (shared_mlp/expert_bias/8bit-gate) + interface bias-move + gmm_v2 OOB fix + tests.
 
 Tests: [A DONE 20 pass] CPU routing-parity + compute_moe_routing helper extracted from fused_moe_func.
 [B DONE] w2 int4: oracle CPU 3 pass; gmm_v2 TPU 3 pass; e2e TPU tp=1&2 exact MLX==REF (w2 int4 proven).
