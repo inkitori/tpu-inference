@@ -351,7 +351,8 @@ This `(scale, signed-code, groupbias)` triplet then flows through the **same**
 `process_moe_weights` / `shard_moe_weights` pipeline that the symmetric-int4 W4A8 MoE
 uses (`:520-530`), with the affine `+ groupbias` riding the new groupbias rails (§4.5).
 
-**w2 decision (int4 vs bf16)** — `mlx.py:475-479`:
+**w2 decision (int4 vs bf16)** — `mlx.py:475-479` (`w2_num_blocks` at `:475`, the
+`w2_keep_int4` assignment spans `:476-478`, `self._w2_int4` at `:479`):
 ```python
 w2_num_blocks = int(w2_scales.shape[-1])  # I // gs
 w2_keep_int4 = (self.moe_backend == MoEBackend.GMM_EP        # EP shards on expert axis
@@ -391,14 +392,15 @@ w2_weight = ... (int4 + scale + groupbias)  OR  (bf16, scale=None, groupbias=Non
 
 The affine `+ groupbias` term is a **first-class** addition to `FusedMoEWeights`:
 
-`process_weights/moe_weights.py:40-57`
+`process_weights/moe_weights.py` (`FusedMoEWeights` at `:40`; comment `:49-55`;
+fields `:56-57`)
 ```python
-# w13_groupbias / w2_groupbias: per-quant-block affine bias for MLX-style affine
-# quant (w = scale*q + groupbias). Rides the SAME rails as the per-group SCALE
-# (NOT the per-channel w13_bias/w2_bias MLP-bias rails): it's part of weight
-# reconstruction inside the k-loop, so it applies on EVERY shard, exactly like scale.
-w13_groupbias: ... | None = None
-w2_groupbias:  ... | None = None
+# Per-quant-block affine bias for MLX-style affine quant (w = scale*q + groupbias).
+# Rides the SAME rails as w13_weight_scale/w2_weight_scale (NOT the per-channel
+# w13_bias/w2_bias MLP-bias rails): part of weight reconstruction inside the k-loop,
+# so it applies on EVERY shard, exactly like scale. Same [E, num_blocks, 1, N] layout.
+w13_groupbias: jax.Array | Tensor | None = None      # :56
+w2_groupbias:  jax.Array | Tensor | None = None      # :57
 ```
 
 The crucial design call: **groupbias rides the SCALE rails, not the bias rails.**
@@ -406,7 +408,9 @@ Concretely, in `process_moe_weights` it gets the *same* `swapaxes(1,2)` +
 `expand_dims(2)` as the scale → lands in `[E, num_blocks, 1, N]`
 (`moe_weights.py:291-298`), the *same* w13 reorder (`concat_dim=3`, not 2, because it's
 4-D like the scale — `:405-409, :432-436`), and the *same* sharding spec
-(`shard_moe_weights`, `:500-510` for GMM_TP; `:478-483` for GMM_EP/FUSED_MOE).
+(`shard_moe_weights`: for GMM_TP, `w13_groupbias` shares the w13 grouped sharding
+`:500-510` and `w2_groupbias` its own block-dim spec at `:522`; for GMM_EP/FUSED_MOE
+both ride `ep_sharding` at `:478,:482`).
 
 The w2 grouped tensors (scale **and** groupbias) use a block-dim-aware spec computed
 from their *own* block dim — replicate when single-block, else shard on the block dim
@@ -416,30 +420,54 @@ w2-int4 divisibility decision.
 > **Guard:** `FUSED_MOE` backend does **not** support affine groupbias (it reshapes
 > the scale to 5-D but has no groupbias reshape), so a non-None groupbias **asserts**
 > there (`moe_weights.py:314-317`). MLX affine MoE therefore requires **GMM_TP or
-> GMM_EP**. Backend selection: `interface/moe.py:29-58`
-> (`USE_MOE_EP_KERNEL` → FUSED_MOE; `moe.use_ep` → GMM_EP; else GMM_TP).
+> GMM_EP**. Backend selection: `select_moe_backend_from_fused_moe_config`
+> (`interface/moe.py:29-58`) — `USE_MOE_EP_KERNEL` **and** `moe.use_ep` → FUSED_MOE
+> (`:44-47`); else `moe.use_ep` → GMM_EP (`:52-54`); else GMM_TP (`:56-58`). (If
+> `USE_MOE_EP_KERNEL` is set but `use_ep` is false, it warns and falls through to
+> GMM_TP.)
 
 ### 4.6 In-kernel dequant (`gmm_v2`)
 
 The packed-int4 weight, per-group scale, and groupbias flow:
-`moe_apply` (`moe.py:127-158`, passes `w1_groupbias=weights.w13_groupbias`,
-`w2_groupbias=weights.w2_groupbias`) → `fused_moe_func` → `gmm_wrapper`
+`moe_apply` (`layers/common/moe.py:73`; in the `GMM_EP | GMM_TP` branch at `:127` it
+passes `w1_groupbias=weights.w13_groupbias`, `w2_groupbias=weights.w2_groupbias` into
+`fused_moe_func`, `common/moe.py:143-144`) → `fused_moe_func` → `gmm_wrapper`
 (`fused_moe_gmm.py:129-172`) → `gmm_v2(rhs_scale=..., rhs_groupbias=...)`.
+(The FUSED_MOE branch's `fused_ep_moe` call passes **no** groupbias — consistent with
+the §4.5 assert.)
 
 `gmm_v2` (`kernels/megablox/gmm_v2.py`) reconstructs the weight **inside the k-loop**:
-matmul the (full-precision) LHS against the int4 RHS codes, scale by the per-group
-`rhs_scale`, then add the affine term `groupbias · sum(lhs over the block)`:
+matmul the LHS against the int4 RHS codes, scale by the per-group `rhs_scale`, then add
+the affine term `groupbias · sum(lhs over the block)`. There are **two** paths inside
+`_matmul`, split at `gmm_v2.py:424` on `lhs_cfgs.quant_dtype is None`; MLX's affine path
+is the **full-precision-LHS** one (`:424-474`):
 
-`gmm_v2.py` (unquantized-LHS / affine path, ~`:449-471`)
+`gmm_v2.py:449-471` (full-precision-LHS / affine path; verified verbatim)
 ```python
-block_acc  = matmul(lhs[:, k0:k1], int4_rhs[k0:k1, ...], preferred=f32)
-block_acc *= rhs_scale[b_id, :, n0:n1]                      # per-group scale
-block_acc += rhs_groupbias[b_id, :, n0:n1] * sum(lhs[:, k0:k1])   # affine + bias
+block_acc  = jnp.matmul(tiled_lhs[:, k0:k1], tiled_rhs[k0:k1, n0:n1],
+                        preferred_element_type=jnp.float32)         # :449-453
+if has_scale:                                                       # :455
+    block_acc *= tiled_rhs_scale[b_id_read, :, n0:n1]              # :457-459  per-group scale
+if has_groupbias:                                                  # :464
+    block_lhs_sum = jnp.sum(tiled_lhs[:, k0:k1], axis=1, keepdims=True)
+    block_acc += tiled_rhs_gbias[b_id_read, :, n0:n1] * block_lhs_sum  # :469-471  affine bias
 ```
-So it is **dequant-to-bf16/fp32 reconstruct-in-kernel then matmul**, *not* a fully
-fused int×int matmul — the int4 weight lives in HBM (8× smaller), is read into the
-kernel, and reconstructed block-by-block on chip. (`b_id` is the per-quant-block
-index; `groupbias·Σlhs` is the algebraic expansion of `Σ (scale·q + groupbias)·x`.)
+So it is **dequant/reconstruct-in-kernel then matmul**, *not* a fully fused int×int
+matmul — the int4 weight lives in HBM (8× smaller), is read into the kernel, and
+reconstructed block-by-block on chip. `groupbias·Σlhs` is the algebraic expansion of
+`Σ (scale·q + groupbias)·x`. The block index is `b_id` (loop var, `:434`) but the
+scale/groupbias buffers are indexed by a **clamped** `b_id_read = min(b_id,
+num_quant_blocks_per_tile_k_read-1)` (`:446-447`) — the clamp keeps an over-aligned
+k-tail's read in-bounds; that tail's matmul and `Σlhs` are already zeroed by the k-mask,
+so its contribution is 0. The scale/groupbias refs are 4-D `[num_blocks, 1, N]`, hence
+the `[b_id_read, :, n0:n1]` slice.
+
+> **Second path (not MLX's).** The `else` branch (`:475-566`) is the *quantized-LHS*
+> fast path (dynamic per-block LHS int8/fp8 quant). It also applies `rhs_scale`
+> (`:543-549`) and the same groupbias affine term (`:554-563`), and notably computes
+> `Σlhs` from the **full-precision** `block_lhs`, not the quantized one (`:558`). MLX
+> never takes this branch — the wrapper forces full-precision LHS whenever groupbias is
+> present (§4.6 note below).
 
 > **Why LHS stays full-precision on the affine path** (`fused_moe_gmm.py:138-156`):
 > `gmm_v2`'s quantized-LHS fast path strides the k-loop by the *512-wide* LHS quant
@@ -502,12 +530,12 @@ load-time and in-kernel dequant must agree. Most illuminating tests:
 - **w2 path is data-dependent.** Whether w2 is int4 or bf16 depends on
   `I/gs % MLP-TP-degree` and the backend — don't assume w2 is always one or the other
   when reasoning about HBM or numerics.
-- **Couldn't fully read** the exact gmm_v2 line numbers in this doc (the kernel is
-  large and the `:449-471` range is from a sub-agent trace, not a direct quote here);
-  the *behavior* (scale then `groupbias·Σlhs` in the k-loop, signed int4 RHS, LHS kept
-  full-precision on affine) is verified via `fused_moe_gmm.py:138-156` and the e2e
-  exact-match test. If you touch the kernel, re-read `gmm_v2.py` around the
-  `has_groupbias` blocks directly.
+- **gmm_v2 anchors are now verified directly** (§4.6): the affine reconstruct lives in
+  the full-precision-LHS path at `gmm_v2.py:449-471` (scale `:457-459`, groupbias
+  `:466-471`), with the parallel quantized-LHS path at `:543-563`. The behavior (scale
+  then `groupbias·Σlhs` in the k-loop, clamped `b_id_read`, LHS kept full-precision on
+  the affine path via `fused_moe_gmm.py:138-156`) is confirmed against the kernel and
+  the e2e exact-match test. If you touch the kernel, re-read both `has_groupbias` blocks.
 - **`HYV3ForCausalLM` model class** lives in vLLM (the transform's `shared_mlp`/router
   handling targets `HYV3MoEFused`/`HYV3FeedForward`); this doc covers the tpu-inference
   side only. The Hy3 chat template defaults to *no-think*; `reasoning_effort` toggles

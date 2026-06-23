@@ -159,17 +159,27 @@ vLLM's loader: `vllm/plugins/__init__.py:69-82` (`load_general_plugins()`), whic
 **idempotent** (guarded by `plugins_loaded`, line 75) and is invoked from several places so it
 fires no matter the entry path:
 
-- `vllm/v1/engine/core.py:103-105` — **`EngineCore.__init__`**, the very first lines, *before*
-  the executor/worker/model are created.
+- `vllm/v1/engine/core.py:103-105` — **`EngineCore.__init__`**: the import is at 103, the
+  call at **105** — the very first executable statements, *before* the executor is
+  constructed (`self.model_executor = executor_class(vllm_config)` at `core.py:118`).
 - `vllm/v1/worker/worker_base.py:237-239` — inside each worker process during
-  `init_worker`, so subprocesses re-trigger the patch.
-- `vllm/engine/arg_utils.py:718-720` and `:2455` — at arg-parsing time in the frontend.
-- `vllm/model_executor/models/registry.py:1355-1357` — before model-registry resolution.
+  `WorkerWrapperBase.init_worker` (import 237, call **239**), a method that every executor
+  (`uniproc`/`multiproc`/`ray`) runs **before** `init_device` and `load_model`, so
+  subprocesses re-trigger the patch ahead of model load.
+- `vllm/engine/arg_utils.py:718-720` (`EngineArgs.__post_init__`) and `:2455`
+  (`AsyncEngineArgs.add_cli_args`, via the module-level import at `arg_utils.py:99`) — at
+  arg-parsing time in the frontend.
+- `vllm/model_executor/models/registry.py:1355-1357` — but this is *not* a main-process
+  registry-resolution hook: it lives in `_run()`, the `__main__` of a **throwaway subprocess**
+  spawned by `_run_in_subprocess` (`registry.py:1323`) to inspect model classes in isolation,
+  so plugins are loaded only inside that subprocess.
 
-**Ordering guarantee:** because `EngineCore.__init__` calls it at line 103 — and
-`worker_base.py` re-calls it in every worker before model load — the layer monkeypatches are
-**always installed before `get_model()` runs**. So when the torchax route instantiates vLLM's
-PyTorch model classes, they are already the TPU-patched versions.
+**Ordering guarantee (verified):** `EngineCore.__init__` calls it at `core.py:105` *before*
+constructing the executor (`core.py:118`), and `worker_base.py:239` re-calls it in every
+worker via `init_worker`, which all three executors run *before* `init_device`/`load_model`.
+So the layer monkeypatches are **always installed before `get_model()` runs** — when the
+torchax route instantiates vLLM's PyTorch model classes, they are already the TPU-patched
+versions.
 
 ---
 

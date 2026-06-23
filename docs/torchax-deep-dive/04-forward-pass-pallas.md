@@ -18,10 +18,10 @@ the torchax-wrapped vLLM model), extracts logits, and then samples. The only TPU
 compute is: (a) `model_fn`, (b) `compute_logits_fn`, (c) `sample`. Everything else is
 NumPy on the host shuffling indices into pre-allocated CPU staging buffers.
 
-The attention kernel is reached *inside* `model_fn`: vLLM's `Attention.forward` is
-monkey-patched (see `SHARED_CONTEXT` / `register_layers`) to
-`PallasAttentionBackendImpl.forward`, which converts torch→JAX and calls the
-**ragged paged attention v3 Pallas kernel**.
+The attention kernel is reached *inside* `model_fn`: vLLM's `Attention.forward`
+delegates to its `.impl` backend, which on TPU is `PallasAttentionBackendImpl.forward`
+(selected via the platform's `get_attn_backend_cls`, **not** a `register_oot` patch). That
+backend converts torch→JAX and calls the **ragged paged attention v3 Pallas kernel**.
 
 ```
 ┌─────────────────────── HOST (NumPy, vLLM scheduler) ───────────────────────┐
@@ -41,7 +41,7 @@ monkey-patched (see `SHARED_CONTEXT` / `register_layers`) to
 │   self.model_fn(state, kv_caches, input_ids, attn_metadata, …)             │
 │     = jit_step_func()  (torchax-wrapped vLLM nn.Module, jitted)            │
 │        └─ … decoder layers …                                               │
-│             └─ vLLM Attention.forward  ── monkeypatched ──►                │
+│             └─ vLLM Attention.forward  ──.impl backend──►                  │
 │                  PallasAttentionBackendImpl.forward                        │
 │                    └─ _jax_attn_func (jax.jit)                             │
 │                         └─ attention()  (attention_interface.py)          │
@@ -279,10 +279,13 @@ of which requests are in it.
 
 ### 3.1 The patched attention layer
 
-vLLM's `Attention.forward` is replaced (via `register_layers`) by
-`PallasAttentionBackendImpl.forward` in
+vLLM's `Attention` class is **not** `register_oot`-patched (unlike the linear /
+embedding layers). Instead `Attention.forward` delegates to its `.impl` backend, and on
+TPU that backend is `PallasAttentionBackendImpl.forward` in
 `tpu_inference/layers/vllm/backends/flash_attn.py:152`. The backend class
-`PallasAttentionBackend` is registered for `AttentionBackendEnum.FLASH_ATTN` (`:32`).
+`PallasAttentionBackend` is registered for `AttentionBackendEnum.FLASH_ATTN` (`:32`) and is
+selected by the platform's `get_attn_backend_cls` (`platforms/tpu_platform.py:115`) for the
+dense (`use_mla=False`) path.
 
 `forward` (`:152-218`) is the torch↔JAX boundary:
 

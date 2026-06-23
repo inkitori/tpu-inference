@@ -8,6 +8,14 @@
 > Audience: a strong engineer new to this codebase, working toward adding **DeepSeek
 > v4** via torchax. All anchors are `path:line`. vLLM paths live under
 > `/home/enyouki/vllm/vllm/`; everything else under `/home/enyouki/tpu-inference/`.
+>
+> ⚠️ **v4 reality check (read §8 first):** this vLLM checkout *already ships*
+> `DeepseekV4ForCausalLM` (`vllm/model_executor/models/deepseek_v4.py`,
+> registered `vllm/.../models/registry.py:99`), and its MLA **does not** match the
+> `(q_nope, q_pe, kv_c_normed, k_pe)` contract everything below assumes. v4 is a
+> different attention algorithm (fused QKV-a, output-LoRA, FlashMLA-*sparse* + SWA,
+> hyper-connections, MegaMoE) and is CUDA/SM100-only. The "v4 for free via torchax"
+> story is **false** — see §8.
 
 ---
 
@@ -130,9 +138,15 @@ return selected_backend.get_path()
 
 ```python
 if vllm_config.model_config and vllm_config.model_config.use_mla:
-    if not envs.NEW_MODEL_DESIGN or not <enable_dp_attention>:
-        raise ValueError("MLA models require both NEW_MODEL_DESIGN=1 ... and DP attention ...")
+    if not envs.NEW_MODEL_DESIGN or not vllm_config.additional_config.get(
+            "sharding", {}).get("sharding_strategy", {}).get(
+                "enable_dp_attention", False):
+        raise ValueError("MLA models require both the NEW_MODEL_DESIGN=1 ... and DP attention ...")
 ```
+
+Here `envs` is **`tpu_inference.envs`** (not vLLM's), and "DP-attention enabled" means
+`additional_config.sharding.sharding_strategy.enable_dp_attention == True`
+(passed via `--additional_config '{"sharding": {"sharding_strategy": {"enable_dp_attention": true}}}'`).
 
 **Default block size** for MLA also comes from this backend:
 `cache_config.block_size = PallasMLAttentionBackend.get_page_size(vllm_config)`
@@ -145,8 +159,8 @@ each MLA cache slot is one small latent row.
 `PallasMLAttentionBackend.get_impl_cls()` → `PallasMLAttentionBackendImpl`
 (`flash_attn_mla.py:40-42, 49`), an `MLAAttentionImpl` subclass. Its `__init__`
 captures the MLA dims (`q_lora_rank, kv_lora_rank, qk_nope_head_dim,
-qk_rope_head_dim, qk_head_dim, v_head_dim`, `flash_attn_mla.py:64-82`). The base
-class's `forward_mha`/`forward_mqa` are **stubbed out** (`flash_attn_mla.py:84-109`)
+qk_rope_head_dim, qk_head_dim, v_head_dim`, `flash_attn_mla.py:77-82`). The base
+class's `forward_mha`/`forward_mqa` are **stubbed to `pass`/no-op** (not raising; `flash_attn_mla.py:84-109`)
 — this impl uses a single bespoke `forward` (§3) instead of vLLM's split
 prefill/decode MLA interface.
 
@@ -243,16 +257,29 @@ Both files define `mla_ragged_paged_attention` and a `get_kv_cache_shape` helper
 ### Shared model
 The combined latent cache is
 `cache_kv: [total_num_pages, align(page_size,kv_packing)//kv_packing, kv_packing,
-align(kv_lora_rank,128) + align(qk_rope_head_dim,128)]`. The last axis concatenates
-`kv_c` (latent, width `lkv_dim=kv_lora_rank`) and `k_pe` (rope key, width
-`r_dim=qk_rope_head_dim`). Query is `ql_nope[T,N,lkv_dim]` + `q_pe[T,N,r_dim]`.
+align(lkv_dim,128) + align(r_dim,128)]` where `lkv_dim=kv_lora_rank`, `r_dim=qk_rope_head_dim`.
+The last axis concatenates `kv_c` (latent) and `k_pe` (rope key); the kernel's
+*write/validate* side (`update_kv_cache`, `v1/kernel.py:59-71`) aligns **each component
+to 128 separately** then concatenates. Query is `ql_nope[T,N,lkv_dim]` + `q_pe[T,N,r_dim]`.
 Attention is **MQA over the latent**: one shared latent K/V row read by all query
 heads. There is no separate V — `v_i = kv_c` (the value *is* the latent; v1
 `kernel.py:217`), so the kernel output width is `lkv_dim` and the up-projection to
 `v_head_dim` is external (the `W_UV` absorption in §3).
 
-`get_kv_cache_shape(total_num_pages, page_size, kv_dim, kv_dtype)` is identical in
-both: v1 `kernels/mla/v1/kernel.py:32-44`, v2 `kernels/mla/v2/kernel.py:59-71`.
+`get_kv_cache_shape(total_num_pages, page_size, kv_dim, kv_dtype)` is byte-identical in
+both (verified): v1 `kernels/mla/v1/kernel.py:32-44`, v2 `kernels/mla/v2/kernel.py:59-71`.
+
+> ⚠️ **Alignment subtlety (latent bug surface for v4).** `get_kv_cache_shape` aligns the
+> **raw sum once** — its last dim is `align_to(kv_dim, 128)`, where the caller passes the
+> *unaligned* `head_size = kv_lora_rank + qk_rope_head_dim` (= 576 for v3;
+> `kv_cache_manager.py:714-715`). But the kernel's *write* side aligns **per-component**:
+> `r_dim=align(64,128)=128`, `lkv_dim=align(512,128)=512`, `kv_dim=640`, and then
+> hard-asserts `kv_dim == cache_kv_dim` (`v1/kernel.py:71`). For v3 these reconcile **only
+> by coincidence** — `align(512+64,128)=640 == align(512,128)+align(64,128)=640`. A v4
+> `(kv_lora_rank, qk_rope_head_dim)` that breaks this equality (e.g. either component not
+> already 128-aligned in a way that survives the sum) would allocate a mis-sized cache and
+> trip the `assert` at runtime. The spec-level `mla_head_size` (`kv_cache_manager.py:362-368`)
+> *does* align per-component (=640), so it agrees with the alloc only by the same coincidence.
 
 ### v1 — `kernels/mla/v1/kernel.py`
 - **Entry** `mla_ragged_paged_attention` (`v1/kernel.py:1092-1124`). Inputs:
@@ -291,12 +318,17 @@ Weight absorption is **external in both** — unchanged.
 ### Which version is used, and when
 - **v2 is the production compute path.** Imported only at
   `layers/common/attention_interface.py:33` and called at `:527`. Both routes reach it.
-- **v1 is used only for the cache shape (not its compute).** Imported at
-  `runner/kv_cache.py:23` and used solely for `mla.get_kv_cache_shape`
-  (`kv_cache.py:68`) and `update_kv_cache`. v1's *attention* kernel is exercised only by
-  tests (`tests/kernels/mla_v1_test.py`, `tests/models/jax/test_deepseek_v3.py:30`).
-  **Caveat:** production *allocates* with v1's `get_kv_cache_shape` but *computes* with
-  v2 — the two shape functions must stay byte-compatible (they are currently identical).
+- **v1 is used only for the cache shape (not its compute, and not its `update_kv_cache`).**
+  Imported `as mla` at `runner/kv_cache.py:23`, used **solely** for `mla.get_kv_cache_shape`
+  (`kv_cache.py:68`). v1's `update_kv_cache` is *not* called in production (v2 fuses the
+  update); v1's *attention* kernel is exercised only by tests
+  (`tests/kernels/mla_v1_test.py`, `tests/models/jax/test_deepseek_v3.py:30`).
+  **Caveat (real coupling):** production *allocates* with v1's `get_kv_cache_shape` but
+  *computes* with v2. The two `get_kv_cache_shape` bodies are byte-identical **today**, but
+  it is unguarded: each module defines its *own* `align_to`/`get_dtype_packing` (v1 imports
+  from `ragged_paged_attention.v3.util`, `v1/kernel.py:24-25`; v2 defines them locally,
+  `v2/kernel.py:41-56`). There is no shared source of truth and no cross-module assertion —
+  a divergent edit to v2's copy would silently desync alloc-shape from compute-shape.
 
 ### Contrast with dense `ragged_paged_attention`
 Dense kernel: `kernels/ragged_paged_attention/` (production = **v3**;
@@ -344,9 +376,12 @@ else:
                               head_size=head_size, use_mla=self.use_mla)[0]
   ```
 
-  The kernel writes latent to `[..., :lkv_dim]` and rope to `[..., lkv_dim:]`
-  (`kernels/mla/v1/kernel.py:91-94`). Contrast the dense path: one tensor with a
-  `num_kv_heads·2` head axis (packed K+V).
+  This `head_size` is the **raw, unaligned** sum (512+64=576); `get_kv_cache_shape` then
+  pads the *last dim* to `align_to(576,128)=640`. The kernel writes latent to
+  `[..., :lkv_dim]` and rope to `[..., lkv_dim:]` (`kernels/mla/v1/kernel.py:91-94`), where
+  `lkv_dim`/`r_dim` are each 128-aligned at write time — these only line up with the
+  alloc-time 640 by coincidence for v3's dims (see §4 alignment subtlety). Contrast the
+  dense path: one tensor with a `num_kv_heads·2` head axis (packed K+V).
 
 - **Sharding differs.** MLA cache shards on `MLP_TENSOR`
   (`kv_cache.py:123-130`; `num_blocks` floored to the `MLP_TENSOR` mesh product without
@@ -386,7 +421,7 @@ MLA latent KV, per layer (num_kv_heads → 1):
   `class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM): pass` (`deepseek_v2.py:1672-1673`).
   Real parent `DeepseekV2ForCausalLM` at `:1322-1665` (composes `DeepseekV2Model`,
   `lm_head`, logits processor).
-- **MLA attention module** = `DeepseekV2MLAAttention` (`deepseek_v2.py:843-1028`),
+- **MLA attention module** = `DeepseekV2MLAAttention` (`deepseek_v2.py:843-1030`),
   selected in the decoder layer when `model_config.use_mla` (`:1069-1070`). It does
   **not** call the generic `Attention` layer — it builds an `MLAModules` dataclass
   (`:987-1005`) and wraps it in `MultiHeadLatentAttentionWrapper` (`:1007-1020`). On
@@ -456,12 +491,29 @@ the flax_nnx route.
 **Both routes converge on the same v2 Pallas kernel and the same absorption strategy.**
 The difference is the *model graph* layer: JAX has a hand-written, tested, default-served
 DeepSeek-V3; the torchax route leans on vLLM's upstream model class and a thin
-TPU attention op. For **DeepSeek v4**:
-- The torchax route gives you v4 "for free" the moment vLLM ships a v4 model class —
-  *if* its MLA still fits the `(q_nope, q_pe), kv_c_normed, k_pe` contract that
-  `mla_attention.py` + the v2 kernel assume.
-- The JAX route requires hand-porting the v4 graph but is the more battle-tested path
-  here and is what's served by default.
+TPU attention op.
+
+For **DeepSeek v4** — ⚠️ **the "v4 for free via torchax" story does not hold** (verified
+against this vLLM checkout, `v0.20.1rc0-36-g75a7cf2c1`, which *already ships* v4):
+- vLLM already has `DeepseekV4ForCausalLM` (`vllm/.../models/deepseek_v4.py`, registered
+  `registry.py:99`) with its **own** attention stack — `DeepseekV4MLAModules` +
+  `DeepseekV4MultiHeadLatentAttentionWrapper` (`vllm/.../layers/deepseek_v4_attention.py:87, 107`).
+  It does **not** build the `MLAModules`/`MultiHeadLatentAttentionWrapper` that
+  `mla_attention.py`'s `register_oot` hooks, so the TPU shim would not even attach.
+- v4's inner attention `forward(self, q, kv, positions, output)`
+  (`deepseek_v4_attention.py:717`) takes a **fused `q` + single `kv`** — *not* the
+  `(q_nope, q_pe), kv_c_normed, k_pe` four-tensor contract the v2 kernel assumes. It uses a
+  different factorization (`fused_wqa_wkv`, per-head q-norm, output-LoRA `wo_a`/`wo_b`),
+  **FlashMLA-sparse + SWA** kernels with an fp8 KV cache, hyper-connections, and MegaMoE — and
+  is hard-CUDA/SM100-only (`deepseek_v4.py:519-527`, `deepseek_v4_attention.py:204`).
+- **Therefore the torchax route does NOT give v4 for free.** Bringing up v4 means porting a
+  new sparse/SWA attention algorithm (new kernel work), not reusing the existing MLA op.
+- If the *actual* near-term target is **v3.2** (not v4), that one **does** still fit the
+  existing contract — vLLM handles it inside `deepseek_v2.py` via `is_v32`
+  (`registry.py:98` maps `DeepseekV32ForCausalLM` → the `deepseek_v2` `DeepseekV3ForCausalLM`),
+  with the indexer only *selecting which cached tokens to attend* (still dense on TPU; §8.3).
+- The JAX route requires hand-porting the target graph but is the more battle-tested path
+  here and is what's served by default for v3.
 
 ---
 
@@ -472,21 +524,29 @@ TPU attention op. For **DeepSeek v4**:
    kernel never sees full per-head K/V. (`mla_attention.py:151-203`,
    `vllm/.../mla_attention.py:840-903`.)
 2. **The v2 kernel's input contract is fixed:** `(q_TNA in latent, q_pe rope,
-   kv_c_normed latent, k_pe rope)`, output in latent width `kv_lora_rank`. Any v4 MLA
-   variant that changes this (e.g. a different latent factorization or the V3.2 sparse
-   indexer changing what's cached) needs kernel work, not just a model class.
-3. **DeepSeek-V3.2 sparse MLA already has hooks** (`is_v32`, `Indexer`,
-   `topk_indices_buffer` in `mla_attention.py:194-197, 263-265`;
+   kv_c_normed latent, k_pe rope)`, output in latent width `kv_lora_rank`. **vLLM's shipped
+   v4 already breaks this contract** — `DeepseekV4...Wrapper.forward(self, q, kv, ...)`
+   (`deepseek_v4_attention.py:717`) passes a fused `q` + single `kv`, plus a different
+   latent factorization and FlashMLA-*sparse* attention. So v4 needs **new kernel + new
+   custom-op work**, not just a model class. (v3.2's indexer also changes *which* tokens
+   are attended, but keeps the four-tensor contract — see #3.)
+3. **DeepSeek-V3.2 sparse MLA already has hooks** (`is_v32 = hasattr(config,"index_topk")`,
+   `Indexer`, `topk_indices_buffer` in `mla_attention.py:194-197, 263-265`;
    `deepseek_v2.py:964, 597-715`) but the TPU kernel path does **not** implement sparse
-   selection — the v2 Pallas kernel is dense-latent. If v4 is sparse-MLA-derived, this
-   is the gap.
+   selection — the v2 Pallas kernel is **dense-latent** (zero topk/indexer/sparse logic;
+   grep-clean). On TPU the indexer is even *invoked* (`mla_attention.py:264`,
+   `_topk_indices = self.indexer(...)`) but its result is **discarded** (leading-underscore
+   throwaway, never passed to `self.mla_attn`). A genuinely sparse v3.2/v4 needs the kernel
+   to consume topk indices — that gap is unimplemented.
 4. **MLA on TPU hard-requires `NEW_MODEL_DESIGN=1` + DP-attention**, else
    `check_and_update_config` raises (`tpu_platform.py:200-207`). Any v4 bring-up must
    set both.
 5. **`VLLM_MLA_DISABLE=1`** is the escape hatch to the dense per-head path
    (`vllm/config/model.py:1595`) — useful as a numerical baseline when debugging v4 MLA.
-6. **MLA shards on `MLP_TENSOR`** (cache, q/k), not `ATTN_HEAD`/`ATTN_DATA`
-   (`attention_interface.py:502-519`, `kv_cache.py:123`). v4 sharding inherits this.
+6. **MLA shards on `MLP_TENSOR`** (kernel cache + q/k I/O), not `ATTN_HEAD`/`ATTN_DATA`
+   (`attention_interface.py:502-519`, `kv_cache.py:123`); the *absorbed weights*
+   `W_UK_T`/`W_UV` shard on `ATTN_HEAD` (`mla_attention.py:84-97`). A TPU v3.x reuse
+   inherits this; v4 would need its own scheme (different cache, fp8, SWA).
 7. **Block sizes are hardcoded, no autotuner** (`attention_interface.py:522-525`) —
    a known perf TODO, and v4 with different head counts may want re-tuning.
 
@@ -500,7 +560,8 @@ TPU attention op. For **DeepSeek v4**:
 - Shared interface: `tpu_inference/layers/common/attention_interface.py:463-553` (`mla_attention`), `:33` (v2 import), `:523-525` (block sizes).
 - Kernels: `tpu_inference/kernels/mla/v2/kernel.py:1398` (entry, production), `:1716/1737/1759` (3 regimes); `tpu_inference/kernels/mla/v1/kernel.py:1092` (entry, tests-only), `:32-44` (`get_kv_cache_shape`, used in prod), `:91-94` (cache write).
 - KV cache: `tpu_inference/runner/kv_cache.py:65-83` (`use_mla` fork), `:123-130` (sharding); `tpu_inference/runner/kv_cache_manager.py:710-728` (alloc), `:80/87-93` (`MLAAttentionSpec`, num_kv_heads=1).
-- vLLM model: `vllm/model_executor/models/deepseek_v2.py:1672-1673` (`DeepseekV3ForCausalLM`), `:843-1028` (`DeepseekV2MLAAttention`), `:872-878` (dims), `:893-932` (projections), `:964` (`is_v32`), `:274-279` (`noaux_tc` gate bias).
+- vLLM model: `vllm/model_executor/models/deepseek_v2.py:1672-1673` (`DeepseekV3ForCausalLM`), `:843-1030` (`DeepseekV2MLAAttention`), `:872-878` (dims), `:893-932` (projections), `:964` (`is_v32`), `:274-279` (`noaux_tc` gate bias).
 - vLLM MLA layer: `vllm/model_executor/layers/mla.py:113-177` (forward), `vllm/.../attention/mla_attention.py:816-903` (`W_UK`/`W_UV` split).
 - vLLM gate: `vllm/config/model.py:1595` (`use_mla`), `:54` (`get_head_size`).
+- vLLM **v4** (already shipped, breaks contract): `vllm/model_executor/models/deepseek_v4.py` (`DeepseekV4ForCausalLM`), `vllm/model_executor/layers/deepseek_v4_attention.py:87` (`DeepseekV4MLAModules`), `:107` (`DeepseekV4MultiHeadLatentAttentionWrapper`, new PluggableLayer name), `:717` (`forward(self, q, kv, ...)` — fused contract); registry `vllm/.../models/registry.py:98` (`DeepseekV32`→`deepseek_v2`), `:99` (`DeepseekV4`→`deepseek_v4`). Checkout `v0.20.1rc0-36-g75a7cf2c1`.
 - JAX contrast: `tpu_inference/models/jax/deepseek_v3.py:1347` (class), `:585` (`DeepseekV3MLA`), `:696-711` (kernel call); `tpu_inference/models/common/model_loader.py:84` (registry), `:51-58` (route resolution).

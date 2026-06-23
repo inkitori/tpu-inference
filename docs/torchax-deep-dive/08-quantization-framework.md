@@ -602,10 +602,14 @@ dispatch to.
 def sharded_quantized_matmul(x, w_q, w_s, weight_sharding, *,
                              mesh=None, x_q_dtype=None) -> jax.Array:
 ```
-- **Picks the kernel by scale rank** (`linear.py:73`): 3-D `w_s` → blockwise Pallas
-  kernel; 1-D `w_s` → pure-JAX `xla_quantized_matmul` (per a comment at `:69`, the
-  per-channel **Pallas** path is intentionally disabled due to NaN issues, so 1-D
-  scales currently go through XLA, not Pallas).
+- **Picks the kernel by scale rank** (`enable_quantized_matmul_kernel = len(w_s.shape)
+  == 3`, `linear.py:73`): 3-D `w_s` (block-quant) → blockwise Pallas kernel
+  (`:96-100`); 1-D `w_s` (per-channel) → pure-JAX `xla_quantized_matmul` (`:102`). A
+  NOTE at `linear.py:69-70` explains the per-channel **Pallas** path is disabled:
+  *"there have been numeric issues (concerning) NaNs with the kernel and thus we
+  disable it for now."* So 1-D scales currently go through XLA, not Pallas. (It's a
+  NOTE/structural fallback, not a literal `if False:` — the **blockwise** Pallas kernel
+  is still live for 3-D scales.)
 - **Infers activation dtype** if `x_q_dtype is None` (`_get_x_q_dtype`, `:27`):
   integer weight → `int8`, float weight → `float8_e4m3fn`.
 - **Runs under `jax.shard_map`** (`:107`): if the contracting (`in_axis`) dim is

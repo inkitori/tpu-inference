@@ -167,7 +167,8 @@ q, k = self.rotary_emb(positions, q, k)
 
 There **is** a TPU RoPE custom op at `layers/vllm/custom_ops/rope.py`, but it only
 patches `DeepseekScalingRotaryEmbedding` (`rope.py:32`) and only overrides the
-**non-NEOX** path (`rope.py:49` returns `super()` for NEOX). So for **plain Qwen2 RoPE
+**non-NEOX** path (`rope.py:49-50`: `if self.is_neox_style: return super().forward_native(...)`).
+So for **plain Qwen2 RoPE
 this file does not apply** — the standard `RotaryEmbedding.forward_native` is traced by
 torchax to JAX. (The `rope.py` op exists for models like DeepSeek; cite it when you get
 there, but don't attribute Qwen2's RoPE to it.)
