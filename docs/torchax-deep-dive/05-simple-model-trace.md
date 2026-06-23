@@ -331,13 +331,13 @@ What the three context managers buy you (this is the crux of the whole route):
 - `set_vllm_model_wrapper_context(...)` — stashes the KV caches and the
   layer→KV-cache-index map so the patched attention can read/write the right cache
   slice. Updated caches are pulled back out at `vllm_model_wrapper.py:381` (note
-  `@jax.jit(donate_argnames=("kv_caches",))` at `:320` — caches are donated and
+  `@jax.jit(donate_argnames=("kv_caches",))` at `:321` — caches are donated and
   returned, not mutated in place).
 - `set_forward_context(attn_metadata=...)` — vLLM's standard mechanism; the
   `Attention` layer reads `attn_metadata` from the forward context (not from a
   function arg), which is how block tables / seq lens reach the Pallas kernel (§3.5).
 
-Then the **whole thing is `jax.jit`-compiled** (`vllm_model_wrapper.py:320`), so the
+Then the **whole thing is `jax.jit`-compiled** (`vllm_model_wrapper.py:321`), so the
 torch trace is captured once and replayed as a fused XLA program. Logits and sampling
 run as separate jitted steps (§3.7).
 

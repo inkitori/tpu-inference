@@ -9,7 +9,7 @@
 All `path:line` anchors below are verified against the `hy3` branch.
 - tpu-inference: `/home/enyouki/tpu-inference` (package `tpu_inference/`)
 - vLLM (editable): `/home/enyouki/vllm/vllm`
-- torchax (installed): `.venv/.../site-packages/torchax/`
+- torchax (installed): `/home/enyouki/vllm_env/lib/python3.12/site-packages/torchax`
 
 ---
 
@@ -39,7 +39,7 @@ The remainder of the doc walks each one with code.
 ### 1.1 The entry point
 
 `setup.py` declares a `vllm.general_plugins` entry point
-(`/home/enyouki/tpu-inference/setup.py:95-99`):
+(`/home/enyouki/tpu-inference/setup.py:96-97`):
 
 ```python
 entry_points={
@@ -179,7 +179,7 @@ runs. The two base classes:
 
 - **`PluggableLayer`** (`custom_op.py:84`) — class-swap only. Backs
   `RowParallelLinear` (→ `LinearBase`), `VocabParallelEmbedding`, `FusedMoE`.
-- **`CustomOp`** (`custom_op.py:332`) — class-swap **plus** per-platform
+- **`CustomOp`** (class `custom_op.py:103`; `register_oot` `:332`) — class-swap **plus** per-platform
   `forward_*` dispatch (`forward_cuda`/`forward_tpu`/…). Backs
   `DeepseekScalingRotaryEmbedding` (→ `RotaryEmbeddingBase`).
 
@@ -606,7 +606,7 @@ shape** (new `@register_backend`). To **add a new quantization**, add a
 ## Appendix — key anchors
 
 **Activation**
-- `setup.py:95-99` — `vllm.general_plugins` entry point
+- `setup.py:96-97` — `vllm.general_plugins` entry point
 - `tpu_inference/layers/vllm/__init__.py:14-22` — imports fire decorators; `register_layers` is `pass`
 - `vllm/plugins/__init__.py:61,81-82` + `vllm/engine/arg_utils.py:718-720` — vLLM loads/calls plugins
 

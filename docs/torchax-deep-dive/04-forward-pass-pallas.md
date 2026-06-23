@@ -553,7 +553,7 @@ to the engine.
 | defer-sampling stash / return `None` | `runner/tpu_runner.py:908-920` |
 | `_prepare_inputs` (non-DP), device transfer | `runner/tpu_runner.py:1662`, `:1850-1859` |
 | `model_fn = jit_step_func()` (torchax) | `models/common/model_loader.py:430`, `:452` |
-| `AttentionMetadata` pytree | `layers/common/attention_metadata.py:22-49` |
+| `AttentionMetadata` pytree | `layers/common/attention_metadata.py:22-35` |
 | compile cache + bucketed warmup | `runner/compilation_manager.py:51-60`, `:92`; `runner/utils.py:55`,`:67` |
 | patched attention forward (torch↔JAX) | `layers/vllm/backends/flash_attn.py:152-218` |
 | `_jax_attn_func` (jit) | `layers/vllm/backends/flash_attn.py:221-282` |

@@ -174,7 +174,7 @@ It computes the sharding from the layer type:
 
 ### 1.4 Registration: the import side-effect
 
-The vLLM plugin entry point `register_layers` (wired in `setup.py:95-97` under
+The vLLM plugin entry point `register_layers` (wired in `setup.py:96-97` under
 `vllm.general_plugins`) is an **empty no-op**
 (`tpu_inference/layers/vllm/__init__.py:21-22`). The real work is the **import**:
 `tpu_inference/layers/vllm/__init__.py:17` imports the `quantization` package, whose
