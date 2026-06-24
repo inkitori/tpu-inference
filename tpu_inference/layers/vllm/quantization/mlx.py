@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
 from vllm.model_executor.layers.fused_moe import (FusedMoE,
@@ -35,11 +36,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 
+from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_moe_weights, shard_moe_weights)
 from tpu_inference.layers.common.quant_methods import MLX
-from tpu_inference.layers.common.quantization import (mlx_dequantize,
-                                                      mlx_unpack)
+from tpu_inference.layers.common.quantization import mlx_unpack
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.utils import (
     reorder_concatenated_tensor_for_sharding,
@@ -139,20 +140,68 @@ class VllmMLXConfig(QuantizationConfig, VllmQuantConfig):
                 return None
 
 
-class VllmMLXLinearMethod(QuantizeMethodBase):
-    """MLX 4-bit affine linear method (keep-4bit, dequant-in-XLA at apply time).
+def _mlx_int4_matmul(x, codes, scale, groupbias, group_sizes, mesh, in_axis,
+                     out_axis, vmem_limit_bytes=None):
+    """Single-group ``gmm_v2`` dense int4 matmul, sharded like the MoE TP path.
 
-    The MLX weight is ``uint32`` packed along the INPUT dim:
+    ``gmm_v2`` is a Pallas kernel: GSPMD does not auto-partition it, so (exactly
+    like ``tensor_parallel_gmm``) we wrap it in ``shard_map`` over per-shard
+    local tensors. ColumnParallel (out sharded, ``in_axis is None``) needs no
+    reduction; RowParallel (contraction sharded) ``psum``s the partial sums over
+    ``in_axis``. At tp=1 every spec naming a size-1 axis is a replicated no-op.
+
+      * ``x``         ``[M, in]``            -> P(None, in_axis)
+      * ``codes``     ``[1, in, out]`` int4  -> P(None, in_axis, out_axis)
+      * scale/gbias   ``[1, in//gs, 1, out]``-> P(None, in_axis, None, out_axis)
+      * output        ``[M, out]``           -> P(None, out_axis)
+
+    ``vmem_limit_bytes`` is normally None (gmm_v2 picks ``0.9*vmem_capacity``).
+    It only needs raising for a large UNSHARDED contraction dim (a dense down/o
+    proj run at tp=1, where K never gets split across chips); at real serving TP
+    the per-shard K is small and the default tiling fits.
+    """
+
+    def _local(lhs, rhs, sc, gb, gs):
+        y = gmm_v2(lhs=lhs,
+                   rhs=rhs,
+                   group_sizes=gs,
+                   rhs_scale=sc,
+                   rhs_groupbias=gb,
+                   maybe_quantize_lhs=False,
+                   preferred_element_type=jnp.bfloat16,
+                   vmem_limit_bytes=vmem_limit_bytes)
+        if in_axis is not None:  # RowParallel: reduce contraction-dim shards.
+            y = jax.lax.psum(y, axis_name=in_axis)
+        return y
+
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(P(None, in_axis), P(None, in_axis, out_axis),
+                  P(None, in_axis, None, out_axis),
+                  P(None, in_axis, None, out_axis), P()),
+        out_specs=P(None, out_axis),
+        check_vma=False,
+    )(x, codes, scale, groupbias, group_sizes)
+
+
+class VllmMLXLinearMethod(QuantizeMethodBase):
+    """MLX 4-bit affine linear method — in-kernel dequant via ``gmm_v2``.
+
+    The MLX checkpoint ships the weight ``uint32`` packed along the INPUT dim:
       * ``weight``  : ``[out, in // pack_factor]`` (uint32, packed_dim=1)
       * ``scales``  : ``[out, in // group_size]``  (params_dtype, affine scale)
       * ``biases``  : ``[out, in // group_size]``  (params_dtype, affine bias)
-    Dequant is ``w = scale * q + bias`` (see ``mlx_dequantize``); the apply math
-    contracts the input dim: ``y = einsum("bd,fd->bf", x, dequant_weight)`` with
-    the dequantized weight in ``[out, in]`` layout.
 
-    Mirrors ``VllmAWQLinearMethod`` (awq.py) but: MLX packs along input (AWQ along
-    output); MLX is affine (scales+biases) not (q - z) * s; weight stays packed
-    here and is dequantized at apply time via ``mlx_dequantize``.
+    ``process_weights_after_loading`` unpacks ONCE into the ``gmm_v2`` int4
+    layout — signed int4 codes ``[1, in, out]`` plus per-group ``scale`` /
+    ``groupbias`` ``[1, in//gs, 1, out]`` — so the 4-bit weight is never
+    materialized as bf16. ``apply`` runs a single-group ``gmm_v2`` that dequants
+    ``w = scale*q + groupbias`` INSIDE the kernel (4-bit stays in HBM), the dense
+    analogue of the MoE w13 path. Because MLX codes are unsigned ``[0,15]`` but
+    the kernel matmul is signed, codes are shifted ``q -> q-8`` and the offset is
+    folded back into the groupbias: ``(q-8)*scale + (bias+8*scale) ==
+    q*scale + bias``.
     """
 
     def __init__(self, quant_config: "VllmMLXConfig",
@@ -201,100 +250,102 @@ class VllmMLXLinearMethod(QuantizeMethodBase):
         layer.register_parameter("biases", biases)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Keep the weight uint32-packed (no unpack/dequant here; that happens in
-        # apply). Two steps, mirroring AWQ's process_linear_weights +
-        # shard_linear_weights, but on the three MLX tensors directly:
-        #   1. If this is a fused projection (QKV / merged gate_up), reorder the
-        #      output dim 0 from contiguous concat [q | k | v] into
-        #      interleaved-by-shard layout so the apply-time
-        #      slice_sharded_tensor_for_concatenation recovers each projection.
-        #      (No-op when output_sizes has a single entry.)
-        #   2. Shard each tensor along the output dim 0 with weight_sharding
-        #      (= P(out_axis, None)), which applies directly to the 2D
-        #      [out, in//pf] weight and [out, in//gs] scales/biases.
+        # Unpack ONCE into the gmm_v2 int4 layout (codes [1, in, out] +
+        # scale/groupbias [1, in//gs, 1, out]); the 4-bit weight never becomes
+        # bf16. weight_sharding is the [out, in] spec: out_axis shards dim 0
+        # (ColumnParallel: qkv/gate_up), in_axis shards dim 1 (RowParallel:
+        # o/down). The transformed specs put out_axis on the trailing out dim
+        # and in_axis on the in/block dim, matching tensor_parallel_gmm's w1/w2.
         mesh = self.linear_config.mesh
         wsh = self.linear_config.weight_sharding
         output_sizes = self.linear_config.output_sizes
         n_shards = self.linear_config.n_shards
-        # tp=8 RowParallel input-dim sharding correctness (Task 8, Step 3).
-        # The same weight_sharding spec is device_put onto all three tensors.
-        # For RowParallelLinear it is P(None, ATTN_HEAD), which shards axis 1 --
-        # the INPUT dim, which for MLX is packed (weight: in//pf, one uint32 =
-        # pf=8 nibbles) AND grouped (scales/biases: in//gs, one affine pair per
-        # gs=64 inputs). The split is correct ONLY if each shard owns whole
-        # words AND whole groups for the SAME contiguous input range, i.e. both
-        # in//pf and in//gs are divisible by the axis-1 shard count. When they
-        # are, word and group boundaries align to the same per-shard input
-        # slice and per-shard dequant == the input-slice of the full dequant
-        # (verified numerically in test_mlx_linear_method.py::
-        # test_rowparallel_input_dim_sharding_dequant_consistency; for Qwen3-30B
-        # o_proj at tp=8: in=4096 -> in//8=512 (÷8 ✓), in//64=64 (÷8 ✓)).
-        # If axis 1 is replicated (None) the shard count is 1 and this is a
-        # no-op; we only need the guard when the input dim is actually sharded.
+        bits = self.quant_config.bits
+        out_axis = wsh[0]
         in_axis = wsh[1] if len(wsh) > 1 else None
+        self._mesh = mesh
+        self._in_axis = in_axis
+        self._out_axis = out_axis
+        self._output_sizes = output_sizes
+        self._n_shards = n_shards
+
+        # RowParallel input-dim sharding must own whole uint32 words AND whole
+        # quant groups per shard, else a word/group straddles a chip boundary.
         in_shards = get_mesh_shape_product(mesh, in_axis)
         if in_shards > 1:
-            pf = self.quant_config.pack_factor
-            gs = self.quant_config.group_size
-            n_words = layer.weight.shape[1]
-            n_groups = layer.scales.shape[1]
+            n_words = layer.weight.shape[1]   # in // pack_factor
+            n_groups = layer.scales.shape[1]  # in // group_size
             assert n_words % in_shards == 0 and n_groups % in_shards == 0, (
-                "MLX RowParallel input-dim sharding would split a uint32 word "
-                f"or a quant group across chips: packed dim in//{pf}={n_words} "
-                f"and grouped dim in//{gs}={n_groups} must both be divisible by "
-                f"the input shard count {in_shards}. Got remainders "
-                f"{n_words % in_shards}/{n_groups % in_shards}.")
-        # MLX keeps a single packed Parameter per tensor and always uses the
-        # fused-style apply (one dequant + einsum + slice). The split path
-        # (per-projection ParameterLists, AWQ's _apply_split) is not built here,
-        # so a non-fused multi-projection layer would be mis-sliced at apply.
-        # Fail loudly instead of silently corrupting QKV/gate_up outputs.
+                "MLX RowParallel sharding splits a uint32 word or quant group: "
+                f"in//pf={n_words} and in//gs={n_groups} must both be divisible "
+                f"by the input shard count {in_shards}.")
+
+        # Single packed Parameter per tensor + fused-style apply (one gmm +
+        # slice). Non-fused multi-projection layers are unsupported (would be
+        # mis-sliced); fail loudly instead of corrupting QKV/gate_up.
         assert self.linear_config.fuse_matmuls or len(output_sizes) == 1, (
             "VllmMLXLinearMethod only supports fused multi-projection layers; "
             f"got fuse_matmuls=False with output_sizes={output_sizes}.")
         do_reorder = self.linear_config.fuse_matmuls and len(output_sizes) > 1
 
-        def _process(t):
-            # Loaded params are plain CPU torch tensors (PackedvLLMParameter /
-            # GroupQuantScaleParameter), not torchax-wrapped, so cross into JAX
-            # with t2j (the AWQ/FP8/unquantized load-time idiom), not jax_view
-            # (which asserts an already-torchax tensor).
-            arr = t2j(t, use_dlpack=False)
+        @jax.jit
+        def _transform(weight, scales, biases):
+            # Reorder the fused output (dim 0) into interleaved-by-shard order
+            # BEFORE the transpose, so apply's slice/concat recovers each proj.
             if do_reorder:
-                arr = reorder_concatenated_tensor_for_sharding(
-                    arr, output_sizes, n_shards, dim=0)
-            return torch_view(jax.device_put(arr, NamedSharding(mesh, wsh)))
+                weight = reorder_concatenated_tensor_for_sharding(
+                    weight, output_sizes, n_shards, dim=0)
+                scales = reorder_concatenated_tensor_for_sharding(
+                    scales, output_sizes, n_shards, dim=0)
+                biases = reorder_concatenated_tensor_for_sharding(
+                    biases, output_sizes, n_shards, dim=0)
+            # Unpack uint32 -> unsigned codes [out, in], shift to signed int4,
+            # fold the -8 offset into groupbias. Transpose in int32, cast last.
+            codes = mlx_unpack(weight, bits) - 8                # int32 [out, in]
+            scale = scales.astype(jnp.float32)                  # [out, in//gs]
+            groupbias = biases.astype(jnp.float32) + 8.0 * scale
+            codes = jnp.transpose(codes, (1, 0))[None].astype(jnp.int4)
+            scale = jnp.transpose(scale, (1, 0))[None, :, None, :]
+            groupbias = jnp.transpose(groupbias, (1, 0))[None, :, None, :]
+            return codes, scale, groupbias
 
-        layer.weight = torch.nn.Parameter(_process(layer.weight),
-                                          requires_grad=False)
-        layer.scales = torch.nn.Parameter(_process(layer.scales),
-                                          requires_grad=False)
-        layer.biases = torch.nn.Parameter(_process(layer.biases),
-                                          requires_grad=False)
+        codes, scale, groupbias = _transform(
+            t2j(layer.weight, use_dlpack=False),
+            t2j(layer.scales, use_dlpack=False),
+            t2j(layer.biases, use_dlpack=False))
+
+        codes_sh = NamedSharding(mesh, P(None, in_axis, out_axis))
+        sg_sh = NamedSharding(mesh, P(None, in_axis, None, out_axis))
+        layer.weight = torch.nn.Parameter(
+            torch_view(jax.device_put(codes, codes_sh)), requires_grad=False)
+        layer.scales = torch.nn.Parameter(
+            torch_view(jax.device_put(scale, sg_sh)), requires_grad=False)
+        layer.biases = torch.nn.Parameter(
+            torch_view(jax.device_put(groupbias, sg_sh)), requires_grad=False)
 
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         with jax.named_scope(layer._get_name()):
-            x_jax = jax_view(x)
-            # Dequant in XLA: w = scale * q + bias, weight in [out, in] layout.
-            weight = mlx_dequantize(jax_view(layer.weight),
-                                    jax_view(layer.scales),
-                                    jax_view(layer.biases),
-                                    group_size=self.quant_config.group_size,
-                                    bits=self.quant_config.bits)
-            # Contract the input dim: y[b, f] = sum_d x[b, d] * weight[f, d].
-            outs = jnp.einsum("bd,fd->bf", x_jax, weight)
+            x_jax = jax_view(x)                              # [M, in]
+            # int4 survives the torch Parameter round-trip as a torchax wrapper
+            # (reported as int8); re-cast defensively, same as W4A8/the MoE path.
+            codes = jax_view(layer.weight).astype(jnp.int4)  # [1, in, out]
+            scale = jax_view(layer.scales)                   # [1, in//gs, 1, out]
+            groupbias = jax_view(layer.biases)
+            group_sizes = jnp.array([x_jax.shape[0]], dtype=jnp.int32)
+            # Single-group in-kernel int4 matmul (dequant inside gmm_v2).
+            outs = _mlx_int4_matmul(x_jax, codes, scale, groupbias, group_sizes,
+                                    self._mesh, self._in_axis, self._out_axis)
 
             if bias is not None and not layer.skip_bias_add:
                 outs = outs + jax_view(bias)
 
             # Split a fused output back into its projections (no-op pass-through
-            # when there is a single projection), mirroring AWQ's apply.
+            # when there is a single projection).
             outs = slice_sharded_tensor_for_concatenation(
-                outs, self.linear_config.output_sizes,
-                self.linear_config.n_shards)
+                outs, self._output_sizes, self._n_shards)
             return torch_view(jnp.concatenate(outs, axis=-1))
 
 
@@ -345,14 +396,13 @@ def _make_mlx_moe_bias_loader(layer: "FusedMoE"):
 
 
 class VllmMLXMoEMethod(FusedMoEMethodBase):
-    """MLX 4-bit affine fused-MoE method (Stage 2 hybrid: w13 in-kernel 4-bit,
-    w2 dequant-at-load -> bf16).
+    """MLX 4-bit affine fused-MoE method (w13 and w2 both in-kernel 4-bit).
 
     The MLX checkpoint ships each expert's ``gate/up/down`` projection as
     ``uint32``-packed (along the INPUT dim) ``weight`` plus per-group affine
-    ``scales``/``biases``. Task 6's loader transform un-stacks ``switch_mlp``
-    into per-expert names so vLLM's ``FusedMoE.weight_loader`` can route them
-    into the stacked params registered here:
+    ``scales``/``biases``. The loader transform un-stacks ``switch_mlp`` into
+    per-expert names so vLLM's ``FusedMoE.weight_loader`` can route them into the
+    stacked params registered here:
 
       * ``w13_weight`` uint32 ``[E, 2I, H // pack_factor]`` (gate->w1 first I
         rows, up->w3 second I rows; packed along H)
@@ -360,15 +410,9 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
       * ``w2_weight``  uint32 ``[E, H, I // pack_factor]`` (down_proj)
       * ``w2_scales``/``w2_biases`` ``[E, H, I // group_size]``
 
-    ``process_weights_after_loading`` keeps **w13** packed int4 + per-group
-    scale + per-group affine groupbias, so dequant happens INSIDE ``gmm_v2``
-    (true 4-bit in HBM for the dominant expert weight). **w2** is dequantized to
-    bf16 at load (its per-group scale/bias cannot shard cleanly at tp=8), so it
-    flows through the same ``process_moe_weights`` / ``shard_moe_weights`` path
-    with scale/groupbias = None. The two are run as separate ``gmm_v2`` calls, so
-    a mixed int4-w13 / bf16-w2 forward is well-defined. The in-kernel w13 dequant
-    is numerically identical to the Stage-1 load-time dequant (the synthetic e2e
-    gate asserts an exact token match against the bf16 reference).
+    ``process_weights_after_loading`` keeps both w13 and w2 packed int4 +
+    per-group scale + per-group affine groupbias, so dequant happens INSIDE
+    ``gmm_v2`` (true 4-bit in HBM) for every expert weight.
     """
 
     def __init__(self,
@@ -429,28 +473,17 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         _reg("w2_biases", (E, H, I // gs), params_dtype, bias_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Stage-2/3 (hybrid): w13 stays packed int4 (in-kernel dequant via
-        ``gmm_v2``); w2 stays int4 in-kernel when its per-group scale/groupbias
-        shards cleanly, otherwise it is dequantized to bf16 at load.
+        """w13 and w2 both stay packed int4 (in-kernel dequant via ``gmm_v2``).
 
-        w13 mirrors ``VllmCompressedTensorsW4A8MoEMethod`` (int4 codes +
+        Each mirrors ``VllmCompressedTensorsW4A8MoEMethod`` (int4 codes +
         per-group scale flow through ``process_moe_weights`` -> GMM), with the
-        MLX affine ``+ bias`` term routed into the NEW ``w13_groupbias`` ->
+        MLX affine ``+ bias`` term routed into the ``groupbias`` ->
         ``gmm_v2(rhs_groupbias=...)`` so reconstruction is ``w = scale*q +
         groupbias``. Because MLX codes are UNSIGNED [0,15] but the kernel matmul
         is SIGNED int4, we shift codes by -8 and fold the offset back into the
         groupbias: ``(q-8)*scale + (bias + 8*scale) == q*scale + bias``.
-
-        w2 mirrors the same fold. In GMM_TP its per-group scale/groupbias shard
-        on the block dim, so we keep w2 int4 only when num_blocks(w2)=I/gs is
-        divisible by the MLP tensor-parallel degree (Hy3: 1536/64=24 % 8 == 0).
-        Otherwise (e.g. Qwen3-30B at tp=8 where 768/64=12 % 8 != 0) w2 falls back
-        to bf16 -- the gmm chain runs w1 and w2 as separate gmm calls, so a mixed
-        int4-w13 / bf16-w2 model is fine. In GMM_EP the scale/groupbias shard on
-        the expert axis, so block divisibility is irrelevant and w2 stays int4.
         """
         assert isinstance(layer, FusedMoE)
-        gs = self.quant_config.group_size
         bits = self.quant_config.bits
 
         # Loaded params are CPU torch tensors; cross into JAX with t2j (the AWQ/
@@ -469,53 +502,30 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         w13_reorder_size = get_mesh_shape_product(self.mesh,
                                                   ShardingAxisName.MLP_TENSOR)
 
-        # w2 per-group scale/groupbias shard on the block dim in GMM_TP; keep w2
-        # int4 only when num_blocks(w2)=I/gs divides the MLP tensor degree. EP
-        # shards on the expert axis, so block divisibility is irrelevant.
-        w2_num_blocks = int(w2_scales.shape[-1])  # I // gs
-        w2_keep_int4 = (self.moe_backend == MoEBackend.GMM_EP
-                        or w13_reorder_size <= 1
-                        or w2_num_blocks % w13_reorder_size == 0)
-        self._w2_int4 = w2_keep_int4
-
         @jax.jit
         def _process(w13q, w13s, w13b, w2q, w2s, w2b):
-            # --- w13: keep int4, fold sign offset into the groupbias ---
-            # MLX uint32-packed [E, 2I, H//pf] -> unsigned codes [E, 2I, H].
-            w13_codes_u = mlx_unpack(w13q, bits)  # int32, unsigned [0, 15]
-            # Shift to signed int4 [-8, 7] for the signed in-kernel matmul.
-            w13_codes = (w13_codes_u - 8).astype(jnp.int4)  # [E, 2I, H]
-            w13_scale = w13s.astype(jnp.float32)  # [E, 2I, H//gs]
-            # groupbias = MLX affine bias + 8*scale (re-absorbs the -8 shift),
-            # same [E, out, n_groups] layout as scale; process_moe_weights then
-            # reshapes both to [E, num_blocks, 1, N] identically.
-            w13_groupbias = (w13b.astype(jnp.float32) + 8.0 * w13_scale)
+            # Both projections: unpack uint32 -> unsigned codes, shift to signed
+            # int4 [-8, 7], fold the -8 offset back into groupbias = bias +
+            # 8*scale. process_moe_weights reshapes scale/groupbias from
+            # [E, out, n_groups] to [E, num_blocks, 1, N] identically.
+            def _fold(q, s, b):
+                codes = (mlx_unpack(q, bits) - 8).astype(jnp.int4)
+                scale = s.astype(jnp.float32)
+                groupbias = b.astype(jnp.float32) + 8.0 * scale
+                return codes, scale, groupbias
 
-            if w2_keep_int4:
-                # --- w2: keep int4, same sign-fold as w13 (mandatory for HBM) ---
-                # MLX uint32-packed [E, H, I//pf] -> unsigned codes [E, H, I].
-                w2_codes_u = mlx_unpack(w2q, bits)
-                w2_codes = (w2_codes_u - 8).astype(jnp.int4)  # [E, H, I]
-                w2_scale = w2s.astype(jnp.float32)  # [E, H, I//gs]
-                w2_groupbias = (w2b.astype(jnp.float32) + 8.0 * w2_scale)
-                w2_fields = dict(w2_weight=w2_codes,
-                                 w2_weight_scale=w2_scale,
-                                 w2_groupbias=w2_groupbias,
-                                 w2_bias=None)
-            else:
-                # --- w2: dequant to bf16 at load (Stage-1 fallback) ---
-                w2 = mlx_dequantize(w2q, w2s, w2b, group_size=gs, bits=bits)
-                w2_fields = dict(w2_weight=w2,
-                                 w2_weight_scale=None,
-                                 w2_groupbias=None,
-                                 w2_bias=None)
+            w13_codes, w13_scale, w13_groupbias = _fold(w13q, w13s, w13b)
+            w2_codes, w2_scale, w2_groupbias = _fold(w2q, w2s, w2b)
 
             weights = FusedMoEWeights(
                 w13_weight=w13_codes,
                 w13_weight_scale=w13_scale,
                 w13_groupbias=w13_groupbias,
                 w13_bias=None,
-                **w2_fields,
+                w2_weight=w2_codes,
+                w2_weight_scale=w2_scale,
+                w2_groupbias=w2_groupbias,
+                w2_bias=None,
             )
             return process_moe_weights(
                 weights,
@@ -529,22 +539,20 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
 
-        # Store back: w13 stays packed int4 + per-group scale + groupbias. w2 is
-        # either packed int4 (+ scale + groupbias) or plain bf16. The int4 dtype
-        # survives the torch Parameter round-trip as a torchax wrapper (reported
-        # as int8 but the underlying jax buffer stays int4); apply_monolithic
-        # re-casts to int4 defensively -- same as W4A8.
+        # Store back: w13 and w2 both stay packed int4 + per-group scale +
+        # groupbias. The int4 dtype survives the torch Parameter round-trip as a
+        # torchax wrapper (reported as int8 but the underlying jax buffer stays
+        # int4); apply_monolithic re-casts to int4 defensively -- same as W4A8.
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(weights.w13_weight_scale,
                                            requires_grad=False)
         layer.w13_groupbias = Parameter(weights.w13_groupbias,
                                         requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
-        if w2_keep_int4:
-            layer.w2_weight_scale = Parameter(weights.w2_weight_scale,
-                                              requires_grad=False)
-            layer.w2_groupbias = Parameter(weights.w2_groupbias,
-                                           requires_grad=False)
+        layer.w2_weight_scale = Parameter(weights.w2_weight_scale,
+                                          requires_grad=False)
+        layer.w2_groupbias = Parameter(weights.w2_groupbias,
+                                       requires_grad=False)
 
         # Release intermediate buffers before the next layer (mirrors the
         # unquantized path's barrier to avoid cross-layer buffer accumulation).
@@ -556,25 +564,16 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
                          router_logits: torch.Tensor,
                          input_ids: Optional[torch.Tensor] = None
                          ) -> torch.Tensor:
-        # w13: packed int4 + per-group scale + affine groupbias straight through
-        # (dequant happens inside gmm_v2). w2: either packed int4 (+ scale +
-        # groupbias) or bf16, matching what process_weights_after_loading stored.
-        if getattr(self, "_w2_int4", False):
-            w2_weight = jax_view(layer.w2_weight).astype(jnp.int4)
-            w2_weight_scale = jax_view(layer.w2_weight_scale)
-            w2_groupbias = jax_view(layer.w2_groupbias)
-        else:
-            w2_weight = jax_view(layer.w2_weight)
-            w2_weight_scale = None
-            w2_groupbias = None
+        # w13 and w2: packed int4 + per-group scale + affine groupbias straight
+        # through (dequant happens inside gmm_v2).
         weights = FusedMoEWeights(
             w13_weight=jax_view(layer.w13_weight).astype(jnp.int4),
             w13_weight_scale=jax_view(layer.w13_weight_scale),
             w13_groupbias=jax_view(layer.w13_groupbias),
             w13_bias=None,
-            w2_weight=w2_weight,
-            w2_weight_scale=w2_weight_scale,
-            w2_groupbias=w2_groupbias,
+            w2_weight=jax_view(layer.w2_weight).astype(jnp.int4),
+            w2_weight_scale=jax_view(layer.w2_weight_scale),
+            w2_groupbias=jax_view(layer.w2_groupbias),
             w2_bias=None)
         return vllm_moe_apply(layer=layer,
                               weights=weights,
