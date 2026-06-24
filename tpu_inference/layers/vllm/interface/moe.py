@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import jax.numpy as jnp
 import torch
 import torchax
 from torchax.interop import jax_view, torch_view
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
@@ -21,7 +23,9 @@ from tpu_inference import envs
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
 from tpu_inference.layers.common.process_weights.moe_weights import \
     FusedMoEWeights
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
+from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
 
@@ -97,6 +101,31 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
         e_score_correction_bias = jax_view(e_score_correction_bias)
     routed_scaling_factor = getattr(layer, "routed_scaling_factor", None)
 
+    # Number of real (non-padding) rows. The runner pads the token dim up to a
+    # static compiled shape (e.g. 1 real decode token padded to 16); padding rows
+    # carry garbage hidden states that route to arbitrary experts and inflate the
+    # distinct-active-expert count driving the grouped-matmul cost. Plumb the real
+    # token count so the MoE routing collapses padding rows onto a single expert.
+    # query_start_loc is the per-request cumsum of scheduled tokens, padded with 1
+    # past the last real request, so its max is the total actual token count (a
+    # dynamic traced scalar -- no recompile, no new dynamic shape). attn_metadata
+    # is set on the forward context by the vLLM model wrapper (set_forward_context).
+    #
+    # Guard to the single attention-DP-rank case: with attention DP > 1, the token
+    # tensor seen by the MoE is the per-rank blocks concatenated, each with its own
+    # real-prefix + padding, so a single contiguous arange >= n mask is invalid.
+    # Fall back to None there (no masking, no regression).
+    num_actual_tokens = None
+    mesh = quant_method_instance.mesh
+    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) == 1:
+        fwd_ctx = get_forward_context()
+        attn_metadata = getattr(fwd_ctx, "attn_metadata", None)
+        query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+        if query_start_loc is not None:
+            # attn_metadata on the TPU forward context is the JAX
+            # AttentionMetadata dataclass, so query_start_loc is a raw jax.Array.
+            num_actual_tokens = jnp.max(query_start_loc)
+
     return torch_view(
         moe_apply(
             layer=layer,
@@ -108,4 +137,5 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
             extra_backend_kwargs=quant_method_instance.extra_backend_kwargs,
             e_score_correction_bias=e_score_correction_bias,
             routed_scaling_factor=routed_scaling_factor,
+            num_actual_tokens=num_actual_tokens,
         ))

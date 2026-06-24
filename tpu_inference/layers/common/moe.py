@@ -80,6 +80,7 @@ def moe_apply(
     extra_backend_kwargs: dict,
     e_score_correction_bias: jax.Array | None = None,
     routed_scaling_factor: float | None = None,
+    num_actual_tokens: jax.Array | int | None = None,
 ) -> jax.Array:
 
     with jax.named_scope(layer._get_name()):
@@ -143,6 +144,7 @@ def moe_apply(
                     w1_groupbias=weights.w13_groupbias,
                     w2_groupbias=weights.w2_groupbias,
                     e_score_correction_bias=e_score_correction_bias,
+                    num_actual_tokens=num_actual_tokens,
                     gating_output=gating_output,
                     topk=layer.top_k,
                     renormalize=layer.renormalize,

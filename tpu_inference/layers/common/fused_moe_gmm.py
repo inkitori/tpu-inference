@@ -96,7 +96,8 @@ def compute_moe_routing(gating_output,
                         scoring_fn,
                         renormalize,
                         e_score_correction_bias=None,
-                        routed_scaling_factor=1.0):
+                        routed_scaling_factor=1.0,
+                        num_actual_tokens=None):
     """Return (topk_weights, topk_indices) replicating vLLM grouped_topk/
     fused_topk_bias: bias affects selection only; weights gathered from unbiased
     scores; then renormalize (+1e-20) and scale. bias=None & rsf=1.0 is an exact
@@ -110,6 +111,16 @@ def compute_moe_routing(gating_output,
       then optionally renormalized and scaled by routed_scaling_factor.
     With bias=None and routed_scaling_factor=1.0 this is an exact no-op vs. the
     previous plain top_k path (e.g. Qwen3 softmax routing).
+
+    num_actual_tokens (optional, a dynamic traced scalar): the number of real
+    (non-padding) rows in gating_output. The runner pads the token dim up to a
+    static compiled shape (e.g. 1 real decode token padded to 16); the padding
+    rows carry garbage hidden states that route to arbitrary experts and inflate
+    the number of distinct active experts driving the grouped-matmul cost. When
+    provided, padding rows [num_actual_tokens:] are forced to expert 0 with zero
+    weight so they collapse onto a single group. Their outputs are discarded
+    downstream, so this is exact and only affects performance. None (default)
+    leaves routing unchanged for callers that do not pad.
     """
     scores = apply_scoring_fn(scoring_fn, gating_output)
     if e_score_correction_bias is not None:
@@ -123,6 +134,15 @@ def compute_moe_routing(gating_output,
             topk_weights.sum(axis=-1, keepdims=True) + 1e-20)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
+    if num_actual_tokens is not None:
+        # Mask padding rows: keep [0:num_actual_tokens) untouched, force the rest
+        # to expert 0 with zero weight. num_tokens stays the static padded shape;
+        # num_actual_tokens is a dynamic traced value, so this is a data-dependent
+        # jnp.where (no recompile per value, no new dynamic shape).
+        num_tokens = topk_indices.shape[0]
+        pad_mask = jnp.arange(num_tokens) >= num_actual_tokens
+        topk_indices = jnp.where(pad_mask[:, None], 0, topk_indices)
+        topk_weights = jnp.where(pad_mask[:, None], 0.0, topk_weights)
     return topk_weights, topk_indices
 
 
@@ -525,6 +545,7 @@ def fused_moe_func(
     w1_groupbias: jax.Array | None = None,
     w2_groupbias: jax.Array | None = None,
     e_score_correction_bias: jax.Array | None = None,
+    num_actual_tokens: jax.Array | int | None = None,
     *,
     renormalize: bool,
     mesh: Mesh,
@@ -573,7 +594,8 @@ def fused_moe_func(
         scoring_fn=scoring_fn,
         renormalize=renormalize,
         e_score_correction_bias=e_score_correction_bias,
-        routed_scaling_factor=routed_scaling_factor)
+        routed_scaling_factor=routed_scaling_factor,
+        num_actual_tokens=num_actual_tokens)
     # All gathering topk_indices and topk_weights if attention dp is used.
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
