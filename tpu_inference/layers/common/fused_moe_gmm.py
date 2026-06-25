@@ -556,6 +556,27 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     )(hidden_states_q, scale)
 
 
+def mask_padding_token_routing(topk_weights, topk_indices, num_actual_tokens):
+    """Force padding rows ``[num_actual_tokens:]`` to expert 0 with zero weight.
+
+    At decode the runner pads the token dim up to a static compiled shape (e.g. a
+    single decode token padded to 16). The padding rows carry garbage hidden
+    states that route to arbitrary experts, inflating the number of distinct
+    active experts that drives the expert grouped-matmul cost. Collapsing them
+    onto a single expert with zero weight cuts that cost; their outputs are
+    discarded downstream, so this is numerically exact for the real tokens.
+
+    ``num_actual_tokens`` is a dynamic traced scalar, so the masking is a
+    data-dependent ``jnp.where`` -- no recompilation per value and no new dynamic
+    shape (the static padded ``num_tokens`` is preserved).
+    """
+    num_tokens = topk_indices.shape[0]
+    pad_mask = (jnp.arange(num_tokens) >= num_actual_tokens)[:, None]
+    topk_indices = jnp.where(pad_mask, 0, topk_indices)
+    topk_weights = jnp.where(pad_mask, 0.0, topk_weights)
+    return topk_weights, topk_indices
+
+
 @jax.jit(static_argnames=(
     "topk",
     "renormalize",
@@ -590,6 +611,7 @@ def fused_moe_func(
     scatter_results: bool = False,
     hash_based_topk_indices: jax.Array | None = None,
     expert_score_correction_bias: jax.Array | None = None,
+    num_actual_tokens: jax.Array | None = None,
     moe_chunk_size: int = 0,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
@@ -644,6 +666,12 @@ def fused_moe_func(
             topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    # Collapse decode padding-row routing onto a single expert (exact; cuts the
+    # distinct-active-expert count that drives grouped-matmul cost). Only the
+    # caller knows the real token count, so this is a no-op unless it is passed.
+    if num_actual_tokens is not None:
+        topk_weights, topk_indices = mask_padding_token_routing(
+            topk_weights, topk_indices, num_actual_tokens)
     # All gathering topk_indices and topk_weights if attention dp is used.
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(

@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_BLOCK_SIZE_BUCKETS: list[int] = []
     MOE_APPROX_TOPK: bool = False
     MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
+    MOE_MASK_PADDING_ROUTING: bool = True
     VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
     ENABLE_RS_KERNEL: bool = False
     NUM_PRECOMPILE_WORKERS: int = 1
@@ -385,6 +386,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A lower rate can speedup expert selection at the risk of higher accuracy loss.
     "MOE_APPROX_TOPK_RECALL_TARGET":
     lambda: float(os.getenv("MOE_APPROX_TOPK_RECALL_TARGET", "0.9")),
+    # MoE: mask decode padding-row routing. The runner pads the token dim up to a
+    # static compiled shape (e.g. one decode token -> 16); padding rows otherwise
+    # route to arbitrary experts and inflate the distinct-active-expert count that
+    # drives grouped-matmul cost. Forcing them to expert 0 / zero weight is
+    # numerically exact (padded outputs are discarded downstream). Set
+    # MOE_MASK_PADDING_ROUTING=0 to disable (e.g. for A/B perf measurement).
+    "MOE_MASK_PADDING_ROUTING":
+    env_bool("MOE_MASK_PADDING_ROUTING", default=True),
     "DISABLE_WEIGHT_REQUANTIZATION":
     env_bool("DISABLE_WEIGHT_REQUANTIZATION", default=False),
     "VLLM_TPU_PATCH_MM_EMBEDDINGS":

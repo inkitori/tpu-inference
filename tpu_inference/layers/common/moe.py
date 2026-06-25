@@ -78,6 +78,7 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
+    num_actual_tokens: jax.Array | None = None,
 ) -> jax.Array:
     extra_backend_kwargs = dict(
         extra_backend_kwargs) if extra_backend_kwargs else {}
@@ -162,6 +163,7 @@ def moe_apply(
                         "hash_based_topk_indices", None),
                     expert_score_correction_bias=extra_backend_kwargs.get(
                         "e_score_correction_bias", None),
+                    num_actual_tokens=num_actual_tokens,
                     moe_chunk_size=moe_chunk_size,
                 )
             case MoEBackend.DENSE_MAT:

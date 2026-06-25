@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import jax
 import torch
 from torchax.interop import jax_view, torch_view
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
@@ -26,6 +27,27 @@ from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
+
+
+def _get_num_actual_tokens() -> jax.Array | None:
+    """Return the number of real (non-padding) tokens for the current forward.
+
+    On the vLLM/TorchAX path the model wrapper sets the JAX ``AttentionMetadata``
+    on the forward context, whose ``query_start_loc`` is the per-request cumsum of
+    scheduled tokens with its padding tail filled by the final cumsum value, so
+    ``query_start_loc[-1]`` is the total actual token count (a traced scalar).
+    Returns ``None`` when the metadata is unavailable, so callers fall back to
+    leaving routing unchanged.
+    """
+    try:
+        from vllm.forward_context import get_forward_context
+        attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+    except (AssertionError, RuntimeError):
+        return None
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    if query_start_loc is None:
+        return None
+    return query_start_loc[-1]
 
 
 def select_moe_backend_from_fused_moe_config(
@@ -123,6 +145,18 @@ def vllm_moe_apply(layer: RoutedExperts,
         extra_kwargs["e_score_correction_bias"] = jax_view(
             layer.e_score_correction_bias)
 
+    # Real (non-padding) token count, used to collapse decode padding-row routing
+    # onto a single expert (cuts the distinct-active-expert count that drives
+    # grouped-matmul cost; exact since padded outputs are discarded). The runner
+    # fills query_start_loc's padding tail with the final cumsum, so its last
+    # element is the total actual token count -- a dynamic traced scalar (no
+    # recompile). Guarded to the single attention-DP-rank case: with attn DP > 1
+    # the MoE sees per-rank blocks concatenated (each with its own prefix +
+    # padding), so a single contiguous mask would be invalid; fall back to None.
+    num_actual_tokens = None
+    if envs.MOE_MASK_PADDING_ROUTING and attn_dp_size == 1:
+        num_actual_tokens = _get_num_actual_tokens()
+
     return torch_view(
         moe_apply(
             layer=layer,
@@ -132,4 +166,5 @@ def vllm_moe_apply(layer: RoutedExperts,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
             extra_backend_kwargs=extra_kwargs,
+            num_actual_tokens=num_actual_tokens,
         ))
