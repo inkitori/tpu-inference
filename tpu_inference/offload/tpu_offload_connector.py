@@ -487,13 +487,18 @@ class TPUOffloadConnector(KVConnectorBase_V1):
         self.connector_worker.start_load_kv(fwd_ctx)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        logger.info("TPUOffloadConnector: Entering wait_for_layer_load")
-        """TPU connector doesn't support layer wise load."""
+        """No-op: TPU connector loads KV in bulk via start_load_kv, not per-layer."""
         pass
 
-    def save_kv_layer(self, **kwargs) -> None:
-        logger.info("TPUOffloadConnector: Entering save_kv_layer")
-        """TPU connector doesn't support layer wise save."""
+    def save_kv_layer(self, layer_name=None, kv_layer=None,
+                      attn_metadata=None, **kwargs) -> None:
+        """No-op: TPU connector saves KV in bulk via wait_for_save, not per-layer.
+
+        vLLM's PyTorch attention decorator (kv_transfer_utils.py) calls this
+        positionally as save_kv_layer(layer_name, kv_cache, attn_metadata) for
+        every attention layer; the real save happens in bulk at the runner
+        level, so this just needs to accept and ignore those args.
+        """
         pass
 
     def wait_for_save(self):
