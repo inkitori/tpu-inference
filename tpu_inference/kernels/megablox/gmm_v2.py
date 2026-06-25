@@ -497,11 +497,27 @@ def inner_kernel(
 
                 acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size),
                                   dtype=acc_ref.dtype)
+                # The rhs scale/groupbias (affine path) may be FINER than the lhs
+                # quant block (e.g. rhs group_size=64 vs lhs block=512). Quantize
+                # the lhs once over the full lhs block (cheap, shared scale), but
+                # apply the rhs per-sub-block scale/groupbias inside the block so
+                # each rhs quant block gets its own affine params -- otherwise a
+                # single matmul over the lhs block mixes several rhs sub-blocks
+                # while only the first sub-block's scale/groupbias is applied
+                # (b_id collapses to start_k//rhs_block), silently corrupting the
+                # result. When the rhs has no finer block (rhs_quant_block_size >=
+                # q_block_size, e.g. the symmetric single-block path), rhs_sub ==
+                # q_block_size and this reduces to the original single matmul per
+                # lhs block.
+                rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+                has_rhs_subblocks = (
+                    (cfgs.rhs_cfgs.has_scale or cfgs.rhs_cfgs.has_groupbias)
+                    and rhs_qbs < q_block_size)
+                rhs_sub = rhs_qbs if has_rhs_subblocks else q_block_size
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
                     block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
                     # Perform lhs quantization. Note that for every block_lhs,
                     # same computation will be performed tiles_n//mxu_size times.
@@ -519,50 +535,62 @@ def inner_kernel(
                     # Convert lhs into quantized dtype.
                     block_lhs_q = (block_lhs *
                                    block_scale_inv).astype(lhs_q_dtype)
-                    # Some mixed precision matmuls are not supported. In that case,
-                    # convert rhs into the same dtype as lhs. We generally expect that
-                    # this will be an upcast, e.g. int4 -> fp8 or int8.
-                    if not pltpu.get_tpu_info().is_matmul_supported(
-                            lhs_q_dtype, block_rhs.dtype):
-                        block_rhs = block_rhs.astype(lhs_q_dtype)
 
-                    block_acc = jnp.matmul(
-                        block_lhs_q,
-                        block_rhs,
-                        preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
+                    # Inner loop over rhs quant sub-blocks within this lhs block.
+                    for sub in range(0, end_k - start_k, rhs_sub):
+                        sub_end = min(end_k - start_k, sub + rhs_sub)
+                        k0 = start_k + sub
+                        sub_lhs_q = block_lhs_q[:, sub:sub_end]
+                        sub_rhs = tiled_rhs[k0:start_k + sub_end,
+                                            start_n:end_n]
+                        # Some mixed precision matmuls are not supported. In that
+                        # case, convert rhs into the same dtype as lhs. We
+                        # generally expect this to be an upcast, e.g. int4 ->
+                        # fp8/int8.
+                        if not pltpu.get_tpu_info().is_matmul_supported(
+                                lhs_q_dtype, sub_rhs.dtype):
+                            sub_rhs = sub_rhs.astype(lhs_q_dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                        sub_acc = jnp.matmul(
+                            sub_lhs_q,
+                            sub_rhs,
+                            preferred_element_type=preferred_element_type,
+                        ).astype(acc_ref.dtype)
 
-                    # Apply rhs subchannel scale per quant block. Clamp the
-                    # block index to the real blocks held in the buffer: tile_k
-                    # may over-align past size_k (when size_k is not a multiple
-                    # of num_lanes), so the scale/groupbias buffer holds only
-                    # num_quant_blocks_per_tile_k_read blocks. The over-aligned
-                    # tail's rhs/lhs are already zeroed by the k-tail mask.
-                    if cfgs.rhs_cfgs.has_scale:
-                        b_id = min(start_k // cfgs.rhs_cfgs.quant_block_size,
-                                   cfgs.num_quant_blocks_per_tile_k_read - 1)
-                        rhs_scale_slice = tiled_rhs_ref.get_scale()
-                        block_acc *= rhs_scale_slice[b_id, :,
-                                                     start_n:end_n].astype(
-                                                         acc_ref.dtype)
+                        # Undo lhs block scale (shared across rhs sub-blocks).
+                        sub_acc *= block_scale.astype(acc_ref.dtype)
 
-                    # Per-group additive bias (MLX affine: w = scale*q + bias).
-                    # Use the full-precision block_lhs (not block_lhs_q) for the
-                    # sum_k lhs[t, k] term; added before fuse_act.
-                    if cfgs.rhs_cfgs.has_groupbias:
-                        b_id = min(start_k // cfgs.rhs_cfgs.quant_block_size,
-                                   cfgs.num_quant_blocks_per_tile_k_read - 1)
-                        rhs_gbias_slice = tiled_rhs_ref.get_groupbias()
-                        block_lhs_sum = jnp.sum(block_lhs,
-                                                axis=1,
-                                                keepdims=True)
-                        block_acc += (
-                            rhs_gbias_slice[b_id, :, start_n:end_n] *
-                            block_lhs_sum).astype(acc_ref.dtype)
+                        # Apply rhs subchannel scale per rhs quant block. Clamp
+                        # the block index to the real blocks held in the buffer:
+                        # tile_k may over-align past size_k (when size_k is not a
+                        # multiple of num_lanes), so the scale/groupbias buffer
+                        # holds only num_quant_blocks_per_tile_k_read blocks. The
+                        # over-aligned tail's rhs/lhs are already zeroed by the
+                        # k-tail mask.
+                        if cfgs.rhs_cfgs.has_scale:
+                            b_id = min(k0 // rhs_qbs,
+                                       cfgs.num_quant_blocks_per_tile_k_read - 1)
+                            rhs_scale_slice = tiled_rhs_ref.get_scale()
+                            sub_acc *= rhs_scale_slice[b_id, :,
+                                                       start_n:end_n].astype(
+                                                           acc_ref.dtype)
 
-                    acc_n += block_acc
+                        # Per-group additive bias (MLX affine: w = scale*q +
+                        # bias). Use the full-precision lhs (not the quantized
+                        # one) for the sum_k lhs[t, k] term; added before
+                        # fuse_act.
+                        if cfgs.rhs_cfgs.has_groupbias:
+                            b_id = min(k0 // rhs_qbs,
+                                       cfgs.num_quant_blocks_per_tile_k_read - 1)
+                            rhs_gbias_slice = tiled_rhs_ref.get_groupbias()
+                            sub_lhs_sum = jnp.sum(block_lhs[:, sub:sub_end],
+                                                  axis=1,
+                                                  keepdims=True)
+                            sub_acc += (
+                                rhs_gbias_slice[b_id, :, start_n:end_n] *
+                                sub_lhs_sum).astype(acc_ref.dtype)
+
+                        acc_n += sub_acc
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 

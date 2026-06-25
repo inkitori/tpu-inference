@@ -156,23 +156,26 @@ def gmm_wrapper(lhs,
                 fuse_act=None,
                 preferred_element_type=None):
     # The MLX affine path (rhs_groupbias is not None) reconstructs the weight
-    # per quant-block as ``w = scale*q + groupbias`` and uses fine-grained quant
-    # blocks (e.g. group_size=64 -> num_blocks>1 along the contraction dim). The
-    # quantized-lhs fast path in gmm_v2 strides the k-loop by the 512-wide lhs
-    # quant block and indexes the rhs scale/groupbias by ``start_k // rhs_block``
-    # -- so when the rhs block is finer than 512 the per-block scale/groupbias is
-    # mis-applied (collapses to b_id=0), silently corrupting the result. Keep the
-    # lhs full-precision for the affine path so each rhs quant block gets its own
-    # scale/groupbias (verified exact vs the load-time dequant; see the e2e gate
-    # and tests/kernels/megablox/test_gmm_v2_groupbias.py).
+    # per quant-block as ``w = scale*q + groupbias`` with fine-grained quant
+    # blocks (group_size=64 -> num_blocks>1 along the contraction dim). gmm_v2's
+    # quantized-lhs (W4A8 / int8 activation) k-loop is now CORRECT for this case:
+    # it quantizes the lhs once per 512-wide block, then applies the per-rhs-
+    # quant-block (64-wide) scale/groupbias on inner sub-block matmuls (see the
+    # quantized matmul path in gmm_v2.py). It is therefore coherence-safe --
+    # scratch_mlx_int4/moe_gmm_bench.py measures W4A8 rel_L2 ~2.5e-2 vs W4A16
+    # ~1.8e-3 (only modestly worse, not corrupted).
+    #
+    # We still keep the affine path on bf16 lhs (W4A16), because at the real
+    # decode shape (M=128, 8 active experts, group_size=64) W4A8 is ~1.3-1.5x
+    # SLOWER: the grouped int4 weight load is the decode bottleneck (memory-
+    # bound), and the required per-64-sub-block int8 matmuls + lhs quant +
+    # int4->int8 upcast add VPU/MXU overhead without relieving it (see the
+    # moe_gmm_bench speed table). Flip this to True if a future shape makes W4A8
+    # a win; the kernel is ready.
     #
     # Every non-affine path (bf16 and the symmetric W4A8 int4 path) passes
     # rhs_groupbias=None, so this conditional leaves their maybe_quantize_lhs=True
-    # BYTE-IDENTICAL and they keep the quantized-lhs fast path. (W4A8 is NOT safe
-    # because it is single-block -- it is grouped/multi-block in general; the
-    # group_size==hidden_size unit test merely happens to be single-block. The
-    # reason it is unaffected is solely that it never sets rhs_groupbias, so it
-    # never enters the affine reconstruction this branch guards.)
+    # BYTE-IDENTICAL and they keep the quantized-lhs fast path.
     maybe_quantize_lhs = rhs_groupbias is None
     gmm_res = gmm_v2(
         lhs=lhs,
