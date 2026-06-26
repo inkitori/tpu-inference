@@ -220,7 +220,12 @@ class DFlashTorchaxWrapper:
 
                 target_h = torch_view(target_hidden).unsqueeze(0)  # (1, C, D')
                 pos = torch_view(position_ids).unsqueeze(0)  # (1, C+B)
-                mask = torch_view(attention_mask).unsqueeze(0)  # (1, C+B)
+                # attention_mask is an additive float bias (bf16) of shape
+                # (C+B,). Reshape to (1, 1, 1, C+B) so it broadcasts over the
+                # KEY (last) axis of attn_weights (1, H, B, C+B) in the HF
+                # eager_attention_forward add -- masks keys, never queries.
+                mask = torch_view(attention_mask).reshape(1, 1, 1,
+                                                          -1)  # (1,1,1,C+B)
 
                 output = torch.func.functional_call(
                     model,

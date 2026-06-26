@@ -149,9 +149,13 @@ class DFlashTorchaxProposer:
             position_ids = device_array(
                 self.mesh,
                 jnp.zeros((padded_ctx + self.block_size, ), dtype=jnp.int32))
+            # Additive float bias; all-zeros = "no padding masked" is a valid
+            # warm-up case. Dtype/shape MUST match prepare_inputs() so the JIT
+            # signature is shared (bf16, shape (C+B,)).
             attention_mask = device_array(
                 self.mesh,
-                jnp.zeros((padded_ctx + self.block_size, ), dtype=jnp.int32))
+                jnp.zeros((padded_ctx + self.block_size, ),
+                          dtype=jnp.bfloat16))
 
             hidden = self._draft_forward_fn(
                 self._params,
@@ -264,8 +268,22 @@ class DFlashTorchaxProposer:
                            self._ctx_len)
         position_ids = jnp.concatenate([ctx_positions, noise_positions])
 
-        ctx_mask = (jnp.arange(padded_ctx) < self._ctx_len).astype(jnp.int32)
-        noise_mask = jnp.ones(self.block_size, dtype=jnp.int32)
+        # Additive float bias (NOT a {0,1} multiplicative mask): the cached HF
+        # DFlash draft adds attention_mask straight onto attn_weights
+        # (eager_attention_forward: attn_weights = attn_weights + mask) with no
+        # _prepare_4d_attention_mask conversion. So padding ctx keys must get a
+        # large-negative bias (-> ~0 softmax weight) and every real ctx/noise
+        # key must get 0.0. Use dtype-min (not literal -inf) to match HF's
+        # AttentionMaskConverter and avoid NaN. Bias is bf16 (the compute dtype
+        # the attn add/softmax see), shape (C+B,); reshaped to broadcast over
+        # the KEY axis of attn_weights (1, H, B, C+B) downstream.
+        neg = jnp.finfo(jnp.bfloat16).min
+        ctx_mask = jnp.where(
+            jnp.arange(padded_ctx) < self._ctx_len,
+            jnp.zeros(padded_ctx, dtype=jnp.bfloat16),
+            jnp.full((padded_ctx, ), neg, dtype=jnp.bfloat16),
+        )
+        noise_mask = jnp.zeros(self.block_size, dtype=jnp.bfloat16)
         attention_mask = jnp.concatenate([ctx_mask, noise_mask])
 
         target_hidden_states = (ctx_padded, position_ids, attention_mask)
