@@ -98,10 +98,14 @@ class _DFlashRunner(torch.nn.Module):
     @staticmethod
     def _compute_logits(
         hidden_state: torch.Tensor,
-        embed_weight: torch.Tensor,
+        logits_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Logits via tied embeddings: hidden @ embed^T."""
-        return torch.nn.functional.linear(hidden_state, embed_weight)
+        """Draft logits: hidden @ W^T, where W is the target's OUTPUT
+        projection (lm_head). For an untied target (gpt-oss) this is a
+        distinct matrix from the input embedding; the proposer passes
+        ``lm_head_weight_jax`` here, falling back to the embedding only when
+        the target ties them."""
+        return torch.nn.functional.linear(hidden_state, logits_weight)
 
 
 class DFlashTorchaxWrapper:
@@ -113,6 +117,12 @@ class DFlashTorchaxWrapper:
         self.model: _DFlashRunner | None = None
         self.params: dict | None = None
         self.embed_weight_jax: jax.Array | None = None
+        # Output projection (lm_head) weight used to turn draft hidden states
+        # into draft logits. For a target with tie_word_embeddings=False (e.g.
+        # gpt-oss) this is a DISTINCT matrix from the input embedding, so it
+        # must be captured separately. Falls back to the input embedding when
+        # the target ties them.
+        self.lm_head_weight_jax: jax.Array | None = None
 
     def load(
         self,
@@ -139,11 +149,15 @@ class DFlashTorchaxWrapper:
         # so JAX JIT can trace through them.
         self.params = jax_view(self.params)
 
-        # Share embedding from the target model. The DFlash draft model owns
-        # NO embedding / lm_head of its own (tie_word_embeddings=False but the
-        # custom modeling code consumes a `noise_embedding` and external logits),
-        # so it must reuse the target's input-embedding weight for both the
-        # noise embedding and the (tied) compute_logits projection.
+        # Share weights from the target model. The DFlash draft model owns NO
+        # embedding / lm_head of its own; the custom modeling code consumes a
+        # `noise_embedding` (built from the target INPUT embedding) and projects
+        # its output through the target OUTPUT projection (lm_head). For an
+        # untied target (gpt-oss: tie_word_embeddings=False) these are two
+        # DISTINCT matrices, so we capture both: the input embedding for the
+        # noise embedding, and lm_head for the draft logits. The HF DFlash
+        # reference does exactly this: noise_embedding = target.embed_tokens(.),
+        # draft_logits = target.lm_head(draft_hidden).
         #
         # Two backends pass different target_model_state shapes:
         #  - flax_nnx target: an nnx.State whose `.model.embed_tokens`/`.embed`
@@ -161,6 +175,18 @@ class DFlashTorchaxWrapper:
             ):
                 if key in target_model_state:
                     self.embed_weight_jax = target_model_state[key]
+                    break
+            # The draft logits use the target's OUTPUT projection (lm_head),
+            # NOT the input embedding. These are the same weight only when the
+            # target ties them; gpt-oss has tie_word_embeddings=False, so the
+            # lm_head is a separate [vocab, hidden] matrix. Capture it here and
+            # fall back to the input embedding for tied targets.
+            for key in (
+                    "vllm_model.lm_head.weight",
+                    "lm_head.weight",
+            ):
+                if key in target_model_state:
+                    self.lm_head_weight_jax = target_model_state[key]
                     break
         else:
             target_model = getattr(target_model_state, "model", None)
@@ -186,6 +212,15 @@ class DFlashTorchaxWrapper:
         if self.embed_weight_jax is None:
             raise RuntimeError(
                 "Could not find target model embedding to share with DFlash")
+
+        # Tied-embedding targets expose no separate lm_head weight; reuse the
+        # input embedding for the logits projection in that case.
+        if self.lm_head_weight_jax is None:
+            logger.info(
+                "No separate target lm_head weight found; assuming tied "
+                "embeddings and using the input embedding for DFlash draft "
+                "logits.")
+            self.lm_head_weight_jax = self.embed_weight_jax
 
         logger.info("DFlash torchax wrapper loaded successfully.")
 
@@ -280,7 +315,10 @@ class DFlashTorchaxWrapper:
 
         Signature::
 
-            logits_fn(params, hidden_states, embed_weight) -> logits
+            logits_fn(params, hidden_states, logits_weight) -> logits
+
+        ``logits_weight`` is the target's OUTPUT projection (lm_head), not the
+        input embedding (they differ for an untied target like gpt-oss).
         """
         model = self.model
 
@@ -293,12 +331,12 @@ class DFlashTorchaxWrapper:
         def logits_fn(
             params: dict,
             hidden_states: jax.Array,
-            embed_weight: jax.Array,
+            logits_weight: jax.Array,
         ) -> jax.Array:
             with torchax.default_env():
                 p = torch_view(params)
                 h = torch_view(hidden_states)
-                w = torch_view(embed_weight)
+                w = torch_view(logits_weight)
                 out = torch.func.functional_call(
                     model,
                     p,

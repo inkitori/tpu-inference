@@ -88,6 +88,10 @@ class DFlashTorchaxProposer:
         self._compute_logits_fn = None
         self._params: Optional[dict] = None
         self._embed_weight: Optional[jax.Array] = None
+        # Target output projection (lm_head); distinct from _embed_weight when
+        # the target does not tie its embeddings (e.g. gpt-oss). Used for draft
+        # logits, NOT for the noise embedding.
+        self._lm_head_weight: Optional[jax.Array] = None
 
     def load_model(self, target_model: Any) -> None:
         """Load the DFlash draft model via torchax and share embeddings."""
@@ -99,6 +103,7 @@ class DFlashTorchaxProposer:
         self._compute_logits_fn = self._wrapper.get_compute_logits_fn()
         self._params = self._wrapper.params
         self._embed_weight = self._wrapper.embed_weight_jax
+        self._lm_head_weight = self._wrapper.lm_head_weight_jax
 
         buf_len = self._next_padded_size(self.max_model_len)
         self._ctx_buf = jnp.zeros((buf_len, self._raw_hidden_dim),
@@ -166,7 +171,7 @@ class DFlashTorchaxProposer:
                 attention_mask,
             )
             _ = self._sample_block_draft_tokens(self._params, hidden,
-                                                self._embed_weight)
+                                                self._lm_head_weight)
 
         _ = self._build_noise_block(seq_len_arr, next_token_ids,
                                     self.mask_token_id, self.block_size)
@@ -205,10 +210,12 @@ class DFlashTorchaxProposer:
         self,
         params: dict,
         hidden_states: jax.Array,
-        embed_weight: jax.Array,
+        logits_weight: jax.Array,
     ) -> jax.Array:
+        # logits_weight is the target's OUTPUT projection (lm_head), which is a
+        # different matrix from the input embedding for untied targets.
         draft_hidden = hidden_states[1:1 + self.num_speculative_tokens]
-        logits = self._compute_logits_fn(params, draft_hidden, embed_weight)
+        logits = self._compute_logits_fn(params, draft_hidden, logits_weight)
         return jnp.argmax(logits, axis=-1)
 
     def prepare_inputs(
@@ -339,7 +346,7 @@ class DFlashTorchaxProposer:
         )
 
         draft_token_ids = self._sample_block_draft_tokens(
-            self._params, hidden_states, self._embed_weight)
+            self._params, hidden_states, self._lm_head_weight)
 
         if draft_token_ids.ndim == 1:
             draft_token_ids = draft_token_ids[jnp.newaxis, :]
