@@ -73,8 +73,10 @@ class _DFlashRunner(torch.nn.Module):
                            target hidden states (NOT yet projected).
             position_ids: (1, ctx_len + block_size) positions for RoPE
                           covering both context and noise.
-            attention_mask: (1, ctx_len + block_size) binary mask where 1
-                           indicates a valid position and 0 indicates padding.
+            attention_mask: (1, 1, 1, ctx_len + block_size) additive float
+                           bias (bf16): 0.0 for valid ctx/noise keys and
+                           finfo(bf16).min for padding ctx keys. Added
+                           directly onto attn_weights in eager attention.
         Returns:
             hidden_states: (1, block_size, D) – the draft model output
                            after the final norm (before lm_head).
