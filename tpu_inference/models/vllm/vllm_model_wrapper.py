@@ -345,7 +345,12 @@ class VllmModelWrapper:
                     # torch_view creates a torchax tensor sharing memory with the JAX array
                     param.data = torchax.interop.torch_view(target_param)
 
-        if self.vllm_config.speculative_config and self.vllm_config.speculative_config.method == "eagle3" and not self.is_draft_model:
+        if self.vllm_config.speculative_config and self.vllm_config.speculative_config.method in (
+                "eagle3", "dflash") and not self.is_draft_model:
+            # DFlash also captures auxiliary hidden states from the target via
+            # the eagle3 hook; set_eagle3_aux_hidden_state_layers reads the
+            # draft's dflash_config.target_layer_ids (with the +1 output-of-layer
+            # conversion) when method == "dflash".
             set_eagle3_aux_hidden_state_layers(
                 vllm_model, self.vllm_config.speculative_config)
 
@@ -457,7 +462,8 @@ class VllmModelWrapper:
             if not is_last_rank:
                 output = JaxIntermediateTensors.from_torch(output_from_torch)
             else:
-                if self.vllm_config.speculative_config and self.vllm_config.speculative_config.method == "eagle3":
+                if self.vllm_config.speculative_config and self.vllm_config.speculative_config.method in (
+                        "eagle3", "dflash"):
                     output, aux_hidden_states = jax_view(output_from_torch)
                 else:
                     output = jax_view(output_from_torch)

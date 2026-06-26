@@ -137,29 +137,50 @@ class DFlashTorchaxWrapper:
         # so JAX JIT can trace through them.
         self.params = jax_view(self.params)
 
-        # Share embedding from the target model (for compute_logits).
-        # target_model_state is an nnx.State for the JAX/flax_nnx backend;
-        # the vllm/torchax backend passes a params dict instead, which has
-        # no `.model` attribute -- skip embedding sharing in that case.
-        target_model = getattr(target_model_state, "model", None)
-        embed = None
-        if target_model is not None:
-            embed = getattr(target_model, "embed_tokens", None)
-            if embed is None:
-                embed = getattr(target_model, "embed", None)
-        if embed is not None:
-            if hasattr(embed, "embedding"):
-                w = embed.embedding
-                # Unwrap nnx.Param → raw jax.Array
-                self.embed_weight_jax = w.value if hasattr(w, "value") else w
-            elif hasattr(embed, "weight"):
-                w = embed.weight
-                if hasattr(w, "value"):
-                    self.embed_weight_jax = w.value
-                elif isinstance(w, torch.Tensor):
-                    self.embed_weight_jax = jax_view(w)
-                else:
-                    self.embed_weight_jax = w
+        # Share embedding from the target model. The DFlash draft model owns
+        # NO embedding / lm_head of its own (tie_word_embeddings=False but the
+        # custom modeling code consumes a `noise_embedding` and external logits),
+        # so it must reuse the target's input-embedding weight for both the
+        # noise embedding and the (tied) compute_logits projection.
+        #
+        # Two backends pass different target_model_state shapes:
+        #  - flax_nnx target: an nnx.State whose `.model.embed_tokens`/`.embed`
+        #    exposes the embedding (`.embedding` or `.weight`).
+        #  - vllm/torchax target (our gpt-oss path): a flat params dict of
+        #    jax.Arrays keyed by torch-style fully-qualified names. The gpt-oss
+        #    input embedding lives at `vllm_model.model.embedding.weight`
+        #    (VocabParallelEmbedding, replicated global jax.Array [vocab, hidden]).
+        if isinstance(target_model_state, dict):
+            for key in (
+                    "vllm_model.model.embedding.weight",
+                    "vllm_model.model.embed_tokens.weight",
+                    "model.embedding.weight",
+                    "model.embed_tokens.weight",
+            ):
+                if key in target_model_state:
+                    self.embed_weight_jax = target_model_state[key]
+                    break
+        else:
+            target_model = getattr(target_model_state, "model", None)
+            embed = None
+            if target_model is not None:
+                embed = getattr(target_model, "embed_tokens", None)
+                if embed is None:
+                    embed = getattr(target_model, "embed", None)
+            if embed is not None:
+                if hasattr(embed, "embedding"):
+                    w = embed.embedding
+                    # Unwrap nnx.Param → raw jax.Array
+                    self.embed_weight_jax = w.value if hasattr(w,
+                                                               "value") else w
+                elif hasattr(embed, "weight"):
+                    w = embed.weight
+                    if hasattr(w, "value"):
+                        self.embed_weight_jax = w.value
+                    elif isinstance(w, torch.Tensor):
+                        self.embed_weight_jax = jax_view(w)
+                    else:
+                        self.embed_weight_jax = w
         if self.embed_weight_jax is None:
             raise RuntimeError(
                 "Could not find target model embedding to share with DFlash")
