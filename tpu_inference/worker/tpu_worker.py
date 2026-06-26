@@ -540,6 +540,21 @@ class TPUWorker(WorkerBase):
     def load_model(self) -> None:
         self.model_runner.load_model()
 
+    def shutdown(self) -> None:
+        """Release the model's JAX device arrays so HBM is freed.
+
+        vLLM's engine teardown chain (InprocClient.shutdown ->
+        EngineCore.shutdown -> executor.shutdown -> worker.shutdown) expects the
+        worker to drop its resources here; the base WorkerBase.shutdown is a
+        no-op. On the JAX/torchax path the model params and KV cache live as JAX
+        device arrays on the runner, and a plain `del LLM` does not reach this
+        method nor collect those arrays promptly, so HBM stays pinned (a second
+        in-process LLM then fails its memory check). Delegate to the runner to
+        delete them explicitly."""
+        runner = getattr(self, "model_runner", None)
+        if runner is not None and hasattr(runner, "release_device_memory"):
+            runner.release_device_memory()
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         self.model_runner.capture_model()
         # Reset the seed to ensure that the random state is not affected by

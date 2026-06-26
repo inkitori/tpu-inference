@@ -570,6 +570,36 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
 
+    def release_device_memory(self) -> None:
+        """Delete the model's JAX device arrays to free HBM.
+
+        Called from TPUWorker.shutdown (via vLLM's engine teardown chain) so
+        that a `del LLM` actually releases TPU HBM. Without this, the model
+        params (``state``/``state_leaves``) and ``kv_caches`` stay resident and
+        a second in-process LLM fails its available-memory check.
+        """
+
+        def _delete_leaves(tree):
+            for leaf in jax.tree_util.tree_leaves(tree):
+                if isinstance(leaf, jax.Array):
+                    try:
+                        leaf.delete()
+                    except Exception:
+                        pass
+
+        for attr in ("state", "state_leaves", "kv_caches"):
+            tree = getattr(self, attr, None)
+            if tree is not None:
+                _delete_leaves(tree)
+                setattr(self, attr,
+                        [] if attr == "kv_caches" else None)
+        self.model = None
+        self.model_fn = None
+        try:
+            jax.clear_caches()
+        except Exception:
+            pass
+
     def _init_random(self):
         if self.model_config.seed is None:
             self.model_config.seed = 0

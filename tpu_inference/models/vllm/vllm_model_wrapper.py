@@ -242,6 +242,20 @@ class VllmModelWrapper:
 
         self._apply_pp_patch()
 
+    def modules(self):
+        """No-op nn.Module-compatible shim for vLLM's engine cleanup.
+
+        New vLLM (>= cc7981599) registers a weakref finalizer
+        (LLMEngine._cleanup_instance_caches) on the driver model that iterates
+        ``model.modules()`` to drop ``TorchCompileWithNoGuardsWrapper`` bytecode
+        hooks pinning compiled GPU code. The torchax/JAX path has no such
+        torch.compile wrappers and no nn.Module tree here, so there is nothing
+        to clean up. Returning an empty iterable lets the finalizer run cleanly;
+        without this shim the AttributeError aborts cleanup and leaves the
+        previous engine's HBM pinned (the next LLM then fails its memory check).
+        """
+        return iter(())
+
     def _apply_pp_patch(self):
         # patch `get_pp_group` in vLLM to jax's get_pp_group.
         import sys

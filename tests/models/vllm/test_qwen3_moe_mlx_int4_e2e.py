@@ -131,6 +131,11 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference(tensor_parallel_size):
                   enforce_eager=True, dtype="bfloat16",
                   load_format="tpu_streaming_loader")
         out_mlx = mlx.generate({"prompt_token_ids": prompt_ids}, sp)
+        # Explicitly shut the engine down so the TPU worker releases its JAX
+        # device arrays (HBM). A plain `del` does not reach worker.shutdown, so
+        # without this the first model's HBM stays pinned and the second
+        # (reference) LLM fails its available-memory check.
+        mlx.llm_engine.engine_core.shutdown()
         del mlx
         time.sleep(10)  # Wait for the TPU to be released before the next LLM.
 
@@ -138,6 +143,7 @@ def test_synthetic_mlx_moe_logits_match_bf16_reference(tensor_parallel_size):
                   tensor_parallel_size=tensor_parallel_size, max_model_len=64,
                   enforce_eager=True, dtype="bfloat16")
         out_ref = ref.generate({"prompt_token_ids": prompt_ids}, sp)
+        ref.llm_engine.engine_core.shutdown()
         del ref
         time.sleep(10)  # Wait for the TPU to be released.
 
