@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -1662,6 +1663,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             draft_token_ids = self._extract_draft_token_ids(
                 input_ids, spec_decode_metadata.final_logits_indices,
                 spec_decode_metadata.target_logits_indices)
+            if os.environ.get("DFLASH_PERFECT_DRAFT", "0") == "1":
+                # DIAGNOSTIC (GOAL ladder #1): inject the target's own greedy
+                # tokens as the draft proposals. With greedy verification this
+                # must yield ~100% acceptance; anything less reveals a bug in
+                # the verify/alignment path rather than in the DFlash drafter.
+                draft_token_ids = jnp.argmax(target_logits,
+                                             axis=-1).astype(draft_token_ids.dtype)
             next_tokens = self.rejection_sampler(
                 draft_token_ids=draft_token_ids,
                 num_draft_tokens=spec_decode_metadata.draft_lengths,
