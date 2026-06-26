@@ -167,7 +167,13 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                     w2_weight_scale=None,
                     w2_bias=w2_bias,
                 ),
-                jnp.float4_e2m1fn,
+                # LOCAL WORKAROUND (v6e lacks native float4_e2m1fn Mosaic
+                # lowering): requantize MoE experts to float8_e4m3fn instead of
+                # packed FP4 so the gmm_v2 kernel avoids the unsupported
+                # tpu.unpack_subelements(f4E2M1FN) op. We use e4m3fn (not e5m2)
+                # because gmm_v2 sets lhs_q_dtype=float8_e4m3fn and Mosaic
+                # cannot lower an e5m2->e4m3fn cast. See STATE.md.
+                jnp.float8_e4m3fn,
                 REQUANTIZED_BLOCK_SIZE,
                 w13_interleave=w13_interleave,
             )
