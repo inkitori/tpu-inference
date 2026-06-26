@@ -31,10 +31,12 @@ from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.layers import FlaxUtils
-from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear
+from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
-from tpu_inference.layers.jax.rope_interface import apply_rope
+from tpu_inference.layers.jax.rope_interface import (apply_rope,
+                                                     get_rope_scaling,
+                                                     get_rope_theta)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
@@ -114,8 +116,8 @@ class Qwen2Attention(JaxModule):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.rope_theta = config.rope_parameters["rope_theta"]
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_theta = get_rope_theta(config, default=1000000.0)
+        self.rope_scaling = get_rope_scaling(config)
 
         self.head_dim_original = getattr(config, "head_dim",
                                          self.hidden_size // self.num_heads)
@@ -397,12 +399,11 @@ class Qwen2ForCausalLM(JaxModule, LoadableWithIterator):
             hidden_size = getattr(
                 model_config.hf_config, 'hidden_size',
                 model_config.hf_config.text_config.hidden_size)
-            self.lm_head = JaxEinsum(
-                einsum_str="TD,DV->TV",
-                kernel_shape=(hidden_size, vocab_size),
+            self.lm_head = JaxLmHead(
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
                 dtype=model_config.dtype,
                 rngs=rng,
-                quant_config=vllm_config.quant_config,
                 prefix="lm_head",
             )
 
@@ -420,7 +421,7 @@ class Qwen2ForCausalLM(JaxModule, LoadableWithIterator):
         is_last_rank: bool = True,
         *args,
     ) -> Tuple[List[jax.Array], jax.Array | JaxIntermediateTensors,
-               List[jax.Array]]:
+               List[jax.Array], Optional[jax.Array]]:
         if not is_first_rank:
             assert intermediate_tensors is not None
             inputs_embeds = intermediate_tensors["hidden_states"]
@@ -432,7 +433,7 @@ class Qwen2ForCausalLM(JaxModule, LoadableWithIterator):
         )
         if not is_last_rank:
             x = JaxIntermediateTensors(tensors={"hidden_states": x}, )
-        return kv_caches, x, []
+        return kv_caches, x, [], None
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if hasattr(self, 'lm_head'):

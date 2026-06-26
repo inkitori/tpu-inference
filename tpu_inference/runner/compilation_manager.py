@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import jax
@@ -23,15 +26,23 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 import tpu_inference.envs as envs
 from tpu_inference.core.disagg_utils import is_disagg_enabled
+from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.jax.sample.sampling import sample
+from tpu_inference.layers.jax.sample.sampling import (
+    compute_and_gather_logprobs, compute_and_gather_prompt_logprobs, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
-from tpu_inference.utils import device_array, to_jax_dtype
+from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
+from tpu_inference.runner.utils import SpecDecodeMetadata
+from tpu_inference.spec_decode.jax.utils import (
+    concat_last_sampled_tokens_and_draft_tokens, extend_logits_simple,
+    extract_last_sampled_tokens, process_and_extend_logits)
+from tpu_inference.utils import (device_array, get_mesh_shape_product,
+                                 time_function, to_jax_dtype)
 
 if TYPE_CHECKING:
     from tpu_inference.runner.tpu_runner import TPUModelRunner
@@ -58,12 +69,46 @@ class CompilationManager:
                                   -1)
                 jax.config.update("jax_persistent_cache_min_compile_time_secs",
                                   -1)
+        # Thread pool for parallel XLA compilation. NUM_PRECOMPILE_WORKERS=1
+        # disables the pool and runs compilations sequentially in the main
+        # thread.
+        num_workers = envs.NUM_PRECOMPILE_WORKERS
+        self._prev_stack_size: Optional[int] = None
+        if num_workers == 1:
+            self._compile_executor = None
+        else:
+            # Pool threads default to the system thread stack size (~8MB on
+            # Linux), much smaller than the main thread. XLA lowering overflows
+            # that stack on large graphs. Bump the default stack size.
+            try:
+                self._prev_stack_size = threading.stack_size()
+                threading.stack_size(64 * 1024 * 1024)
+            except (RuntimeError, ValueError):
+                self._prev_stack_size = None
+            logger.info(
+                "Parallel AOT compilation enabled (NUM_PRECOMPILE_WORKERS=%d).",
+                num_workers)
+            self._compile_executor = ThreadPoolExecutor(
+                max_workers=num_workers, thread_name_prefix="aot_compilation")
+        self._compile_futures: list[Future] = []
+        self._warmup_tasks: list = []
 
     def _create_dummy_tensor(self,
                              shape: Tuple[int, ...],
                              dtype: Any,
                              sharding: Optional[NamedSharding] = None) -> Any:
         """Helper to create dummy tensors for precompilation."""
+        if len(shape) > 1:
+            # Use parallel_config as the primary source of truth during initialization
+            # to avoid AttributeError when self.runner.mesh is not yet assigned (common in unit tests).
+            tp_size = 1
+            if self.runner.vllm_config.parallel_config is not None:
+                tp_size = self.runner.vllm_config.parallel_config.tensor_parallel_size
+            elif hasattr(self.runner, 'mesh') and self.runner.mesh is not None:
+                tp_size = self.runner.mesh.shape.get(ShardingAxisName.MODEL, 1)
+            assert shape[
+                1] % tp_size == 0, f"Dimension size {shape[1]} is not divisible by TP size {tp_size} for shape {shape}"
+
         tensor = jnp.ones(shape, dtype=to_jax_dtype(dtype))
         if sharding:
             return device_array(self.runner.mesh, tensor, sharding=sharding)
@@ -81,56 +126,184 @@ class CompilationManager:
                          fn: Callable,
                          *args,
                          call_kwargs=dict(),
+                         warmup_handler: Optional[Callable] = None,
+                         aot: bool = True,
                          **kwargs) -> None:
-        logger.info(f"Precompile {name} --> {kwargs}")
-        start = time.perf_counter()
-        result = fn(*args, **call_kwargs)
-        jax.tree.map(lambda r: r.block_until_ready(), result)
-        end = time.perf_counter()
-        logger.info("Compilation finished in %.2f [secs].", end - start)
+        log_name = f"{name} --> {kwargs}"
+        logger.info(f"Precompile {log_name}")
+        # Unwrap functools.partial so the underlying jit's static_argnums are
+        # respected.
+        while isinstance(fn, functools.partial):
+            args = fn.args + args
+            call_kwargs = {**fn.keywords, **call_kwargs}
+            fn = fn.func
+        self._warmup_tasks.append(
+            (name, fn, args, call_kwargs, warmup_handler))
+        if not aot or not hasattr(fn, 'lower'):
+            # Skip AOT when the caller opts out, or when fn is unjitted.
+            # The warmup pass will run fn() and populate the inner-jit caches.
+            reason = "aot=False" if not aot else "not a jit"
+            logger.info(
+                "AOT lower skipped for %s (%s); will compile in warmup.", name,
+                reason)
+            return
+        try:
+            lowered = fn.lower(*args, **call_kwargs)
+        except Exception as e:
+            # AOT lower not supported here (e.g. a jit whose body contains a
+            # nested jit with compiler_options). Fall back to warmup-only — the
+            # warmup pass will trigger inline compile.
+            logger.info(
+                "AOT lower skipped for %s (%r); will compile in warmup.", name,
+                e)
+            return
 
+        # Compilation is thread-safe
+        def _compile(lowered, name, mesh):
+            with jax.set_mesh(mesh):
+                start = time.perf_counter()
+                compiled = lowered.compile()
+                elapsed = time.perf_counter() - start
+                logger.info("Compilation of %s finished in %.2f [secs].", name,
+                            elapsed)
+                return compiled
+
+        if self._compile_executor is None:
+            _compile(lowered, log_name, self.runner.mesh)
+        else:
+            future = self._compile_executor.submit(_compile, lowered, log_name,
+                                                   self.runner.mesh)
+            self._compile_futures.append(future)
+
+    def _flush_compilations(self) -> None:
+        """Wait for all currently-pending background compilations and run their
+        warmups.
+        """
+        futures, self._compile_futures = self._compile_futures, []
+        tasks, self._warmup_tasks = self._warmup_tasks, []
+
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Compilation failed: {e}\n"
+                    "Hint: if you are seeing memory errors or stack overflows "
+                    "during parallel precompilation, try lowering "
+                    "NUM_PRECOMPILE_WORKERS (e.g. NUM_PRECOMPILE_WORKERS=1 "
+                    "runs all compilations sequentially in the main thread)."
+                ) from e
+
+        warmup_start = time.perf_counter()
+        with jax.set_mesh(self.runner.mesh):
+            for name, fn, args, call_kwargs, warmup_handler in tasks:
+                if warmup_handler is not None:
+                    out = warmup_handler(fn, args, call_kwargs)
+                else:
+                    out = fn(*args, **call_kwargs)
+                jax.tree.map(lambda r: r.block_until_ready(), out)
+        warmup_elapsed = time.perf_counter() - warmup_start
+        if tasks:
+            logger.info(
+                "Warm-up call pass finished in %.2f [secs] over %d tasks.",
+                warmup_elapsed, len(tasks))
+
+    @time_function
     def capture_model(self) -> None:
         if envs.SKIP_JAX_PRECOMPILE or self.runner.model_config.enforce_eager:
             return
         logger.info("Precompile all the subgraphs with possible input shapes.")
         compilation_start_time = time.perf_counter()
 
-        with self.runner.maybe_setup_dummy_loras(
-                self.runner.lora_config), jax.set_mesh(self.runner.mesh):
-            self._precompile_backbone_text_only()
-            if self.runner.is_multimodal_model:
-                if self.runner.precompile_vision_encoder_fn is not None:
-                    self.runner.precompile_vision_encoder_fn(
-                        self._run_compilation, )
-                self._precompile_input_embeddings_merger()
-                self._precompile_backbone_with_inputs_embeds()
-            if self.runner.scheduler_config.async_scheduling:
-                self._precompile_substitute_placeholder_token()
-            if not self.runner.is_last_rank:
-                return
-            self._precompile_select_from_array()
-            if not self.runner.is_pooling_model:
-                self._precompile_compute_logits()
-            else:
-                self._precompile_compute_pooling()
-            # Skip sampling if already precompiled before KV cache allocation
-            if not self._sampling_precompiled:
-                self._precompile_sampling()
-            self._precompile_disagg_utils()
-            # Skip gather_logprobs if already precompiled before KV cache allocation
-            if not self._gather_logprobs_precompiled:
-                self._precompile_gather_logprobs()
-            self._precompile_structured_decoding()
-            if self.runner.speculative_config:
-                self._precompile_speculative_decoding()
+        try:
+            with self.runner.maybe_setup_dummy_loras(
+                    self.runner.lora_config), jax.set_mesh(self.runner.mesh):
+                self._precompile_backbone_text_only()
+                self._flush_compilations()
+                if self.runner.is_multimodal_model:
+                    if self.runner.precompile_vision_encoder_fn is not None:
+                        self.runner.precompile_vision_encoder_fn(
+                            self._run_compilation, )
+                    self._precompile_input_embeddings_merger()
+                    self._flush_compilations()
+                    self._precompile_backbone_with_inputs_embeds()
+                    self._flush_compilations()
+                if self.runner.scheduler_config.async_scheduling:
+                    self._precompile_substitute_placeholder_token()
+                    self._flush_compilations()
+                    if self.runner.speculative_config:
+                        self._precompile_subtract_num_rejected_tokens()
+                        self._flush_compilations()
+                        self._precompile_concat_last_sampled_tokens_and_draft_tokens(
+                        )
+                        self._flush_compilations()
 
+                if not self.runner.is_last_rank:
+                    return
+                self._precompile_select_from_array()
+                self._flush_compilations()
+                if not self.runner.is_pooling_model:
+                    self._precompile_compute_logits()
+                else:
+                    self._precompile_compute_pooling()
+                self._flush_compilations()
+                # Skip sampling if already precompiled before KV cache allocation
+                if not self._sampling_precompiled:
+                    self._precompile_sampling()
+                    self._flush_compilations()
+                self._precompile_disagg_utils()
+                self._flush_compilations()
+                # Skip gather_logprobs if already precompiled before KV cache allocation
+                if not self._gather_logprobs_precompiled:
+                    self._precompile_gather_logprobs()
+                    self._flush_compilations()
+                self._precompile_structured_decoding()
+                self._flush_compilations()
+                if self.runner.speculative_config:
+                    self._precompile_speculative_decoding()
+                    self._flush_compilations()
+                if self.runner.enable_continue_decode:
+                    self._precompile_continue_decode()
+                    self._flush_compilations()
+        finally:
+            self._finalize_compilation()
         elapsed = time.perf_counter() - compilation_start_time
         self.runner.vllm_config.compilation_config.compilation_time += elapsed
+
+    def _finalize_compilation(self) -> None:
+        """Shut down the precompile pool and restore the thread stack default
+        so the bumped stack size doesn't leak to threads spawned later by the
+        engine."""
+        if self._compile_executor is not None:
+            self._compile_executor.shutdown(wait=True)
+            self._compile_executor = None
+        if self._prev_stack_size is not None:
+            try:
+                threading.stack_size(self._prev_stack_size)
+            except (RuntimeError, ValueError):
+                pass
+            self._prev_stack_size = None
 
     def _precompile_input_embeddings_merger(self) -> None:
         for num_tokens in self.runner.num_tokens_paddings:
             hidden_size = self.runner.vllm_config.model_config.get_hidden_size(
             )
+            hf_conf = self.runner.vllm_config.model_config.hf_config
+
+            # Identify multimodal embedding size
+            mm_hidden_size = hidden_size
+            vision_config = getattr(hf_conf, "vision_config", None)
+
+            if vision_config:
+                visual_dim = getattr(vision_config, "out_hidden_size", None)
+                deepstack_indexes = getattr(vision_config,
+                                            "deepstack_visual_indexes", None)
+
+                # If both exist, we apply the deepstack concat logic
+                if visual_dim is not None and deepstack_indexes is not None:
+                    deepstack_levels = len(deepstack_indexes)
+                    mm_hidden_size = visual_dim * (1 + deepstack_levels)
+
             sharding = NamedSharding(
                 self.runner.mesh,
                 PartitionSpec(ShardingAxisName.ATTN_DATA, None))
@@ -138,20 +311,21 @@ class CompilationManager:
                 self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
 
             dummy_multimodal_embeddings = self._create_dummy_tensor(
-                (num_tokens, hidden_size),
+                (num_tokens, mm_hidden_size),
                 self.runner.vllm_config.model_config.dtype,
                 sharding=sharding)
             dummy_input_ids = self._create_dummy_tensor(
                 (num_tokens, ), jnp.int32, sharding=input_sharding)
             dummy_is_multimodal = self._create_dummy_tensor(
-                (num_tokens, ), jnp.int32, sharding=input_sharding)
+                (num_tokens, ), jnp.bool_, sharding=input_sharding)
 
             self._run_compilation(
                 "input_embeddings_merger",
                 self.runner.embed_input_ids_fn,
-                self.runner.state,
+                self.runner.state_leaves,
                 dummy_input_ids,
-                dummy_multimodal_embeddings,
+                # Make _compute_deepstack_embeds happy.
+                [dummy_multimodal_embeddings],
                 call_kwargs={"is_multimodal": dummy_is_multimodal},
                 num_tokens=num_tokens,
             )
@@ -159,7 +333,7 @@ class CompilationManager:
             self._run_compilation(
                 "input_embeddings_merger_text_only",
                 self.runner.embed_input_ids_fn,
-                self.runner.state,
+                self.runner.state_leaves,
                 dummy_input_ids,
                 None,
                 call_kwargs={"is_multimodal": None},
@@ -174,7 +348,8 @@ class CompilationManager:
                                     inputs_embeds,
                                     intermediate_tensors=None,
                                     is_first_rank=True,
-                                    is_last_rank=True) -> None:
+                                    is_last_rank=True,
+                                    num_reqs: int) -> None:
         num_tokens = None
         if input_ids is not None:
             num_tokens = input_ids.shape[0]
@@ -197,6 +372,18 @@ class CompilationManager:
         request_distribution = device_array(self.runner.mesh,
                                             request_distribution,
                                             sharding=dp_sharding)
+        # Dummy mamba_state_indices for compile-cache pre-tracing. Only
+        # populate for hybrid attn+mamba models — for pure-attention models we
+        # pass None at runtime (see `_prepare_inputs`), and the precompile
+        # primer must match that shape so the cached HLO is reused.
+        if self.runner.kv_cache_config.has_mamba_layers:
+            mamba_state_indices = device_array(self.runner.mesh,
+                                               np.zeros(
+                                                   self.runner.max_num_reqs,
+                                                   dtype=np.int32),
+                                               sharding=dp_sharding)
+        else:
+            mamba_state_indices = None
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
@@ -216,6 +403,8 @@ class CompilationManager:
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
+                mamba_state_indices=mamba_state_indices,
+                padded_num_reqs=num_reqs,
             )
             return attention_metadata_gid
 
@@ -233,25 +422,22 @@ class CompilationManager:
                 for name in kv_cache_group.layer_names
             }
 
-        def model_fn_wrapper(
-            state,
-            kv_caches,
-            input_ids,
-            attention_metadata,
-            positions,
-            inputs_embeds,
-            layer_name_to_kvcache_index,
-            lora_metadata,
-            intermediate_tensors,
-            is_first_rank,
-            is_last_rank,
-        ):
-            kv_caches, hidden_states, _ = self.runner.model_fn(
-                state, kv_caches, input_ids, attention_metadata, inputs_embeds,
-                positions, layer_name_to_kvcache_index, lora_metadata,
-                intermediate_tensors, is_first_rank, is_last_rank)
-            self.runner.kv_caches = kv_caches
-            return hidden_states
+        def model_fn_warmup(_fn, _args, _call_kwargs):
+            out = self.runner.model_fn(
+                self.runner.state_leaves,
+                self.runner.kv_caches,
+                input_ids,
+                attention_metadata,
+                inputs_embeds,
+                positions,
+                tuple(self.runner.layer_name_to_kvcache_index.items()),
+                lora_metadata,
+                intermediate_tensors,
+                is_first_rank,
+                is_last_rank,
+            )
+            self.runner.kv_caches = out[0]
+            return out
 
         with self.runner.maybe_select_dummy_loras(
                 self.runner.lora_config, np.array([num_tokens],
@@ -259,74 +445,92 @@ class CompilationManager:
             lora_metadata = self.runner.lora_utils.extract_lora_metadata()
             self._run_compilation(
                 name,
-                model_fn_wrapper,
-                self.runner.state,
+                self.runner.model_fn,
+                self.runner.state_leaves,
                 self.runner.kv_caches,
                 input_ids,
                 attention_metadata,
-                positions,
                 inputs_embeds,
+                positions,
                 tuple(self.runner.layer_name_to_kvcache_index.items()),
                 lora_metadata,
                 intermediate_tensors,
                 is_first_rank,
                 is_last_rank,
                 num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                warmup_handler=model_fn_warmup,
             )
 
     def _precompile_substitute_placeholder_token(self) -> None:
-        """Precompiles the token substitution function for all expected input shapes.
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+        replicated_sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+        indices_sharding = NamedSharding(self.runner.mesh, PartitionSpec(None))
 
-        It iterates through all potential padded token lengths
-        (`num_tokens_paddings`) and request batch sizes (`num_reqs_paddings`)
-        that the scheduler is expected to handle, ensuring a compiled version
-        is ready for each combination.
-        """
+        def _compile_one(input_padding: int, input_sharding: NamedSharding,
+                         next_tokens_size: int,
+                         next_tokens_sharding: NamedSharding) -> None:
+            padded_token_in_tpu_cur_input_indices = np.zeros((input_padding, ),
+                                                             dtype=np.int32)
+            padded_token_in_tpu_pre_next_tokens_indices = np.zeros(
+                (input_padding, ), dtype=np.int32)
+            (padded_token_in_tpu_cur_input_indices,
+             padded_token_in_tpu_pre_next_tokens_indices) = device_array(
+                 self.runner.mesh,
+                 (padded_token_in_tpu_cur_input_indices,
+                  padded_token_in_tpu_pre_next_tokens_indices),
+                 sharding=indices_sharding)
+
+            input_ids = self._create_dummy_tensor((input_padding, ), jnp.int32,
+                                                  input_sharding)
+            next_tokens = self._create_dummy_tensor(
+                (next_tokens_size, ), jnp.int32, sharding=next_tokens_sharding)
+            placeholder_num = device_array(self.runner.mesh,
+                                           np.array([1], dtype=np.int32))
+            self._run_compilation(
+                "_substitute_placeholder_token_fn",
+                self.runner._substitute_placeholder_token_fn,
+                input_ids,
+                padded_token_in_tpu_cur_input_indices,
+                padded_token_in_tpu_pre_next_tokens_indices,
+                next_tokens,
+                placeholder_num,
+                num_tokens=input_padding,
+                next_tokens_size=next_tokens_size,
+            )
+
+        if self.runner.speculative_config:
+            num_spec_tokens = (
+                self.runner.speculative_config.num_speculative_tokens)
+            spec_next_tokens_size = self.runner.max_num_reqs * (
+                num_spec_tokens + 1)
+            for num_tokens in self.runner.num_tokens_paddings:
+                _compile_one(num_tokens, dp_sharding, spec_next_tokens_size,
+                             dp_sharding)
+            for num_logits in self.runner.num_logits_paddings:
+                _compile_one(num_logits, replicated_sharding,
+                             spec_next_tokens_size, dp_sharding)
+        else:
+            for num_tokens in self.runner.num_tokens_paddings:
+                for num_reqs in self.runner.num_reqs_paddings:
+                    _compile_one(num_tokens, dp_sharding, num_reqs,
+                                 replicated_sharding)
+
+    def _precompile_subtract_num_rejected_tokens(self) -> None:
+        from tpu_inference.runner.tpu_runner import \
+            _subtract_num_rejected_tokens_fn
+
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+        replicated_sharding = NamedSharding(self.runner.mesh,
+                                            PartitionSpec(None))
 
         for num_tokens in self.runner.num_tokens_paddings:
-            dp_sharding = NamedSharding(
-                self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
-
-            for num_reqs in self.runner.num_reqs_paddings:
-                padded_token_in_tpu_cur_input_indices = np.zeros(
-                    (num_tokens, ), dtype=np.int32)
-                padded_token_in_tpu_pre_next_tokens_indices = np.zeros(
-                    (num_tokens, ), dtype=jnp.int32)
-                (padded_token_in_tpu_cur_input_indices,
-                 padded_token_in_tpu_pre_next_tokens_indices) = device_array(
-                     self.runner.mesh,
-                     (padded_token_in_tpu_cur_input_indices,
-                      padded_token_in_tpu_pre_next_tokens_indices),
-                     sharding=NamedSharding(self.runner.mesh,
-                                            PartitionSpec(None)))
-
-                input_ids = self._create_dummy_tensor((num_tokens, ),
-                                                      jnp.int32, dp_sharding)
-                next_tokens = self._create_dummy_tensor(
-                    (num_reqs, ),
-                    jnp.int32,
-                    sharding=NamedSharding(self.runner.mesh, PartitionSpec()))
-
-                placeholder_num = jnp.asarray(1, dtype=jnp.int32)
-                self._run_compilation(
-                    "_substitute_placeholder_token_fn",
-                    self.runner._substitute_placeholder_token_fn,
-                    input_ids,
-                    padded_token_in_tpu_cur_input_indices,
-                    padded_token_in_tpu_pre_next_tokens_indices,
-                    next_tokens,
-                    placeholder_num,
-                    num_tokens=num_tokens,
-                    num_reqs=num_reqs,
-                )
-
-    def _precompile_backbone_text_only(self) -> None:
-        hidden_size = self.runner.model_config.get_hidden_size()
-        for num_tokens in self.runner.num_tokens_paddings:
-            dp_sharding = NamedSharding(
-                self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
-            input_ids = self._create_dummy_tensor((num_tokens, ), jnp.int32,
-                                                  dp_sharding)
+            # `_subtract_num_rejected_tokens_fn` donates seq_lens and positions
+            # (donate_argnums=(0, 1)) so a fresh pair must be created per call.
+            seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                                 jnp.int32, dp_sharding)
             if self.runner.uses_mrope:
                 mrope_sharding = NamedSharding(
                     self.runner.mesh,
@@ -336,79 +540,173 @@ class CompilationManager:
             else:
                 positions = self._create_dummy_tensor((num_tokens, ),
                                                       jnp.int32, dp_sharding)
-            is_first_rank = self.runner.is_first_rank
-            is_last_rank = self.runner.is_last_rank
-            if is_first_rank:
-                intermediate_tensors = None
-            else:
-                sharding = NamedSharding(
+            num_rejected_tokens = self._create_dummy_tensor(
+                (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+            seq_lens_subtract_indices = self._create_dummy_tensor(
+                (self.runner.max_num_reqs, ), jnp.int32, replicated_sharding)
+            positions_subtract_indices = self._create_dummy_tensor(
+                (num_tokens, ), jnp.int32, replicated_sharding)
+
+            self._run_compilation(
+                "_subtract_num_rejected_tokens_fn",
+                _subtract_num_rejected_tokens_fn,
+                seq_lens,
+                positions,
+                num_rejected_tokens,
+                seq_lens_subtract_indices,
+                positions_subtract_indices,
+                num_tokens=num_tokens,
+            )
+
+    def _precompile_concat_last_sampled_tokens_and_draft_tokens(self) -> None:
+        logger.info(
+            "Compiling concat_last_sampled_tokens_and_draft_tokens with "
+            "different input shapes.")
+        num_spec_tokens = (
+            self.runner.speculative_config.num_speculative_tokens)
+        max_num_reqs = self.runner.max_num_reqs
+        data_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+        last_sampled_tokens = device_array(self.runner.mesh,
+                                           jnp.ones((max_num_reqs, ),
+                                                    dtype=jnp.int32),
+                                           sharding=data_sharding)
+        draft_tokens = device_array(self.runner.mesh,
+                                    jnp.ones((max_num_reqs, num_spec_tokens),
+                                             dtype=jnp.int32),
+                                    sharding=data_sharding)
+        self._run_compilation(
+            f"worker{self.runner.rank} "
+            "concat_last_sampled_tokens_and_draft_tokens",
+            concat_last_sampled_tokens_and_draft_tokens,
+            last_sampled_tokens,
+            draft_tokens,
+            max_num_reqs=max_num_reqs,
+            num_spec_tokens=num_spec_tokens,
+        )
+
+    def _precompile_backbone_text_only(self) -> None:
+        hidden_size = self.runner.model_config.get_hidden_size()
+        for num_tokens in self.runner.num_tokens_paddings:
+            for num_reqs in self.runner.attn_num_reqs_paddings:
+                dp_sharding = NamedSharding(
                     self.runner.mesh,
-                    PartitionSpec(ShardingAxisName.ATTN_DATA, None))
-                hidden_states = self._create_dummy_tensor(
-                    (num_tokens, hidden_size), jnp.bfloat16, sharding=sharding)
-                residual = self._create_dummy_tensor((num_tokens, hidden_size),
-                                                     jnp.bfloat16,
-                                                     sharding=sharding)
-                intermediate_tensors = JaxIntermediateTensors(
-                    tensors={
-                        "hidden_states": hidden_states,
-                        "residual": residual
-                    })
-            self._precompile_backbone_helper(
-                f"worker{self.runner.rank} backbone",
-                input_ids=input_ids,
-                positions=positions,
-                inputs_embeds=None,
-                intermediate_tensors=intermediate_tensors,
-                is_first_rank=is_first_rank,
-                is_last_rank=is_last_rank)
+                    PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+                input_ids = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, dp_sharding)
+                if self.runner.uses_mrope:
+                    mrope_sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+                    positions = self._create_dummy_tensor(
+                        (3, num_tokens), jnp.int32, mrope_sharding)
+                else:
+                    positions = self._create_dummy_tensor(
+                        (num_tokens, ), jnp.int32, dp_sharding)
+                is_first_rank = self.runner.is_first_rank
+                is_last_rank = self.runner.is_last_rank
+                if is_first_rank:
+                    intermediate_tensors = None
+                else:
+                    sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+                    hidden_states = self._create_dummy_tensor(
+                        (num_tokens, hidden_size),
+                        jnp.bfloat16,
+                        sharding=sharding)
+                    residual = self._create_dummy_tensor(
+                        (num_tokens, hidden_size),
+                        jnp.bfloat16,
+                        sharding=sharding)
+                    intermediate_tensors = JaxIntermediateTensors(
+                        tensors={
+                            "hidden_states": hidden_states,
+                            "residual": residual
+                        })
+                self._precompile_backbone_helper(
+                    f"worker{self.runner.rank} backbone",
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=None,
+                    intermediate_tensors=intermediate_tensors,
+                    is_first_rank=is_first_rank,
+                    is_last_rank=is_last_rank,
+                    num_reqs=num_reqs)
 
     def _precompile_backbone_with_inputs_embeds(self) -> None:
         hidden_size = self.runner.model_config.get_hidden_size()
         dtype = self.runner.model_config.dtype
-        for num_tokens in self.runner.num_tokens_paddings:
-            sharding = NamedSharding(
-                self.runner.mesh,
-                PartitionSpec(ShardingAxisName.ATTN_DATA, None))
-            input_sharding = NamedSharding(
-                self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
 
-            inputs_embeds = self._create_dummy_tensor(
-                (num_tokens, hidden_size), dtype, sharding=sharding)
-            if self.runner.uses_mrope:
-                mrope_sharding = NamedSharding(
-                    self.runner.mesh,
-                    PartitionSpec(None, ShardingAxisName.ATTN_DATA))
-                positions = self._create_dummy_tensor((3, num_tokens),
-                                                      jnp.int32,
-                                                      sharding=mrope_sharding)
-            else:
-                positions = self._create_dummy_tensor((num_tokens, ),
-                                                      jnp.int32,
-                                                      sharding=input_sharding)
-            is_first_rank = self.runner.is_first_rank
-            is_last_rank = self.runner.is_last_rank
-            if not is_first_rank:
-                hidden_states = self._create_dummy_tensor(
-                    (num_tokens, hidden_size), jnp.bfloat16, sharding=sharding)
-                residual = self._create_dummy_tensor((num_tokens, hidden_size),
-                                                     jnp.bfloat16,
-                                                     sharding=sharding)
-                intermediate_tensors = JaxIntermediateTensors(
-                    tensors={
-                        "hidden_states": hidden_states,
-                        "residual": residual
-                    })
-            else:
-                intermediate_tensors = None
-            self._precompile_backbone_helper(
-                f"worker{self.runner.rank} backbone with embeds",
-                input_ids=None,
-                positions=positions,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-                is_first_rank=is_first_rank,
-                is_last_rank=is_last_rank)
+        # Identify multimodal embedding size including Deepstack
+        hf_conf = self.runner.vllm_config.model_config.hf_config
+        vision_config = getattr(hf_conf, "vision_config", None)
+        embeds_hidden_size = hidden_size
+
+        if vision_config:
+            visual_dim = getattr(vision_config, "out_hidden_size", None)
+            deepstack_indexes = getattr(vision_config,
+                                        "deepstack_visual_indexes", None)
+
+            # If both exist, we apply the deepstack concat logic
+            if visual_dim is not None and deepstack_indexes is not None:
+                deepstack_levels = len(deepstack_indexes)
+                embeds_hidden_size = visual_dim * (1 + deepstack_levels)
+
+        # Compile for both standard (4k) and Deepstack (16k) dimensions if they differ
+        hidden_sizes_to_compile = [hidden_size]
+        if embeds_hidden_size != hidden_size:
+            hidden_sizes_to_compile.append(embeds_hidden_size)
+
+        for h_size in hidden_sizes_to_compile:
+            for num_tokens in self.runner.num_tokens_paddings:
+                for num_reqs in self.runner.attn_num_reqs_paddings:
+                    sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+                    input_sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+                    inputs_embeds = self._create_dummy_tensor(
+                        (num_tokens, h_size), dtype, sharding=sharding)
+                if self.runner.uses_mrope:
+                    mrope_sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+                    positions = self._create_dummy_tensor(
+                        (3, num_tokens), jnp.int32, sharding=mrope_sharding)
+                else:
+                    positions = self._create_dummy_tensor(
+                        (num_tokens, ), jnp.int32, sharding=input_sharding)
+                is_first_rank = self.runner.is_first_rank
+                is_last_rank = self.runner.is_last_rank
+                if not is_first_rank:
+                    hidden_states = self._create_dummy_tensor(
+                        (num_tokens, hidden_size),
+                        jnp.bfloat16,
+                        sharding=sharding)
+                    residual = self._create_dummy_tensor(
+                        (num_tokens, hidden_size),
+                        jnp.bfloat16,
+                        sharding=sharding)
+                    intermediate_tensors = JaxIntermediateTensors(
+                        tensors={
+                            "hidden_states": hidden_states,
+                            "residual": residual
+                        })
+                else:
+                    intermediate_tensors = None
+                self._precompile_backbone_helper(
+                    f"worker{self.runner.rank} backbone with embeds",
+                    input_ids=None,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                    is_first_rank=is_first_rank,
+                    is_last_rank=is_last_rank,
+                    num_reqs=num_reqs)
 
     def _precompile_select_from_array_helper(
         self,
@@ -456,11 +754,22 @@ class CompilationManager:
 
                 self._run_compilation(
                     f"select_from_array [{name}]",
-                    self.runner._select_from_array_fn, input_tensor,
-                    indices_to_select, **{
+                    self.runner._select_from_array_fn,
+                    self.runner,
+                    input_tensor,
+                    indices_to_select,
+                    **{
                         "array_size": array_size,
                         "index_size": indices_count
-                    })
+                    },
+                    warmup_handler=self._skip_self_arg_warmup_handler)
+
+    def _skip_self_arg_warmup_handler(self, fn, args, call_kwargs):
+        """Warmup handler for methods compiled with an explicit `self` as the
+        first positional arg.  At warm-up time the object is already bound, so
+        we drop args[0] and forward the rest.
+        """
+        return fn(*args[1:], **call_kwargs)
 
     def _precompile_select_from_array(self) -> None:
         logger.info("Compiling select_from_array with different input shapes.")
@@ -484,7 +793,7 @@ class CompilationManager:
         )
 
         if self.runner.speculative_config:
-            vocab_size = self.runner.model_config.get_vocab_size()
+            vocab_size = self.runner.vocab_size
             self._precompile_select_from_array_helper(
                 name=
                 f"worker{self.runner.rank} select bonus tokens for spec decoding",
@@ -531,7 +840,7 @@ class CompilationManager:
                 self._run_compilation(
                     f"worker{self.runner.rank} compute_logits",
                     self.runner.compute_logits_fn,
-                    self.runner.state,
+                    self.runner.state_leaves,
                     hidden_states,
                     lora_metadata,
                     num_reqs=num_reqs,
@@ -548,7 +857,7 @@ class CompilationManager:
 
     def _precompile_sampling(self) -> None:
         logger.info("Compiling sampling with different input shapes.")
-        hsize = self.runner.model_config.get_vocab_size()
+        hsize = self.runner.vocab_size
         for num_reqs in self.runner.num_reqs_paddings:
             # `logits_sharding` need to be consistent with
             # compute_logits_fn's output sharding to avoid serving
@@ -604,6 +913,7 @@ class CompilationManager:
                         sampling_metadata,
                         num_reqs=num_reqs,
                         do_sampling=do_sampling,
+                        logprobs=logprobs,
                     )
 
         self._sampling_precompiled = True
@@ -636,7 +946,7 @@ class CompilationManager:
 
     def _precompile_gather_logprobs(self) -> None:
         logger.info("Compiling gather_logprobs with different input shapes.")
-        hsize = self.runner.model_config.get_vocab_size()
+        hsize = self.runner.vocab_size
         for num_reqs in self.runner.num_reqs_paddings:
             logits_sharding = NamedSharding(
                 self.runner.mesh,
@@ -650,25 +960,277 @@ class CompilationManager:
                                                   token_ids_sharding)
             self._run_compilation(
                 f"worker{self.runner.rank} gather_logprobs",
-                self.runner._compute_and_gather_logprobs,
+                compute_and_gather_logprobs,
                 logits,
                 token_ids,
                 self.runner.model_config.max_logprobs,
                 num_reqs=num_reqs,
             )
 
+        if self.runner.speculative_config:
+            logger.info(
+                "Compiling gather_logprobs for speculative decoding shapes.")
+            for num_logits in self.runner.num_logits_paddings:
+                for num_reqs in self.runner.num_reqs_paddings:
+                    if num_reqs > num_logits:
+                        continue
+                    combined_size = num_logits + num_reqs
+                    logits_sharding = NamedSharding(self.runner.mesh,
+                                                    PartitionSpec())
+                    token_ids_sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.ATTN_DATA))
+                    logits = self._create_dummy_tensor(
+                        (combined_size, hsize), jnp.float32, logits_sharding)
+                    token_ids = self._create_dummy_tensor(
+                        (combined_size, ), jnp.int32, token_ids_sharding)
+                    self._run_compilation(
+                        f"worker{self.runner.rank} gather_logprobs_spec",
+                        compute_and_gather_logprobs,
+                        logits,
+                        token_ids,
+                        self.runner.model_config.max_logprobs,
+                        num_logits=num_logits,
+                        num_reqs=num_reqs,
+                    )
+
+        logger.info(
+            "Compiling compute_and_gather_prompt_logprobs with different input shapes."
+        )
+        MAX_PRECOMPILE_PROMPT_TOKENS = 1024
+        for num_tokens in self.runner.num_tokens_paddings:
+            if num_tokens > MAX_PRECOMPILE_PROMPT_TOKENS:
+                logger.info(
+                    f"Skipping precompilation of compute_and_gather_prompt_logprobs for {num_tokens=}, "
+                    f"as it exceeds the {MAX_PRECOMPILE_PROMPT_TOKENS=} limit to prevent HBM exhaustion."
+                )
+                continue
+            logits_sharding = NamedSharding(
+                self.runner.mesh,
+                PartitionSpec(ShardingAxisName.MLP_DATA,
+                              ShardingAxisName.MLP_TENSOR))
+            token_ids_sharding = NamedSharding(self.runner.mesh,
+                                               PartitionSpec())
+            logits = self._create_dummy_tensor((num_tokens, hsize),
+                                               jnp.float32, logits_sharding)
+            token_ids = self._create_dummy_tensor((num_tokens, ), jnp.int32,
+                                                  token_ids_sharding)
+            self._run_compilation(
+                f"worker{self.runner.rank} compute_and_gather_prompt_logprobs",
+                compute_and_gather_prompt_logprobs,
+                logits,
+                token_ids,
+                self.runner.model_config.max_logprobs,
+                num_tokens=num_tokens,
+            )
+
         self._gather_logprobs_precompiled = True
+
+    def _precompile_process_and_extend_logits(self) -> None:
+        logger.info(
+            "Compiling _process_and_extend_logits with different input shapes."
+        )
+        vocab_size = self.runner.vocab_size
+        for num_logits in self.runner.num_logits_paddings:
+            for num_reqs in self.runner.num_reqs_paddings:
+                if num_reqs > num_logits:
+                    continue
+
+                logits_sharding = NamedSharding(self.runner.mesh,
+                                                PartitionSpec())
+                dp_sharding = NamedSharding(self.runner.mesh, PartitionSpec())
+
+                target_logits = self._create_dummy_tensor(
+                    (num_logits, vocab_size), jnp.float32, logits_sharding)
+
+                processed_bonus_logits = self._create_dummy_tensor(
+                    (num_reqs, vocab_size), jnp.float32, logits_sharding)
+
+                draft_lengths = self._create_dummy_tensor(
+                    (num_reqs, ), jnp.int32, dp_sharding)
+
+                temperature = self._create_dummy_tensor(
+                    (num_reqs, ), np.float32, dp_sharding)
+                top_k = self._create_dummy_tensor((num_reqs, ), np.int32,
+                                                  dp_sharding)
+                top_p = self._create_dummy_tensor((num_reqs, ), np.float32,
+                                                  dp_sharding)
+
+                dummy_shape = (1, )  # logprobs=True
+                _cache_collision_dummy = jnp.zeros(dummy_shape,
+                                                   dtype=jnp.int32)
+                _cache_collision_dummy = device_array(self.runner.mesh,
+                                                      _cache_collision_dummy)
+
+                sampling_metadata = TPUSupportedSamplingMetadata(
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    _cache_collision_dummy=_cache_collision_dummy,
+                    do_sampling=True,
+                    logprobs=True,
+                )
+
+                spec_decode_metadata = SpecDecodeMetadata(
+                    draft_lengths=draft_lengths,
+                    target_logits_indices=self._create_dummy_tensor(
+                        (num_logits, ), jnp.int32, dp_sharding),
+                    bonus_logits_indices=self._create_dummy_tensor(
+                        (num_reqs, ), jnp.int32, dp_sharding),
+                    final_logits_indices=self._create_dummy_tensor(
+                        (num_logits, ), jnp.int32, dp_sharding),
+                )
+
+                self._run_compilation(
+                    f"worker{self.runner.rank} _process_and_extend_logits",
+                    process_and_extend_logits,
+                    self.runner.mesh,
+                    target_logits,
+                    processed_bonus_logits,
+                    spec_decode_metadata,
+                    sampling_metadata,
+                    num_logits=num_logits,
+                    num_reqs=num_reqs,
+                )
+
+    def _precompile_extend_logits_simple(self) -> None:
+        logger.info(
+            "Compiling _extend_logits_simple with different input shapes.")
+        vocab_size = self.runner.vocab_size
+        for num_logits in self.runner.num_logits_paddings:
+            for num_reqs in self.runner.num_reqs_paddings:
+                if num_reqs > num_logits:
+                    continue
+
+                attn_data_size = get_mesh_shape_product(
+                    self.runner.mesh, ShardingAxisName.ATTN_DATA)
+                if attn_data_size == 1:
+                    logits_spec = PartitionSpec()
+                else:
+                    logits_spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
+                                                None)
+
+                logits_sharding = NamedSharding(self.runner.mesh, logits_spec)
+
+                target_logits = self._create_dummy_tensor(
+                    (num_logits, vocab_size), jnp.bfloat16, logits_sharding)
+                bonus_logits = self._create_dummy_tensor(
+                    (num_reqs, vocab_size), jnp.bfloat16, logits_sharding)
+
+                self._run_compilation(
+                    f"worker{self.runner.rank} _extend_logits_simple",
+                    extend_logits_simple,
+                    target_logits,
+                    bonus_logits,
+                    self.runner.mesh,
+                    num_logits=num_logits,
+                    num_reqs=num_reqs,
+                )
 
     def _precompile_speculative_decoding(self) -> None:
         logger.info(
             "Compiling speculative_decoding with different input shapes.")
         self._precompile_rejection_sampler()
+        self._precompile_extract_last_sampled_tokens()
+        self._precompile_extract_draft_token_ids()
+        self._precompile_process_and_extend_logits()
+        self._precompile_extend_logits_simple()
         if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
+        if self.runner.speculative_config.method == "mtp":
+            self._precompile_mtp_helpers()
+
+    def _precompile_extract_draft_token_ids(self) -> None:
+        logger.info(
+            "Compiling extract_draft_token_ids with different input shapes.")
+        data_parallel_attn_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+        for num_tokens in self.runner.num_tokens_paddings:
+            for num_logits in self.runner.num_logits_paddings:
+                if self._should_skip_padding_combination(num_tokens,
+                                                         num_logits,
+                                                         only_equal=False):
+                    continue
+                input_ids = self._create_dummy_tensor(
+                    (num_tokens, ),
+                    jnp.int32,
+                    sharding=data_parallel_attn_sharding)
+                final_logits_indices = self._create_dummy_tensor(
+                    (num_logits, ),
+                    jnp.int32,
+                    sharding=data_parallel_attn_sharding)
+                target_logits_indices = self._create_dummy_tensor(
+                    (num_logits, ),
+                    jnp.int32,
+                    sharding=data_parallel_attn_sharding)
+                self._run_compilation(
+                    f"worker{self.runner.rank} extract_draft_token_ids",
+                    self.runner._extract_draft_token_ids,
+                    self.runner,
+                    input_ids,
+                    final_logits_indices,
+                    target_logits_indices,
+                    num_tokens=num_tokens,
+                    num_logits=num_logits,
+                    warmup_handler=self._skip_self_arg_warmup_handler,
+                )
+
+    def _precompile_extract_last_sampled_tokens(self) -> None:
+        logger.info(
+            "Compiling extract_last_sampled_tokens with different input shapes."
+        )
+        vocab_size = self.runner.vocab_size
+        num_speculative_tokens = (
+            self.runner.speculative_config.num_speculative_tokens)
+        max_num_reqs_per_dp_rank = (self.runner.max_num_reqs //
+                                    self.runner.dp_size)
+
+        data_parallel_attn_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+        # sampled_token_ids has shape (num_logits + num_reqs,) from the
+        # rejection_sampler output — [main_tokens (num_logits),
+        # bonus_tokens (num_reqs)].
+        for num_logits in self.runner.num_logits_paddings:
+            for num_reqs in self.runner.num_reqs_paddings:
+                sampled_token_ids = self._create_dummy_tensor(
+                    (num_logits + num_reqs, ),
+                    jnp.int32,
+                    sharding=data_parallel_attn_sharding)
+                spec_decode_metadata = SpecDecodeMetadata(
+                    draft_lengths=self._create_dummy_tensor(
+                        (num_reqs, ),
+                        jnp.int32,
+                        sharding=data_parallel_attn_sharding),
+                    target_logits_indices=self._create_dummy_tensor(
+                        (num_logits, ),
+                        jnp.int32,
+                        sharding=data_parallel_attn_sharding),
+                    bonus_logits_indices=self._create_dummy_tensor(
+                        (num_reqs, ),
+                        jnp.int32,
+                        sharding=data_parallel_attn_sharding),
+                    final_logits_indices=self._create_dummy_tensor(
+                        (num_logits, ),
+                        jnp.int32,
+                        sharding=data_parallel_attn_sharding),
+                )
+                self._run_compilation(
+                    f"worker{self.runner.rank} extract_last_sampled_tokens",
+                    extract_last_sampled_tokens,
+                    spec_decode_metadata,
+                    sampled_token_ids,
+                    num_speculative_tokens,
+                    vocab_size,
+                    max_num_reqs_per_dp_rank,
+                    self.runner.mesh,
+                    num_logits=num_logits,
+                    num_reqs=num_reqs,
+                )
 
     def _precompile_rejection_sampler(self) -> None:
         logger.info("Compiling rejection_sampler with different input shapes.")
-        vocab_size = self.runner.model_config.get_vocab_size()
+        vocab_size = self.runner.vocab_size
         for num_logits in self.runner.num_logits_paddings:
             for num_reqs in self.runner.num_reqs_paddings:
                 sharding = NamedSharding(
@@ -737,237 +1299,266 @@ class CompilationManager:
         draft_hidden_size = self.runner.speculative_config.draft_model_config.get_hidden_size(
         )
         dtype = self.runner.model_config.dtype
+        dp_size = self.runner.dp_size
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
         block_tables = self.runner.input_batch.block_table[
             draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
         block_tables = device_array(self.runner.mesh,
                                     block_tables,
-                                    sharding=PartitionSpec(None, ))
+                                    sharding=dp_sharding)
 
-        selected_positions = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32)
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
-                                             jnp.int32)
+                                             jnp.int32, dp_sharding)
+        # query_start_loc carries one start-of-loc entry per DP rank, matching
+        # the runtime layout produced by `_prepare_inputs`.
         query_start_loc = self._create_dummy_tensor(
-            (self.runner.max_num_reqs + 1, ), jnp.int32)
-        self._run_compilation(
-            "_update_inputs_for_loop_speculation for the first loop",
-            self.runner.drafter._update_inputs_for_loop_speculation,
-            selected_positions, seq_lens, block_tables)
-        self._run_compilation(
-            "_update_inputs_for_loop_speculation for the subsequent loops",
-            self.runner.drafter._update_inputs_for_loop_speculation,
-            selected_positions, seq_lens, block_tables)
+            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
 
-        request_distribution = np.array([0, 0, 0], dtype=np.int32)
+        # request_distribution stores 3 counters per DP rank
+        # (decode/decode/total), so the shape scales with dp_size.
+        request_distribution = np.array([0, 0, 0] * dp_size, dtype=np.int32)
         request_distribution = device_array(self.runner.mesh,
-                                            request_distribution)
+                                            request_distribution,
+                                            sharding=dp_sharding)
+        # Dummy mamba_state_indices for spec-decode compile-cache pre-tracing.
+        # Must match the ATTN_DATA sharding `_prepare_inputs_*` produces at
+        # runtime — otherwise the draft model_fn cache misses and the
+        # ForbidCompile guard inside `Eagle3Proposer.propose` raises. None for
+        # pure-attention models (the common eagle3 case) so the field stays
+        # absent end-to-end.
+        if self.runner.kv_cache_config.has_mamba_layers:
+            eagle3_mamba_state_indices = device_array(
+                self.runner.mesh,
+                np.zeros(self.runner.max_num_reqs, dtype=np.int32),
+                sharding=dp_sharding)
+        else:
+            eagle3_mamba_state_indices = None
 
-        for num_reqs_padding in self.runner.num_reqs_paddings:
-            for i in range(1, self.runner.drafter.num_speculative_tokens + 1):
-                draft_token_ids_list = [
-                    self._create_dummy_tensor(
-                        (num_reqs_padding, ), jnp.int32,
-                        NamedSharding(self.runner.mesh, PartitionSpec()))
-                    for _ in range(i)
-                ]
-                self._run_compilation(
-                    "eagle3_stack_draft_token_ids",
-                    self.runner.drafter._stack_draft_token_ids,
-                    draft_token_ids_list,
-                    num_reqs=num_reqs_padding,
-                    draft_token_ids_list_length=len(draft_token_ids_list))
-
-        for num_logits in self.runner.num_logits_paddings:
-            hidden_states = self._create_dummy_tensor(
-                (num_logits, draft_hidden_size), jnp.bfloat16)
-            self._run_compilation(
-                "eagle3_get_draft_token_ids",
-                self.runner.drafter._get_draft_token_ids,
-                self.runner.drafter.state,
-                hidden_states,
-                num_logits=num_logits,
-            )
-
-        input_ids_loop = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32,
-            NamedSharding(self.runner.mesh, PartitionSpec()))
-        draft_hidden_state_loop = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, draft_hidden_size), dtype,
-            NamedSharding(self.runner.mesh, PartitionSpec(None, None)))
-        next_token_ids = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32)
+        num_reqs_dp = self._create_dummy_tensor((dp_size, ),
+                                                jnp.int32,
+                                                sharding=dp_sharding)
         last_token_indices = self._create_dummy_tensor(
-            (self.runner.max_num_reqs, ), jnp.int32)
+            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
         for num_tokens in self.runner.num_tokens_paddings:
-            aux_hidden_states = [
-                self._create_dummy_tensor((num_tokens, target_hidden_size),
-                                          dtype),
-                self._create_dummy_tensor((num_tokens, target_hidden_size),
-                                          dtype),
-                self._create_dummy_tensor((num_tokens, target_hidden_size),
-                                          dtype),
-            ]
+            for num_reqs in self.runner.attn_num_reqs_paddings:
+                positions = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, dp_sharding)
+                attention_metadata = AttentionMetadata(
+                    input_positions=positions,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                    mamba_state_indices=eagle3_mamba_state_indices,
+                    padded_num_reqs=num_reqs,
+                )
 
-            positions = self._create_dummy_tensor((num_tokens, ), jnp.int32)
-            attention_metadata = AttentionMetadata(
-                input_positions=positions,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                request_distribution=request_distribution,
-            )
+                def drafter_propose_warmup(_fn, _args, _call_kwargs):
+                    new_args = (self.runner.kv_caches, ) + _args[1:]
+                    kv_caches, draft_token_ids = self.runner.drafter.propose(
+                        *new_args, **_call_kwargs)
+                    self.runner.kv_caches = kv_caches
+                    return draft_token_ids
 
-            def filter_token_and_prepare_initial_inputs_wrapper(
-                token_indices,
-                query_start_loc,
-                seq_lens,
-                input_ids,
-                aux_hidden_states,
-                attention_metadata,
-                next_token_ids,
-                num_reqs,
-            ):
-                target_hidden_states, input_ids, last_token_indices, _ = self.runner.drafter._filter_token_and_prepare_initial_inputs(
-                    self.runner.drafter.state, token_indices, query_start_loc,
-                    seq_lens, input_ids, aux_hidden_states, attention_metadata,
-                    next_token_ids, num_reqs)
-                return target_hidden_states, input_ids, last_token_indices
-
-            input_ids = self._create_dummy_tensor((num_tokens, ), jnp.int32)
-            aux_hidden_states = [
-                self._create_dummy_tensor(
-                    (num_tokens, target_hidden_size), jnp.bfloat16,
-                    NamedSharding(self.runner.mesh, PartitionSpec(None,
-                                                                  None))),
-                self._create_dummy_tensor(
-                    (num_tokens, target_hidden_size), jnp.bfloat16,
-                    NamedSharding(self.runner.mesh, PartitionSpec(None,
-                                                                  None))),
-                self._create_dummy_tensor(
-                    (num_tokens, target_hidden_size), jnp.bfloat16,
-                    NamedSharding(self.runner.mesh, PartitionSpec(None,
-                                                                  None))),
-            ]
-            # TODO(ranlihao): This will increase the precompilation latency. Find proper range for token_indices.
-            for padded_total_num_tokens in [
-                    num_tokens,
-                    min(num_tokens * 2, self.runner.num_tokens_paddings[-1])
-            ]:
-                token_indices = self._create_dummy_tensor(
-                    (padded_total_num_tokens, ), jnp.int32)
+                draft_hidden_states = self._create_dummy_tensor(
+                    (num_tokens, draft_hidden_size), dtype,
+                    NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.MLP_DATA,
+                                      ShardingAxisName.MLP_TENSOR)))
+                input_ids = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, dp_sharding)
                 self._run_compilation(
-                    "eagle3_filter_token_and_prepare_initial_inputs",
-                    filter_token_and_prepare_initial_inputs_wrapper,
-                    token_indices,
-                    query_start_loc,
-                    seq_lens,
+                    "drafter_propose",
+                    self.runner.drafter.propose,
+                    self.runner.kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    last_token_indices,
+                    draft_hidden_states,
+                    num_tokens=num_tokens,
+                    warmup_handler=drafter_propose_warmup,
+                )
+                aux_hidden_states = [
+                    self._create_dummy_tensor(
+                        (num_tokens, target_hidden_size), jnp.bfloat16,
+                        NamedSharding(
+                            self.runner.mesh,
+                            PartitionSpec(ShardingAxisName.ATTN_DATA, None))),
+                    self._create_dummy_tensor(
+                        (num_tokens, target_hidden_size), jnp.bfloat16,
+                        NamedSharding(
+                            self.runner.mesh,
+                            PartitionSpec(ShardingAxisName.ATTN_DATA, None))),
+                    self._create_dummy_tensor(
+                        (num_tokens, target_hidden_size), jnp.bfloat16,
+                        NamedSharding(
+                            self.runner.mesh,
+                            PartitionSpec(ShardingAxisName.ATTN_DATA, None))),
+                ]
+                last_sampled_token_id = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+                next_prompt_token_id = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ),
+                    jnp.int32,
+                    sharding=dp_sharding)
+                is_in_prefill = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ),
+                    jnp.int32,
+                    sharding=dp_sharding)
+                num_rejected_tokens = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+
+                self._run_compilation(
+                    "drafter_prepare_inputs",
+                    self.runner.drafter.prepare_inputs,
+                    attention_metadata,
                     input_ids,
                     aux_hidden_states,
-                    attention_metadata,
-                    next_token_ids,
-                    device_array(
-                        self.runner.mesh,
-                        np.asarray([self.runner.input_batch.num_reqs],
-                                   dtype=jnp.int32)),
+                    last_sampled_token_id,
+                    next_prompt_token_id,
+                    is_in_prefill,
+                    num_rejected_tokens,
+                    num_reqs_dp,
                     num_tokens=num_tokens,
                 )
 
-            def draft_model_fn_wrapper(
-                state,
-                kv_caches,
-                input_ids,
-                draft_hidden_states,
-                attention_metadata,
-                layer_name_to_kvcache_index,
-            ):
-                kv_caches, hidden_states, _ = self.runner.drafter.model_fn(
-                    state, kv_caches, input_ids, draft_hidden_states,
-                    attention_metadata, layer_name_to_kvcache_index)
-                self.runner.kv_caches = kv_caches
-                return hidden_states
+    def _precompile_mtp_helpers(self) -> None:
+        logger.info(
+            "Compiling mtp jitted helpers with different input shapes.")
+        target_hidden_size = self.runner.model_config.get_hidden_size()
+        draft_hidden_size = self.runner.speculative_config.draft_model_config.get_hidden_size(
+        )
+        dtype = self.runner.model_config.dtype
+        dp_size = self.runner.dp_size
 
-            draft_hidden_states = self._create_dummy_tensor(
-                (num_tokens, draft_hidden_size), dtype,
-                NamedSharding(
-                    self.runner.mesh,
-                    PartitionSpec(ShardingAxisName.MLP_DATA,
-                                  ShardingAxisName.MLP_TENSOR)))
-            input_ids = self._create_dummy_tensor(
-                (num_tokens, ), jnp.int32,
-                NamedSharding(self.runner.mesh, PartitionSpec()))
-            self._run_compilation(
-                "eagle3_draft_model_fn",
-                draft_model_fn_wrapper,
-                self.runner.drafter.state,
-                self.runner.kv_caches,
-                input_ids,
-                draft_hidden_states,
-                attention_metadata,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
-                num_tokens=num_tokens,
-            )
-            target_token_ids = self._create_dummy_tensor((num_tokens, ),
-                                                         jnp.int32)
+        num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
+        draft_kv_cache_group_id = num_kv_cache_groups - 1
+        block_tables = self.runner.input_batch.block_table[
+            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+        block_tables = device_array(self.runner.mesh,
+                                    block_tables,
+                                    sharding=dp_sharding)
 
-            self._run_compilation(
-                "eagle3_prepare_hidden_states_and_input_ids",
-                self.runner.drafter._prepare_hidden_states_and_input_ids,
-                self.runner.drafter.state,
-                aux_hidden_states,
-                query_start_loc,
-                target_token_ids,
-                next_token_ids,
-                device_array(
-                    self.runner.mesh,
-                    np.asarray([self.runner.input_batch.num_reqs],
-                               dtype=jnp.int32)),
-                num_tokens=num_tokens,
-            )
+        seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                             jnp.int32, dp_sharding)
+        # query_start_loc carries one start-of-loc entry per DP rank, matching
+        # the runtime layout produced by `_prepare_inputs`.
+        query_start_loc = self._create_dummy_tensor(
+            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
 
-            attention_metadata.query_start_loc = device_array(
-                self.runner.mesh,
-                attention_metadata.query_start_loc,
-                sharding=PartitionSpec())
-            attention_metadata.input_positions = self._create_dummy_tensor(
-                (self.runner.max_num_reqs, ), jnp.int32)
-            self._run_compilation(
-                "draft_model_fn in a loop",
-                draft_model_fn_wrapper,
-                self.runner.drafter.state,
-                self.runner.kv_caches,
-                input_ids_loop,
-                draft_hidden_state_loop,
-                attention_metadata,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
-                num_tokens=num_tokens,
-            )
+        # request_distribution stores 3 counters per DP rank
+        # (decode/decode/total), so the shape scales with dp_size.
+        request_distribution = np.array([0, 0, 0] * dp_size, dtype=np.int32)
+        request_distribution = device_array(self.runner.mesh,
+                                            request_distribution,
+                                            sharding=dp_sharding)
+        # Dummy mamba_state_indices for spec-decode compile-cache pre-tracing.
+        # Must match the ATTN_DATA sharding `_prepare_inputs_*` produces at
+        # runtime — otherwise the draft model_fn cache misses and the
+        # ForbidCompile guard inside `Eagle3Proposer.propose` raises. None for
+        # pure-attention models (the common eagle3 case) so the field stays
+        # absent end-to-end.
+        if self.runner.kv_cache_config.has_mamba_layers:
+            mamba_state_indices = device_array(self.runner.mesh,
+                                               np.zeros(
+                                                   self.runner.max_num_reqs,
+                                                   dtype=np.int32),
+                                               sharding=dp_sharding)
+        else:
+            mamba_state_indices = None
 
-            hidden_states = self._create_dummy_tensor(
-                (num_tokens, draft_hidden_size), jnp.bfloat16,
-                NamedSharding(self.runner.mesh, PartitionSpec(None, None)))
+        num_reqs_dp = self._create_dummy_tensor((dp_size, ),
+                                                jnp.int32,
+                                                sharding=dp_sharding)
+        last_token_indices = self._create_dummy_tensor(
+            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+        for num_tokens in self.runner.num_tokens_paddings:
+            for num_reqs in self.runner.attn_num_reqs_paddings:
+                if self.runner.uses_mrope:
+                    mrope_sharding = NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+                    positions = self._create_dummy_tensor(
+                        (3, num_tokens), jnp.int32, mrope_sharding)
+                else:
+                    positions = self._create_dummy_tensor(
+                        (num_tokens, ), jnp.int32, dp_sharding)
 
-            self._run_compilation(
-                "eagle3_select_inputs_for_loop_speculation",
-                self.runner.drafter._select_inputs_for_loop_speculation,
-                self.runner.drafter.state,
-                positions,
-                hidden_states,
-                hidden_states,
-                last_token_indices,
-                num_tokens=num_tokens,
-            )
+                attention_metadata = AttentionMetadata(
+                    input_positions=positions,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                    mamba_state_indices=mamba_state_indices,
+                    padded_num_reqs=num_reqs,
+                )
 
-            self._run_compilation(
-                "eagle3_select_draft_token_ids",
-                self.runner.drafter._select_draft_token_ids,
-                self.runner.drafter.state,
-                hidden_states,
-                last_token_indices,
-                num_tokens=num_tokens,
-            )
+                def drafter_propose_warmup(_fn, _args, _call_kwargs):
+                    new_args = (self.runner.kv_caches, ) + _args[1:]
+                    kv_caches, draft_token_ids = self.runner.drafter.propose(
+                        *new_args, **_call_kwargs)
+                    self.runner.kv_caches = kv_caches
+                    return draft_token_ids
+
+                draft_hidden_states = self._create_dummy_tensor(
+                    (num_tokens, draft_hidden_size), dtype,
+                    NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.ATTN_DATA, None)))
+
+                input_ids = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, dp_sharding)
+                self._run_compilation(
+                    "drafter_propose",
+                    self.runner.drafter.propose,
+                    self.runner.kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    last_token_indices,
+                    draft_hidden_states,
+                    num_tokens=num_tokens,
+                    warmup_handler=drafter_propose_warmup,
+                )
+
+                aux_hidden_states = (self._create_dummy_tensor(
+                    (num_tokens, target_hidden_size), jnp.bfloat16,
+                    NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(ShardingAxisName.ATTN_DATA, None))), )
+                last_sampled_token_id = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+                next_prompt_token_id = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ),
+                    jnp.int32,
+                    sharding=dp_sharding)
+                is_in_prefill = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ),
+                    jnp.int32,
+                    sharding=dp_sharding)
+                num_rejected_tokens = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+
+                self._run_compilation(
+                    "drafter_prepare_inputs",
+                    self.runner.drafter.prepare_inputs,
+                    attention_metadata,
+                    input_ids,
+                    aux_hidden_states,
+                    last_sampled_token_id,
+                    next_prompt_token_id,
+                    is_in_prefill,
+                    num_rejected_tokens,
+                    num_reqs_dp,
+                    num_tokens=num_tokens,
+                )
 
     def _precompile_structured_decoding(self) -> None:
         logger.info(
@@ -993,9 +1584,193 @@ class CompilationManager:
             self._run_compilation(
                 "structured_decode",
                 self.runner.structured_decoding_manager.structured_decode_fn,
+                self.runner.structured_decoding_manager,
                 dummy_require_struct_decoding,
                 dummy_grammar_bitmask,
                 dummy_logits,
                 arange,
                 num_reqs=num_reqs,
+                warmup_handler=self._skip_self_arg_warmup_handler,
+            )
+
+    def _precompile_continue_decode(self) -> None:
+        logger.info("Precompiling continue_decode loop.")
+        dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+
+        user_max_decode_steps = self.runner.vllm_config.additional_config.get(
+            "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
+
+        # We only need to compile once for user_max_decode_steps
+
+        # We also need to construct TPUSupportedSamplingMetadata
+        # For greedy decoding, we can use empty parameters
+        _cache_collision_dummy = jnp.zeros((2, ), dtype=jnp.int32)
+        _cache_collision_dummy = device_array(self.runner.mesh,
+                                              _cache_collision_dummy)
+        sampling_metadata = TPUSupportedSamplingMetadata(
+            temperature=None,
+            top_k=None,
+            top_p=None,
+            _cache_collision_dummy=_cache_collision_dummy,
+            do_sampling=False,
+            logprobs=False)
+
+        for num_reqs in self.runner.num_reqs_paddings:
+            init_tokens = self._create_dummy_tensor((num_reqs, ), jnp.int32,
+                                                    dp_sharding)
+            active_mask = self._create_dummy_tensor((num_reqs, ), jnp.bool_,
+                                                    dp_sharding)
+
+            seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                                 jnp.int32, dp_sharding)
+            query_start_loc = self._create_dummy_tensor(
+                (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+
+            request_distribution = np.array([0, 0, 0] * dp_size,
+                                            dtype=np.int32)
+            request_distribution = device_array(self.runner.mesh,
+                                                request_distribution,
+                                                sharding=dp_sharding)
+
+            if self.runner.kv_cache_config.has_mamba_layers:
+                mamba_state_indices = device_array(
+                    self.runner.mesh,
+                    np.zeros(self.runner.max_num_reqs, dtype=np.int32),
+                    sharding=dp_sharding)
+            else:
+                mamba_state_indices = None
+
+            def build_block_table(kv_cache_gid: int) -> jax.Array:
+                block_table_obj = self.runner.input_batch.block_table[
+                    kv_cache_gid]
+                shape = (self.runner.max_num_reqs,
+                         block_table_obj.max_num_blocks_per_req)
+                block_tables = np.zeros(shape, dtype=np.int32)
+                block_tables = block_tables.reshape(-1)
+                block_tables = device_array(self.runner.mesh,
+                                            block_tables,
+                                            sharding=dp_sharding)
+                return block_tables
+
+            if len(self.runner.kv_cache_config.kv_cache_groups) <= 1:
+                no_kv_cache = len(
+                    self.runner.kv_cache_config.kv_cache_groups) == 0
+                block_tables = build_block_table(
+                    0) if not no_kv_cache else None
+                attn_metadata = AttentionMetadata(
+                    input_positions=init_tokens,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                    mamba_state_indices=mamba_state_indices,
+                    padded_num_reqs=num_reqs,
+                )
+            else:
+                attn_metadata = {
+                    name:
+                    AttentionMetadata(
+                        input_positions=init_tokens,
+                        block_tables=build_block_table(gid),
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                        request_distribution=request_distribution,
+                        mamba_state_indices=mamba_state_indices,
+                        padded_num_reqs=num_reqs,
+                    )
+                    for gid, kv_cache_group in enumerate(
+                        self.runner.kv_cache_config.kv_cache_groups)
+                    for name in kv_cache_group.layer_names
+                }
+
+            init_state = TpuSamplingState(
+                current_tokens=init_tokens,
+                active_mask=active_mask,
+                attn_metadata=attn_metadata,
+                step_counter=self.runner.zero_array,
+            )
+
+            lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+
+            # Compile once for the max steps using JAX array for dynamic bound
+            max_decode_steps_arr = jnp.array(user_max_decode_steps,
+                                             dtype=jnp.int32)
+
+            def continue_decode_wrapper(
+                state,
+                model_fn,
+                compute_logits_fn,
+                sample_fn,
+                mesh,
+                sampling_metadata,
+                init_state,
+                kv_caches,
+                max_decode_steps,
+                static_max_decode_steps,
+                eos_token_id,
+                padding_token_id,
+                rng,
+                layer_name_to_kvcache_index,
+                lora_metadata,
+                is_first_rank,
+                is_last_rank,
+                dp_size,
+                collect_expert_indices,
+            ):
+                generated_tokens, final_kv_caches, final_state, final_rng, all_expert_indices = continue_decode(
+                    state=state,
+                    model_fn=model_fn,
+                    compute_logits_fn=compute_logits_fn,
+                    sample_fn=sample_fn,
+                    mesh=mesh,
+                    sampling_metadata=sampling_metadata,
+                    init_state=init_state,
+                    kv_caches=kv_caches,
+                    max_decode_steps=max_decode_steps,
+                    static_max_decode_steps=static_max_decode_steps,
+                    eos_token_id=eos_token_id,
+                    padding_token_id=padding_token_id,
+                    rng=rng,
+                    layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+                    lora_metadata=lora_metadata,
+                    is_first_rank=is_first_rank,
+                    is_last_rank=is_last_rank,
+                    dp_size=dp_size,
+                    collect_expert_indices=collect_expert_indices,
+                )
+                self.runner.kv_caches = final_kv_caches
+                return generated_tokens
+
+            def continue_decode_warmup(_fn, _args, _call_kwargs):
+                new_args = list(_args)
+                new_args[7] = self.runner.kv_caches
+                return _fn(*new_args, **_call_kwargs)
+
+            self._run_compilation(
+                f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}",
+                continue_decode_wrapper,
+                self.runner.state_leaves,
+                getattr(self.runner.model, "step_fn_no_options",
+                        self.runner.model_fn),
+                self.runner.compute_logits_fn,
+                sample,
+                self.runner.mesh,
+                sampling_metadata,
+                init_state,
+                self.runner.kv_caches,
+                max_decode_steps_arr,
+                user_max_decode_steps,
+                self.runner.eos_token_id,
+                self.runner.pad_token_id,
+                self.runner.rng_params_for_sampling,
+                tuple(self.runner.layer_name_to_kvcache_index.items()),
+                lora_metadata,
+                self.runner.is_first_rank,
+                self.runner.is_last_rank,
+                self.runner.dp_size,
+                getattr(self.runner.vllm_config.model_config,
+                        "enable_return_routed_experts", False),
+                warmup_handler=continue_decode_warmup,
             )

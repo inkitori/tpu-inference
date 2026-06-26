@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import functools
 from typing import Any, Optional
 
 import jax
+import numpy as np
 import torch
 import vllm.envs as vllm_envs
 from flax import nnx
@@ -34,6 +33,8 @@ from tpu_inference.layers.jax.quantization import get_tpu_quantization_config
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.interface import (ModelInterface,
                                                    MultiModalInterface)
+from tpu_inference.models.jax.utils.multi_modal_utils import \
+    flatten_pad_mm_embeds
 from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     apply_qwix_on_abstract_model, apply_qwix_quantization,
     load_random_weights_into_qwix_abstract_model,
@@ -51,6 +52,8 @@ _MODEL_REGISTRY = {}
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
     "GptOssForCausalLM",
     "Qwen3MoeForCausalLM",
+    "KimiK25ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
 })
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
@@ -70,6 +73,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
     from tpu_inference.models.jax.gemma4_mm import \
         Gemma4ForConditionalGeneration
+    from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -93,6 +97,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
     _MODEL_REGISTRY[
         "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
+    _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
@@ -110,7 +115,24 @@ def _get_nnx_model(
     vllm_config: VllmConfig,
     rng: jax.Array,
     mesh: Mesh,
+    pooler: Optional[Any] = None,
+    is_draft_model: bool = False,
 ) -> nnx.Module:
+    """Instantiate the nnx JAX model and optionally pass the embedding/pooling layer.
+
+    Args:
+        model_class: The class of the model.
+        vllm_config: The current vLLM config.
+        rng: Array specifying random keys.
+        mesh: JAX device mesh for sharding.
+        pooler: The optional pooler for handling embedding path.
+
+    Returns:
+        nnx.Module: The instantiated JAX module.
+    """
+
+    model_config = (vllm_config.speculative_config.draft_model_config
+                    if is_draft_model else vllm_config.model_config)
 
     def create_abstract_model() -> nnx.Module:
         """
@@ -249,26 +271,30 @@ def _get_nnx_model(
                     vllm_config.load_config.load_format = "pathways_dummy"
                 else:
                     vllm_config.load_config.load_format = "jax_dummy"
+            vllm_config.pytorch_pooler = pooler
             loader = get_model_loader(vllm_config.load_config)
             if isinstance(model, LoadableWithIterator):
                 assert isinstance(model, JaxModule)
-                loader.load_weights(model, vllm_config.model_config)
+                loader.load_weights(model, model_config)
             elif isinstance(loader, RunaiModelStreamerLoader):
-                model_weights = vllm_config.model_config.model
-                if hasattr(vllm_config.model_config, "model_weights"):
-                    model_weights = vllm_config.model_config.model_weights
+                model_weights = model_config.model
+                if hasattr(model_config, "model_weights"):
+                    model_weights = model_config.model_weights
                 weights_iterator = loader._get_weights_iterator(
-                    model_weights, vllm_config.model_config.revision)
+                    model_weights, model_config.revision)
+
                 # We set the weights iterator at runtime, to prevent having to change
                 # every model's load_weights signature. This also prevents us from hitting
                 # a TypeError at runtime if you use the RunaiModelStreamerLoader with any
                 # flax_nnx model whose load_weights function does not accept the
                 # weights_iterator keyword argument.
-                vllm_config.model_config.runai_model_weights_iterator = weights_iterator
+                model_config.runai_model_weights_iterator = weights_iterator
                 model.load_weights(rng)
-                del vllm_config.model_config.runai_model_weights_iterator
+                del model_config.runai_model_weights_iterator
             else:
                 model.load_weights(rng)
+            if hasattr(vllm_config, "pytorch_pooler"):
+                del vllm_config.pytorch_pooler
             jit_model = create_jit_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
@@ -301,7 +327,23 @@ def get_flax_model(
     else:
         model_class = _get_model_architecture(
             vllm_config.model_config.hf_config)
-    jit_model = _get_nnx_model(model_class, vllm_config, rng, mesh)
+
+    # Instantiate pooler if needed for Hybrid Path
+    is_pooling = vllm_config.model_config.runner_type == "pooling"
+    pooler = None
+    if is_pooling:
+        from vllm.model_executor.layers.pooler import DispatchPooler
+        pooler_config = getattr(vllm_config.model_config, "pooler_config",
+                                None)
+        if pooler_config is not None:
+            pooler = DispatchPooler.for_embedding(pooler_config)
+
+    jit_model = _get_nnx_model(model_class,
+                               vllm_config,
+                               rng,
+                               mesh,
+                               pooler=pooler,
+                               is_draft_model=is_draft_model)
     vllm_config.model_config.dtype = original_dtype
     kv_cache_sharding = NamedSharding(
         mesh,
@@ -316,18 +358,27 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
+    # Capture the nnx.State treedef once. `run_model` accepts a flat tuple
+    # of array leaves at dispatch time and reconstructs the state via this
+    # treedef. The runner does the flatten of `state` once at init, which
+    # avoids the per-call `nnx.Variable` pytree traversal that otherwise
+    # costs ~17 ms/step on Gemma-4-31B decode at TP=2.
+    _state_treedef = jax.tree_util.tree_structure(state)
+
     @jax.jit(
         out_shardings=(
             kv_cache_sharding,
             hidden_states_sharding,
             hidden_states_sharding,  # aux hidden states
+            None,  # expert ids
         ),
-        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
+        donate_argnums=1,  # 0 is state_leaves, 1 is kv_cache
         static_argnums=(
-            7, 10, 11
-        ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
+            6, 9, 10
+        ),  # 6 is layer_name_to_kvcache_index, 9 is is_first_rank, 10 is is_last_rank
     )
-    def run_model(graphdef, state, *args):
+    def run_model(state_leaves, *args):
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
         return model(*args)
 
@@ -336,11 +387,13 @@ def get_flax_model(
             kv_cache_sharding,
             hidden_states_sharding,
             hidden_states_sharding,  # residual
+            None,  # expert ids
         ),
-        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
-        static_argnums=(6, ),  # 6 is layer_name_to_kvcache_index
+        donate_argnums=1,  # 0 is state_leaves, 1 is kv_cache
+        static_argnums=(5, ),  # 5 is layer_name_to_kvcache_index
     )
-    def run_draft_model(graphdef, state, *args):
+    def run_draft_model(state_leaves, *args):
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
         return model(*args)
 
@@ -349,42 +402,70 @@ def get_flax_model(
         PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
 
     @jax.jit(out_shardings=(logits_sharding))
-    def run_compute_logits(graphdef, state, *args):
+    def run_compute_logits(state_leaves, *args):
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
         hidden_state, *_ = args
         return model.compute_logits(hidden_state)
 
     # Multi-modal support only
-    # This function calculates the image token's embeddings by VIT
-    def run_embed_multimodal(graphdef, state, **kwargs):
+    # This function calculates the image/video token's embeddings by VIT
+    def run_embed_multimodal(state_leaves, modality=None, **kwargs):
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
         return model.embed_multimodal(**kwargs)
 
     embed_sharding = NamedSharding(mesh, PartitionSpec(None))
-    # This function will calculates the embeddings of input texts and then merge with the image embeddings
+
     @jax.jit(out_shardings=(embed_sharding))
-    def run_embed_input_ids(graphdef, state, *args, **kwargs):
+    def jitted_embed_input_ids(state_leaves,
+                               input_ids,
+                               mm_embeds,
+                               is_multimodal=None):
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
-        return model.embed_input_ids(*args, **kwargs)
+        return model.embed_input_ids(input_ids,
+                                     mm_embeds,
+                                     is_multimodal=is_multimodal)
+
+    def run_embed_input_ids(state_leaves,
+                            input_ids,
+                            mm_embeds=None,
+                            is_multimodal=None):
+        mm_embeds = flatten_pad_mm_embeds(mm_embeds,
+                                          target_pad_len=input_ids.shape[0])
+        return jitted_embed_input_ids(state_leaves,
+                                      input_ids,
+                                      mm_embeds,
+                                      is_multimodal=is_multimodal)
 
     # For models that want to work with EAGLE-3 speculative decoding
     @jax.jit(out_shardings=(logits_sharding))
-    def combine_hidden_states(graphdef, state, hidden_states):
+    def combine_hidden_states(state_leaves, hidden_states):
+        state = jax.tree_util.tree_unflatten(_state_treedef, state_leaves)
         model = nnx.merge(graphdef, state)
         return model.combine_hidden_states(hidden_states)
 
     model = nnx.merge(graphdef, state)
     precompile_vision_encoder_fn = getattr(model, "precompile_vision_encoder",
                                            None)
-    model_fn = functools.partial(
-        run_draft_model, graphdef) if is_draft_model else functools.partial(
-            run_model, graphdef)
-    compute_logits_fn = functools.partial(run_compute_logits, graphdef)
-    embed_multimodal_fn = functools.partial(run_embed_multimodal, graphdef)
-    embed_input_ids_fn = functools.partial(run_embed_input_ids, graphdef)
+    # `graphdef` and the state treedef are captured in each closure; the
+    # runner passes pre-flattened `state_leaves` as the first positional arg.
+    jitted_model_fn = run_draft_model if is_draft_model else run_model
+
+    model_supports_spec_step = supports_kw(model_class.__call__,
+                                           "spec_step_idx")
+
+    def wrapped_model_fn(*args, **kwargs):
+        if not model_supports_spec_step:
+            kwargs.pop("spec_step_idx", None)
+        return jitted_model_fn(*args, **kwargs)
+
+    compute_logits_fn = run_compute_logits
+    embed_multimodal_fn = run_embed_multimodal
+    embed_input_ids_fn = run_embed_input_ids
     lora_manager, model = None, None
-    combine_hidden_states_fn = functools.partial(combine_hidden_states,
-                                                 graphdef)
+    combine_hidden_states_fn = combine_hidden_states
 
     get_mrope_input_positions_fn = None if not hasattr(
         jit_model,
@@ -397,15 +478,52 @@ def get_flax_model(
         get_mrope_input_positions_fn=get_mrope_input_positions_fn,
     )
 
+    if pooler is not None:
+        import torchax
+        from torchax.interop import torch_view
+        from vllm.v1.pool.metadata import PoolingMetadata
+
+        def compute_pooler_output(
+            hidden_states: jax.Array,
+            pooling_metadata: PoolingMetadata,
+            seq_lens: np.ndarray,
+            num_scheduled_tokens: Optional[np.ndarray] = None,
+        ):
+            # Performance optimization: use torch_view and move to CPU non-blocking
+            torch_states = torch_view(hidden_states)
+            with torchax.default_env():
+                torch_states = torch_states.to('cpu', non_blocking=True)
+
+                if num_scheduled_tokens is None:
+                    num_scheduled_tokens = seq_lens
+
+                # Align with our StepPool logic
+                pooling_metadata.build_pooling_cursor(
+                    num_scheduled_tokens,
+                    torch.tensor(seq_lens),
+                    device=torch_states.device,
+                )
+
+                # Execute pooling on CPU
+                outputs = pooler(torch_states, pooling_metadata)
+                return outputs
+
+        pooler_fn = compute_pooler_output
+    else:
+        pooler_fn = _not_support
+
+    state_leaves = tuple(jax.tree_util.tree_leaves(state))
+
     return ModelInterface(
-        model_fn=model_fn,
+        model_fn=wrapped_model_fn,
         compute_logits_fn=compute_logits_fn,
-        pooler_fn=_not_support,
+        pooler_fn=pooler_fn,
         combine_hidden_states_fn=combine_hidden_states_fn,
         multimodal_fns=multimodal_fns,
         state=state,
+        state_leaves=state_leaves,
         lora_manager=lora_manager,
-        model=model,
+        model=jit_model,
     )
 
 
@@ -414,6 +532,7 @@ def get_vllm_model(
     rng: jax.Array,
     mesh: Mesh,
     is_draft_model: bool = False,
+    shared_params: Optional[dict[str, jax.Array]] = None,
 ) -> ModelInterface:
     model_dtype = to_torch_dtype(vllm_config.model_config.dtype)
     vllm_config.model_config.dtype = model_dtype
@@ -425,7 +544,7 @@ def get_vllm_model(
         mesh=mesh,
         is_draft_model=is_draft_model,
     )
-    params, lora_manager = model.load_weights()
+    params, lora_manager = model.load_weights(shared_params=shared_params)
 
     jit_model = model.jit_step_func()
     compute_logits_fn = model.jit_compute_logits_func()
@@ -436,7 +555,7 @@ def get_vllm_model(
         precompile_vision_encoder_fn=getattr(
             model.model.vllm_model,
             "precompile_vision_encoder",
-            None,
+            model.wrap_precompile_vision_encoder_fn(params),
         ),
         embed_multimodal_fn=model.wrap_embed_multimodal_func(),
         embed_input_ids_fn=model.wrap_embed_input_ids_func(),
@@ -448,6 +567,8 @@ def get_vllm_model(
     )
 
     # the model needs to be returned because lora weights are neither torch.nn.parameter nor torch.nn.buffer. After we load the lora weights and set it to the torch.nn.Module, we can shard it and move it to TPU.
+    # For the vllm-impl path the dispatch-side fns accept the params dict
+    # directly, so `state_leaves` is just the dict.
     return ModelInterface(
         model_fn=jit_model,
         compute_logits_fn=compute_logits_fn,
@@ -455,6 +576,7 @@ def get_vllm_model(
         combine_hidden_states_fn=combine_hidden_states_fn,
         multimodal_fns=multimodal_fns,
         state=params,
+        state_leaves=params,
         lora_manager=lora_manager,
         model=model,
     )
@@ -465,6 +587,7 @@ def get_model(
     rng: jax.Array,
     mesh: Mesh,
     is_draft_model: bool = False,
+    shared_params: Optional[dict[str, jax.Array]] = None,
 ) -> ModelInterface:
     if is_draft_model:
         impl = envs.DRAFT_MODEL_IMPL_TYPE
@@ -485,7 +608,7 @@ def get_model(
                         "PP is not fully supported on Jax flax_nnx %s models yet, fallback to vllm models.",
                         arch)
                     return get_vllm_model(vllm_config, rng, mesh,
-                                          is_draft_model)
+                                          is_draft_model, shared_params)
                 try:
                     # Try to load the flax model first
                     return get_flax_model(vllm_config, rng, mesh,
@@ -498,9 +621,10 @@ def get_model(
 
                     # Fall back to the vLLM model and updating the dtype accordingly
                     return get_vllm_model(vllm_config, rng, mesh,
-                                          is_draft_model)
+                                          is_draft_model, shared_params)
         case "vllm":
-            return get_vllm_model(vllm_config, rng, mesh, is_draft_model)
+            return get_vllm_model(vllm_config, rng, mesh, is_draft_model,
+                                  shared_params)
         case _:
             raise NotImplementedError(f"Unsupported MODEL_IMPL_TYPE: {impl}")
 

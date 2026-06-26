@@ -15,15 +15,18 @@
 from typing import Any, Callable, Optional
 
 import jax
+import jax.numpy as jnp
 import torch
 import vllm.envs as vllm_envs
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch.nn import Parameter
 from torchax.interop import jax_view, torch_view
 from torchax.ops.mappings import t2j
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
+from vllm.model_executor.layers.fused_moe import (FusedMoEConfig,
+                                                  RoutedExperts,
                                                   UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
@@ -37,7 +40,7 @@ from tpu_inference.layers.common.process_weights.linear_weights import (
     LinearWeights, process_linear_weights, shard_linear_weights,
     to_parameter_list)
 from tpu_inference.layers.common.process_weights.moe_weights import (
-    FusedMoEWeights, shard_moe_weights)
+    FusedMoEWeights, process_unquantized_moe_weights, shard_moe_weights)
 from tpu_inference.layers.common.quant_methods import UNQUANTIZED
 from tpu_inference.layers.common.quantization import \
     unquantized as common_unquantized
@@ -68,6 +71,33 @@ def _load_weight_for_layer(
     """Load a layer's weight parameter onto the TPU mesh.
     """
     tensor = getattr(layer, param_name)
+
+    if tensor.device == torch.device("meta"):
+        vllm_config = get_current_vllm_config()
+
+        # Hardening for Multimodal Embedding models (e.g., Qwen3-VL-Embedding-8B):
+        # vLLM V1 uses lazy loading which may leave some tensors on the 'meta' device.
+        # Since the TPU/JAX backend requires concrete data to perform t2j (Torch-to-JAX)
+        # sharding, we must force materialization to CPU memory for pooling tasks.
+        # Note: we cannot use `is_pooling_model` here because a model instance is not available
+        # in this layer-level loading function.
+        if vllm_config.model_config.runner_type == "pooling":
+            logger.warning(
+                f"Materializing meta tensor '{param_name}' for layer "
+                f"{layer.__class__.__name__} to CPU RAM for StepPooler compatibility."
+            )
+            # Allocate real memory on CPU
+            real_data = torch.empty_like(tensor, device='cpu')
+            new_param = torch.nn.Parameter(real_data, requires_grad=False)
+
+            # Bypass setters to satisfy PyTorch registration rules.
+            # pop from __dict__ avoids shadowing KeyError;
+            # inject into _parameters establishes Parameter identity.
+            layer.__dict__.pop(param_name, None)
+            layer._parameters[param_name] = new_param
+
+            # Synchronize local handle for the subsequent t2j call
+            tensor = new_param
 
     if not vllm_envs.VLLM_TPU_USING_PATHWAYS:
         return t2j(tensor, use_dlpack=False)
@@ -119,7 +149,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             case vllm_linear.LinearBase():
                 linear_config = self.get_linear_config(layer)
                 return VllmUnquantizedLinearMethod(linear_config)
-            case FusedMoE():
+            case RoutedExperts():
                 moe_config = self.get_moe_config(layer)
                 return VllmUnquantizedFusedMoEMethod(moe_config, self.mesh)
             case Attention():
@@ -141,7 +171,15 @@ class VllmUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
         weight = _load_weight_for_layer(layer, "weight", weight_sharding)
         delattr(layer, 'weight')
         weight = general_device_put(weight, weight_sharding)
-        layer.weight = Parameter(torch_view(weight), requires_grad=False)
+        is_pooling = get_current_vllm_config(
+        ).model_config.runner_type == "pooling"
+
+        if is_pooling:
+            layer.__dict__.pop("weight", None)
+            layer._parameters["weight"] = Parameter(torch_view(weight),
+                                                    requires_grad=False)
+        else:
+            layer.weight = Parameter(torch_view(weight), requires_grad=False)
 
         if isinstance(layer, ParallelLMHead) and layer.bias is not None:
             bias_sharding = NamedSharding(self.mesh,
@@ -149,28 +187,60 @@ class VllmUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
             bias = _load_weight_for_layer(layer, "bias", bias_sharding)
             delattr(layer, 'bias')
             bias = general_device_put(bias, bias_sharding)
-            layer.bias = Parameter(torch_view(bias), requires_grad=False)
+
+            if is_pooling:
+                layer.__dict__.pop("bias", None)
+                layer._parameters["bias"] = Parameter(torch_view(bias),
+                                                      requires_grad=False)
+            else:
+                layer.bias = Parameter(torch_view(bias), requires_grad=False)
 
 
 class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
                                   common_unquantized.UnquantizedLinearMethod,
                                   VllmQuantizationMethod):
 
+    # Dynamically register this method to support weight_loader_v2 in vLLM.
+    if "VllmUnquantizedLinearMethod" not in vllm_linear.WEIGHT_LOADER_V2_SUPPORTED:
+        vllm_linear.WEIGHT_LOADER_V2_SUPPORTED.append(
+            "VllmUnquantizedLinearMethod")
+
     def __init__(self, linear_config: VllmQuantLinearConfig):
         super().__init__(linear_config)
 
     def maybe_process_weights(self, layer: torch.nn.Module, param_name: str,
                               args, kwargs):
-        """Check if all weights are loaded for the layer. If so, process and shard the weights."""
+        """Check if all weights are loaded for the layer. If so, process and shard the weights.
+
+        Note on Fused Weight Loading (e.g., Qwen3-VL / Qwen3-VL-MoE / Qwen2.5-VL Vision Encoder):
+        Historically, LLMs stored attention Q/K/V weights separately in HuggingFace checkpoints,
+        and vLLM loaded them per shard (passing shard_id in `args`).
+        However, newer multimodal models like Qwen3-VL / Qwen3-VL-MoE store vision attention weights
+        already fused on disk (e.g., `attn.qkv.weight`). In such cases, vLLM's weight loader is invoked
+        without a shard_id (`args` is empty), and vLLM internally slices and copies the fused weight.
+        To support TPU incremental sharding for these fused weights, we detect when `args` is empty
+        and immediately register all underlying shards ('q', 'k', 'v') as loaded to satisfy the sharding trigger.
+        """
         if isinstance(layer, vllm_linear.QKVParallelLinear):
-            assert len(args) == 1, "Expecting shard_id as the only argument"
-            shard_id = args[0]
-            # Keep track of loaded weights for QKVLinear, e.g. (('weight', 'q'), ('bias', 'q'), ('weight', 'k'), ('bias', 'k'), ...)
-            layer._loaded_weights.add((param_name, shard_id))
+            if len(args) == 1:
+                shard_id = args[0]
+                layer._loaded_weights.add((param_name, shard_id))
+            else:
+                # Fused weight loaded in one go (e.g., Qwen3-VL / Qwen3-VL-MoE vision encoder `attn.qkv.weight`).
+                # vLLM's QKVParallelLinear.weight_loader internally slices the weight into q, k, v.
+                # We register all 3 shards to immediately trigger process_weights_after_loading.
+                layer._loaded_weights.add((param_name, 'q'))
+                layer._loaded_weights.add((param_name, 'k'))
+                layer._loaded_weights.add((param_name, 'v'))
         elif isinstance(layer, vllm_linear.MergedColumnParallelLinear):
-            assert len(args) == 1, "Expecting shard_id as the only argument"
-            shard_id = args[0]
-            layer._loaded_weights.add((param_name, shard_id))
+            if len(args) == 1:
+                shard_id = args[0]
+                layer._loaded_weights.add((param_name, shard_id))
+            else:
+                # Fused weight loaded in one go (e.g., MLP gate_up_proj fused on disk).
+                # Register all output partitions to immediately trigger process_weights_after_loading.
+                for i in range(len(layer.output_sizes)):
+                    layer._loaded_weights.add((param_name, i))
         else:
             # Keep track of loaded weights for other linear layers, e.g. ('weight', 'bias')
             layer._loaded_weights.add(param_name)
@@ -187,9 +257,11 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
             return
         # Under Pathways, shard weights directly onto the TPU mesh to avoid
         # placing a full unsharded copy on a single device (OOM).
-        weight_sharding = NamedSharding(self.linear_config.mesh,
-                                        self.linear_config.weight_sharding)
-        weight = _load_weight_for_layer(layer, "weight", weight_sharding)
+        loading_sharding = NamedSharding(
+            self.linear_config.mesh,
+            PartitionSpec(*self.linear_config.weight_sharding[::-1]))
+        weight = _load_weight_for_layer(layer, "weight", loading_sharding)
+        weight = jnp.transpose(weight)
 
         # Free CPU memory immediately
         layer.weight.untyped_storage().resize_(0)
@@ -319,7 +391,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         if not _tensor_is_in_cpu(layer.w13_weight):
             # Already processed and sharded.
             return
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
 
         # Under Pathways, shard weights directly onto the TPU mesh to avoid
         # placing a full unsharded copy on a single device (OOM for large MoE).
@@ -342,14 +414,13 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         else:
             w13_bias = w2_bias = None
 
-        weights = common_unquantized.process_unquantized_moe_weights(
-            mesh=self.mesh,
-            moe_backend=self.moe_backend,
-            activation=layer.activation,
-            w13_weight=w13_weight,
-            w13_bias=w13_bias,
-            w2_weight=w2_weight,
-            w2_bias=w2_bias)
+        weights = process_unquantized_moe_weights(mesh=self.mesh,
+                                                  moe_backend=self.moe_backend,
+                                                  activation=layer.activation,
+                                                  w13_weight=w13_weight,
+                                                  w13_bias=w13_bias,
+                                                  w2_weight=w2_weight,
+                                                  w2_bias=w2_bias)
 
         del w13_weight, w2_weight, w13_bias, w2_bias
 
@@ -369,7 +440,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
 
     def apply_monolithic(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
@@ -388,4 +459,5 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
                               weights=weights,
                               quant_method_instance=self,
                               x=x,
-                              router_logits=router_logits)
+                              router_logits=router_logits,
+                              input_ids=input_ids)

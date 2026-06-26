@@ -39,6 +39,17 @@ def swigluoai(gate: jax.Array,
     return (up + 1.0) * glu
 
 
+def silu_and_mul_with_clamp(gate: jax.Array,
+                            up: jax.Array,
+                            limit: float = 10.0) -> jax.Array:
+    """Activation used in some models DeepSeek V4."""
+    # The limit value is from DSV4's config.
+    # TODO: pass limit from model config, instead of hardcoding here.
+    gate = jnp.clip(gate, max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
+    return jax.nn.silu(gate) * up
+
+
 def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     """Applies a fused activation function to the accumulator.
 
@@ -48,8 +59,7 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
     Args:
         acc: The accumulator array, with the last dimension being 2 * tile_n.
-        fuse_act: The name of the activation function to apply. Supported values are
-            "silu", "gelu", and "swigluoai". If None, no activation is applied.
+        fuse_act: The name of the activation function to apply.
 
     Returns:
         The result of applying the activation function.
@@ -67,8 +77,12 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
             return jax.nn.silu(acc_gate) * acc_up
         case "gelu":
             return jax.nn.gelu(acc_gate) * acc_up
+        case "gelu_tanh":
+            return jax.nn.gelu(acc_gate, approximate=True) * acc_up
         case "swigluoai":
             return swigluoai(acc_gate, acc_up)
+        case "silu_and_mul_with_clamp":
+            return silu_and_mul_with_clamp(acc_gate, acc_up)
         case _:
             raise NotImplementedError(
                 f"Unsupported activation function: {fuse_act}")
@@ -193,6 +207,19 @@ class InputConfigs:
     def should_bitcast(self) -> bool:
         bits = jax.dtypes.itemsize_bits(self.dtype)
         return bits < 8
+
+    @property
+    def should_dequantize_before_matmul(self) -> bool:
+        """Dequantize rhs before matmul if block size limits MXU utilization."""
+        if not self.has_scale:
+            return False
+        assert self.quant_block_size is not None
+        mxu_size = pltpu.get_tpu_info().mxu_column_size
+        return self.quant_block_size < mxu_size
+
+    @property
+    def should_dequantize_after_matmul(self) -> bool:
+        return self.has_scale and not self.should_dequantize_before_matmul
 
 
 @dataclasses.dataclass(frozen=True)
@@ -398,14 +425,45 @@ def inner_kernel(
     """
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
+        tpu_info = pltpu.get_tpu_info()
+        mxu_size = tpu_info.mxu_column_size
+
+        # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
+        tiled_rhs = tiled_rhs_ref.get_weight()
         # When rhs is packed (quantized dtype packed into uint32), unpack it
         # back to the original dtype using pltpu.bitcast which operates on K
         # axis. This expands the K dimension back to tile_k.
-        tiled_rhs = tiled_rhs_ref.get_weight()
         if cfgs.rhs_cfgs.should_bitcast:
             tiled_rhs = pltpu.bitcast(tiled_rhs, cfgs.rhs_cfgs.dtype)
         rhs_tile_n = tiled_rhs.shape[1]
+
+        # This should only be taken in the case where we don't requantize
+        # the scales and thus we need to dequantize inside VMEM to avoid small
+        # contracting dimmensions.
+        #
+        # MERGE NOTE (hy3): the W4A16 unquantized-lhs path below applies the rhs
+        # scale ITSELF (and the per-group additive groupbias, which this
+        # pre-dequant cannot express), so this upstream Step-1 pre-dequant must
+        # NOT also fire there or it would double-apply the scale. Per upstream's
+        # own config construction (make_gmm_configs only quantizes lhs when
+        # rhs_cfgs.should_dequantize_after_matmul, i.e. NOT
+        # should_dequantize_before_matmul) the quantized-lhs path never satisfies
+        # should_dequantize_before_matmul, so gating this on a quantized lhs
+        # leaves the quantized path byte-identical and disables the double-fold
+        # on the unquantized path.
+        rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+        if (cfgs.lhs_cfgs.quant_dtype is not None
+                and cfgs.rhs_cfgs.should_dequantize_before_matmul):
+            tiled_rhs_scale = tiled_rhs_ref.get_scale().astype(
+                cfgs.lhs_cfgs.dtype)
+            num_blocks = cfgs.num_quant_blocks_per_tile_k
+            tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
+                num_blocks, rhs_qbs, rhs_tile_n)
+            tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
+            tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k,
+                                                  rhs_tile_n)
+            rhs_qbs = cfgs.tiles.tile_k
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
         if is_last_k_step and valid_k != 0:
@@ -420,6 +478,7 @@ def inner_kernel(
                                                 1) < valid_k
                 tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
 
+        # Step 2: Matmul.
         acc_list = []
         if cfgs.lhs_cfgs.quant_dtype is None:
             # Unquantized matmul path (W4A16: bf16 lhs, dequant-on-the-fly rhs).
@@ -430,6 +489,12 @@ def inner_kernel(
             # us run ONE full-tile_k matmul per n-chunk instead of one width-64
             # (rhs_qbs) matmul per quant block, keeping the 128-lane MXU
             # contraction dim fully fed.
+            #
+            # NOTE: this path applies the rhs scale itself (below), so upstream's
+            # Step-1 should_dequantize_before_matmul pre-dequant must NOT also
+            # fire here (it is gated to the quantized-lhs path, where it is a
+            # no-op, to avoid double-applying the scale). Re-derive rhs_qbs /
+            # num_blocks from the configs so this path is correct regardless.
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
             num_blocks = cfgs.num_quant_blocks_per_tile_k
@@ -504,7 +569,6 @@ def inner_kernel(
             # result of [tile_m, mxu_size] becomes available at the end of every k
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
-            mxu_size = pltpu.get_tpu_info().mxu_column_size
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -608,6 +672,7 @@ def inner_kernel(
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 
+        # Step 3: Output post-processing.
         if not is_first_k_step:
             acc += acc_ref[...]
 
@@ -1003,21 +1068,18 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
     tile_m = min(tile_m, dims.size_m)
 
-    # Calculate vmem limit for a single rhs buffer when using triple buffers.
-    num_rhs_buffers = 3
-    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
-    base_rhs_size_bytes = dims.size_k * dims.size_n * rhs_bits // 8
-
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
     tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
     tile_n_limit = min(tile_n_limit, dims.size_n)
 
     size_n_per_rhs = dims.size_n
+    fuse_act_factor = 1
     if fuse_act is not None:
         # When computing activation function, rhs is concatenated along dim n.
-        size_n_per_rhs //= 2
-        tile_n_limit //= 2
+        fuse_act_factor = 2
+        size_n_per_rhs //= fuse_act_factor
+        tile_n_limit //= fuse_act_factor
 
     def _is_tile_k_quant_block_compatible(tk: int) -> bool:
         if (tk % rhs_cfgs.quant_block_size != 0
@@ -1031,11 +1093,42 @@ def calculate_tiling(
     tile_k = align_to(dims.size_k, num_lanes)
     tile_n = align_to(size_n_per_rhs, num_lanes)
 
-    # Multiple k tiles will introduce accumulation overhead. Thus, we first try
-    # to fit rhs into vmem by only adjusting tile_n.
+    def _gmm_vmem_estimate(tn: int, tk: int) -> int:
+        # 1. LHS tile (double-buffered)
+        lhs_tile_bytes = lhs_bits // 8
+        lhs_vmem = 2 * tile_m * tk * lhs_tile_bytes
 
-    # Decrease tile_n until rhs fits in vmem target.
-    while (pl.cdiv(base_rhs_size_bytes, num_n_tiles) > rhs_vmem_target
+        # 2. RHS tile (triple-buffered, includes scale and bias if present)
+        # If fuse_act is enabled, we have both gate and up weights,
+        # so RHS memory is doubled.
+        rhs_weight_vmem = tk * tn * rhs_bits // 8
+        rhs_scale_vmem = 0
+        if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
+            num_quant_blocks_per_tile_k = pl.cdiv(tk,
+                                                  rhs_cfgs.quant_block_size)
+            rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * 4
+        rhs_bias_vmem = 0
+        if rhs_cfgs.has_bias:
+            rhs_bias_vmem = tn * 4
+        rhs_vmem = fuse_act_factor * (3 * rhs_weight_vmem +
+                                      2 * rhs_scale_vmem + 2 * rhs_bias_vmem)
+
+        # 3. Accumulator
+        acc_cols = fuse_act_factor * tn
+        acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
+        acc_vmem = tile_m * acc_cols * acc_dtype_bytes
+
+        # 4. Output tile (double-buffered)
+        out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
+        out_vmem = 2 * tile_m * tn * out_dtype_bytes
+
+        return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
+
+    # Multiple k tiles will introduce accumulation overhead. Thus, we first try
+    # to fit the tensors into vmem by only adjusting tile_n.
+
+    # Decrease tile_n until total memory fits in vmem limit.
+    while (_gmm_vmem_estimate(tile_n, tile_k) > vmem_limit_bytes
            and tile_n > tile_n_limit):
         num_n_tiles += 1
         tile_n = align_to(size_n_per_rhs,
@@ -1047,19 +1140,18 @@ def calculate_tiling(
         tile_n = align_to(size_n_per_rhs,
                           num_n_tiles * num_lanes) // num_n_tiles
 
-        # Decrease tile_k until rhs fits in vmem target and tile_k is valid.
-        base_rhs_size_bytes = pl.cdiv(base_rhs_size_bytes, num_n_tiles)
-        while pl.cdiv(
-                base_rhs_size_bytes, num_k_tiles
-        ) > rhs_vmem_target or not _is_tile_k_quant_block_compatible(tile_k):
+        # Decrease tile_k until total memory fits in vmem limit and tile_k is valid.
+        while _gmm_vmem_estimate(
+                tile_n, tile_k
+        ) > vmem_limit_bytes or not _is_tile_k_quant_block_compatible(tile_k):
             num_k_tiles += 1
             tile_k = align_to(dims.size_k,
                               num_k_tiles * num_lanes) // num_k_tiles
 
     if tile_n == 0 or tile_k == 0:
-        raise ValueError(
-            f"Could not find valid tile sizes for {dims=} and {rhs_vmem_target=}."
-        )
+        final_estimate = _gmm_vmem_estimate(tile_n, tile_k)
+        raise ValueError(f"Could not find valid tile sizes for {dims=} and"
+                         f" {final_estimate=} (limit: {vmem_limit_bytes}).")
 
     return TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
 
@@ -1221,16 +1313,16 @@ def make_gmm_configs(
     )
 
     lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_quant_dtype is not None:
+    if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
         # Choose lhs quantization dtype based on TPU hardware support.
         is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
-        is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
         tpu_info = pltpu.get_tpu_info()
         # Check if there is hardware compute support for rhs dtype group.
-        # If the rhs is quantized to int4 or uint4 bits, these can be upcast to
-        # e4m3 without loss, so we consider both fp8 and int8.
-        # Does not consider int8 x fp4 since fp4 does not cleanly map to int8.
         if tpu_info.fp8_ops_per_second > 0:
+            # Special handling for 4-bit integer rhs as it can be converted to fp8
+            # without a numeric issues. Note that this is not the case for 4-bit
+            # floating rhs as conversion to int8 will cause numeric issues.
+            is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
             if is_rhs_float or is_rhs_4bits:
                 lhs_q_dtype = jnp.float8_e4m3fn.dtype
         if tpu_info.int8_ops_per_second > 0:

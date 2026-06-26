@@ -16,7 +16,8 @@ import torch
 import torchax
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
 from tpu_inference import envs
@@ -62,9 +63,12 @@ def select_moe_backend_from_fused_moe_config(
     return MoEBackend.GMM_TP
 
 
-def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
-                   quant_method_instance: FusedMoEMethodBase, x: torch.Tensor,
-                   router_logits: torch.Tensor) -> torch.Tensor:
+def vllm_moe_apply(layer: RoutedExperts,
+                   weights: FusedMoEWeights,
+                   quant_method_instance: FusedMoEMethodBase,
+                   x: torch.Tensor,
+                   router_logits: torch.Tensor,
+                   input_ids: torch.Tensor | None = None) -> torch.Tensor:
     """
     Shared function for applying a FusedMoE layer for the TorchAX/vLLM backend.
 
@@ -78,9 +82,30 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
     Returns:
         The output tensor from the MoE fowrard pass.
     """
-    assert isinstance(layer, FusedMoE)
+    assert isinstance(layer, RoutedExperts)
     assert isinstance(quant_method_instance, FusedMoEMethodBase)
     assert isinstance(weights, FusedMoEWeights)
+
+    from tpu_inference.models.vllm.vllm_model_wrapper_context import \
+        get_vllm_model_wrapper_context
+    try:
+        context = get_vllm_model_wrapper_context()
+        vllm_config = context.vllm_config
+    except AssertionError:
+        vllm_config = None
+
+    enable_return_routed_experts = vllm_config.model_config.enable_return_routed_experts if vllm_config else False
+
+    if enable_return_routed_experts:
+        if isinstance(router_logits, torch.Tensor):
+            _, expert_indices = torch.topk(router_logits, layer.top_k, dim=-1)
+            try:
+                context = get_vllm_model_wrapper_context()
+                context.expert_indices_list.append(jax_view(expert_indices))
+            except AssertionError:
+                pass
+
+    mesh = quant_method_instance.mesh
 
     # DeepSeek-V3 style routing (e.g. Hy3): the per-expert selection bias and the
     # routed scaling factor live on the FusedMoE layer. Move the bias parameter
@@ -116,7 +141,6 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
     # real-prefix + padding, so a single contiguous arange >= n mask is invalid.
     # Fall back to None there (no masking, no regression).
     num_actual_tokens = None
-    mesh = quant_method_instance.mesh
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) == 1:
         fwd_ctx = get_forward_context()
         attn_metadata = getattr(fwd_ctx, "attn_metadata", None)
@@ -126,6 +150,24 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
             # AttentionMetadata dataclass, so query_start_loc is a raw jax.Array.
             num_actual_tokens = jnp.max(query_start_loc)
 
+    # Upstream DP scatter + chunking + hash-based routing knobs.
+    attn_dp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA)
+    dp_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_DATA)
+    is_dp = (attn_dp_size // dp_size) > 1
+
+    extra_kwargs = dict(quant_method_instance.extra_backend_kwargs)
+    extra_kwargs["scatter_results"] = is_dp
+    extra_kwargs["moe_chunk_size"] = envs.VLLM_MOE_CHUNK_SIZE
+
+    if getattr(layer, "hash_indices_table", None) is not None:
+        assert input_ids is not None, "input_ids must be provided when hash_indices_table is present in the layer"
+        hash_table = layer.hash_indices_table
+        hash_based_topk_indices = jax_view(hash_table)[jax_view(input_ids)]
+        extra_kwargs["hash_based_topk_indices"] = hash_based_topk_indices
+    # NOTE: e_score_correction_bias is passed below as a dedicated moe_apply
+    # kwarg (hy3 path, with the nn.Parameter device-move guard), so it is not
+    # duplicated into extra_kwargs here.
+
     return torch_view(
         moe_apply(
             layer=layer,
@@ -134,7 +176,7 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
             weights=weights,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
-            extra_backend_kwargs=quant_method_instance.extra_backend_kwargs,
+            extra_backend_kwargs=extra_kwargs,
             e_score_correction_bias=e_score_correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             num_actual_tokens=num_actual_tokens,

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_NAME: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
+    TPU_MULTIPROCESS_DP: bool | None = None
     PREFILL_SLICES: str = ""
     DECODE_SLICES: str = ""
     SKIP_JAX_PRECOMPILE: bool = False
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     DRAFT_MODEL_IMPL_TYPE: str = "auto"
     NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
+    AGGREGATED_STATS_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
@@ -31,17 +33,25 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
-    MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    MOE_REQUANTIZE_WEIGHT_DTYPE: str = ""
+    MOE_REQUANTIZE_CLIP_PERCENTILE: float | None = None
+    ATTN_BUCKETIZED_NUM_REQS: bool = False
+    ATTN_CUSTOM_NUM_REQS_BUCKETS: list[int] = []
     LAYOUT_Q_PROJ_AS_NDH: bool = False
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     USE_BATCHED_RPA_KERNEL: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
-    SC_KERNEL_THRESHOLD: int = 16777216
-    SC_KERNEL_COL_CHUNK_SIZE: int = 1024
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
-    RAGGED_GATED_DELTA_RULE_IMPL: str = "ragged_gated_delta_rule_chunked"
+    RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
+    # SparseCore MoE gather kernel version used by fused_moe_gmm.
+    # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
+    RAGGED_GATHER_VERSION: str = "v2"
+    # SparseCore MoE gather-reduce (combine) kernel version used by
+    # fused_moe_gmm. "v2" (default) = ragged_gather_reduce_v2; "v1" = legacy
+    # ragged_gather_reduce.
+    RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     MOE_ALL_GATHER_ACTIVATION_DTYPE: str = ""
     TPU_OFFLOAD_SKIP_JAX_PRECOMPILE: bool = False
     TPU_OFFLOAD_DECODE_SAVE: bool = False
@@ -50,6 +60,20 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_SAVE_THREADS: int = 1
     TPU_OFFLOAD_BATCHED_SAVE: bool = False
     TPU_OFFLOAD_METRICS_LOG_INTERVAL: int = 5
+    TPU_OFFLOAD_USE_UNPINNED_HOST: bool = False
+    TPU_OFFLOAD_BLOCK_SIZE_BUCKETS: list[int] = []
+    MOE_APPROX_TOPK: bool = False
+    MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
+    VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
+    ENABLE_RS_KERNEL: bool = False
+    NUM_PRECOMPILE_WORKERS: int = 1
+    DP_SCHED_BATCH_PREFILL: bool = False
+    DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
+    VLLM_MOE_CHUNK_SIZE: int = 0
+    ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    PROFILE_SINGLE_DEVICE: bool = False
+    LORA_MODULE_PATH: str = ""
+    SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
 
 
 def env_with_choices(
@@ -99,30 +123,43 @@ def env_with_choices(
     return _get_validated_env
 
 
-def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
+def env_bool(env_name: str,
+             default: bool | None = False,
+             requires: list[str] | None = None) -> Callable[[], bool | None]:
     """
     Accepts both numeric strings ("0", "1") and boolean strings
     ("true", "false", "True", "False").
 
     Args:
         env_name: Name of the environment variable
-        default: Default boolean value if not set
+        default: Default value if not set. Pass None for a tri-state flag
+            (unset -> None) that callers resolve themselves.
+        requires: List of environment variables that must be set if this is True.
     """
 
-    def _get_bool_env() -> bool:
+    def _get_bool_env() -> bool | None:
         value = os.getenv(env_name)
         if value is None or value == "":
-            return default
-
-        value_lower = value.lower()
-        if value_lower in ("true", "1"):
-            return True
-        elif value_lower in ("false", "0"):
-            return False
+            parsed_value = default
         else:
-            raise ValueError(
-                f"Invalid boolean value '{value}' for {env_name}. "
-                f"Valid options: '0', '1', 'true', 'false', 'True', 'False'.")
+            value_lower = value.lower()
+            if value_lower in ("true", "1"):
+                parsed_value = True
+            elif value_lower in ("false", "0"):
+                parsed_value = False
+            else:
+                raise ValueError(
+                    f"Invalid boolean value '{value}' for {env_name}. "
+                    f"Valid options: '0', '1', 'true', 'false', 'True', 'False'."
+                )
+
+        if parsed_value and requires:
+            for req in requires:
+                if not os.getenv(req):
+                    raise ValueError(
+                        f"{env_name} can only be set if {req} is set.")
+
+        return parsed_value
 
     return _get_bool_env
 
@@ -146,6 +183,25 @@ def env_str_list(env_name: str) -> Callable[[], list[str]]:
     return _get_str_list_env
 
 
+def env_int_list(env_name: str) -> Callable[[], list[int]]:
+    """
+    Accepts a comma-separated string and returns a list of strings.
+
+    Args:
+        env_name: Name of the environment variable
+        default: Default list of strings if not set
+    """
+
+    def _get_int_list_env() -> list[int]:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return []
+
+        return [int(v.strip()) for v in value.split(",")]
+
+    return _get_int_list_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # JAX platform selection (e.g., "tpu", "cpu", "proxy", "proxy,cpu")
     "JAX_PLATFORMS":
@@ -164,6 +220,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Backend for multi-host communication on TPU
     "TPU_MULTIHOST_BACKEND":
     env_with_choices("TPU_MULTIHOST_BACKEND", "", ["ray"]),
+    # Use vLLM-native multi-process data parallelism (one engine process per
+    # DP rank, single load-balanced API endpoint) instead of tpu-inference's
+    # single-process SPMD data parallelism. Each DP rank is pinned to a
+    # disjoint set of TPU chips. Unset (None) means "auto", and
+    # TpuPlatform.check_and_update_config resolves it to a concrete value
+    # (on for online `vllm serve` with DP > 1; off for offline, attention DP,
+    # and Pathways).
+    "TPU_MULTIPROCESS_DP":
+    env_bool("TPU_MULTIPROCESS_DP", default=None),
     # Slice configuration for disaggregated prefill workers
     "PREFILL_SLICES":
     lambda: os.getenv("PREFILL_SLICES", ""),
@@ -226,11 +291,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
-    lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
+    lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", ""),
     # Specify requantization block size for MoE weights
     "MOE_REQUANTIZE_BLOCK_SIZE":
-    lambda: int(block_size) if (block_size := os.getenv(
-        "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
+    lambda: int(block_size)
+    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) else None,
+    # Clip outlier weights before requantization at the given percentile
+    # (e.g. 99.9). Reduces quantization error for large block sizes by
+    # preventing extreme outliers from inflating the per-block scale.
+    "MOE_REQUANTIZE_CLIP_PERCENTILE":
+    lambda: float(pct)
+    if (pct := os.getenv("MOE_REQUANTIZE_CLIP_PERCENTILE")) else None,
+    # By default, it only use max_reqs for attentions. But if set true, it
+    # will precompile max_reqs to power-of-twos between min and max reqs,
+    # and attention will have the num_reqs closer to actual num_reqs. This
+    # makes attention more efficient for num_reqs less than max_reqs but at
+    # the cost of longer model precompilation time.
+    "ATTN_BUCKETIZED_NUM_REQS":
+    env_bool("ATTN_BUCKETIZED_NUM_REQS"),
+    # ATTN_BUCKETIZED_NUM_REQS set to true but the compilation time is too
+    # long, user can set a list of custom buckets (num_reqs to precompile)
+    # separated by comma. The max_reqs will alwasy be added to the buckets
+    "ATTN_CUSTOM_NUM_REQS_BUCKETS":
+    env_int_list("ATTN_CUSTOM_NUM_REQS_BUCKETS"),
     # dictates whether to layout q-proj as NDH (q-heads, model dim, head dim)
     # or DNH (model dim, q-heads, head dim), which is the default (False)
     "LAYOUT_Q_PROJ_AS_NDH":
@@ -244,20 +327,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
-    "SC_KERNEL_THRESHOLD":
-    lambda: int(os.getenv("SC_KERNEL_THRESHOLD") or "16777216"),
-    "SC_KERNEL_COL_CHUNK_SIZE":
-    lambda: int(os.getenv("SC_KERNEL_COL_CHUNK_SIZE") or "3072"),
     "JITTED_MM_MODULE_KEYS":
     env_str_list("JITTED_MM_MODULE_KEYS"),
     "REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES":
     env_str_list("REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES"),
     "RAGGED_GATED_DELTA_RULE_IMPL":
-    env_with_choices("RAGGED_GATED_DELTA_RULE_IMPL",
-                     "ragged_gated_delta_rule_chunked", [
-                         "ragged_gated_delta_rule_ref",
-                         "ragged_gated_delta_rule_chunked", "fused_gdn_kernel"
-                     ]),
+    env_with_choices(
+        "RAGGED_GATED_DELTA_RULE_IMPL",
+        "chunked_jax_pd",
+        [
+            "chunked_jax_pd", "chunked_kernel_pd",
+            "chunked_kernel_p_recurrent_kernel_d"
+        ],
+    ),
+    "RAGGED_GATHER_VERSION":
+    env_with_choices("RAGGED_GATHER_VERSION", "v2", ["v1", "v2"]),
+    "RAGGED_GATHER_REDUCE_VERSION":
+    env_with_choices("RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2"]),
     "MOE_ALL_GATHER_ACTIVATION_DTYPE":
     lambda: os.getenv("MOE_ALL_GATHER_ACTIVATION_DTYPE", ""),
     # kv offload to dram: skip pre-compiling swap-related jax functions
@@ -281,6 +367,66 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv offload to dram: prometheus metrics log interval in seconds
     "TPU_OFFLOAD_METRICS_LOG_INTERVAL":
     lambda: int(os.getenv("TPU_OFFLOAD_METRICS_LOG_INTERVAL", "10")),
+    # kv offload to dram: Whether to use unpinned_host for KV cache tensors on host dram.
+    "TPU_OFFLOAD_USE_UNPINNED_HOST":
+    lambda: bool(int(os.getenv("TPU_OFFLOAD_USE_UNPINNED_HOST", "0"))),
+    "AGGREGATED_STATS_DIR":
+    lambda: os.getenv("AGGREGATED_STATS_DIR", ""),
+    # kv offload to dram: buckets of sizes for pre-compilation
+    "TPU_OFFLOAD_BLOCK_SIZE_BUCKETS":
+    lambda: env_int_list("TPU_OFFLOAD_BLOCK_SIZE_BUCKETS")
+    () or [1, 2, 4, 8, 16, 32, 64],
+    # MoE: whether to use approximate top-k for expert selection.
+    # Enabling this may speedup the expert selection at the risk of accuracy loss.
+    "MOE_APPROX_TOPK":
+    env_bool("MOE_APPROX_TOPK", default=False),
+    # MoE: the target recall rate for approximate top-k expert selection.
+    # A higher rate increases accuracy at the cost of slower speed.
+    # A lower rate can speedup expert selection at the risk of higher accuracy loss.
+    "MOE_APPROX_TOPK_RECALL_TARGET":
+    lambda: float(os.getenv("MOE_APPROX_TOPK_RECALL_TARGET", "0.9")),
+    "DISABLE_WEIGHT_REQUANTIZATION":
+    env_bool("DISABLE_WEIGHT_REQUANTIZATION", default=False),
+    "VLLM_TPU_PATCH_MM_EMBEDDINGS":
+    env_bool("VLLM_TPU_PATCH_MM_EMBEDDINGS", default=False),
+    "DISABLE_MLA_Q_ACTIVATION_QUANTIZATION":
+    env_bool("DISABLE_MLA_Q_ACTIVATION_QUANTIZATION", default=False),
+    # Enable hierarchical reduce-scatter kernel for MoE
+    "ENABLE_RS_KERNEL":
+    env_bool("ENABLE_RS_KERNEL", default=False),
+    # Number of worker threads for parallel XLA precompilation.
+    "NUM_PRECOMPILE_WORKERS":
+    lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),
+    # DP scheudler: hold and batch incoming requests (prefills) to
+    # cluster and dispatch prefills together.
+    "DP_SCHED_BATCH_PREFILL":
+    env_bool("DP_SCHED_BATCH_PREFILL", default=True),
+    # DP scheduler: timeout (ms) to force flush pending requests.
+    "DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS":
+    lambda: int(os.getenv("DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS", "30000")),
+    "MLA_XPOSE_N_TILE_SIZE":
+    lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    "VLLM_MOE_CHUNK_SIZE":
+    lambda: int(os.getenv("VLLM_MOE_CHUNK_SIZE", "0")),
+    # Use Onehot+Matmul for permute and unpermute before and after moe
+    # when the batch size <= this threshold. When set to 0, this feature
+    # is effectively disabled.
+    "ONEHOT_MOE_PERMUTE_THRESHOLD":
+    lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "0")),
+    # Profile a single device instead of all devices.
+    "PROFILE_SINGLE_DEVICE":
+    env_bool("PROFILE_SINGLE_DEVICE", default=False),
+    "LORA_MODULE_PATH":
+    lambda: os.getenv("LORA_MODULE_PATH", ""),
+    "MLA_KV_PACKING_SIZE":
+    lambda: int(os.getenv("MLA_KV_PACKING_SIZE", "32")),
+    # When set to a value, override XLA SparseCore offload minimum size (in Bytes) for all-reduce
+    # and all-gather. When set to 0, use default XLA offload threshold. When set to auto,
+    # use VMEM size as the threshold.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES":
+    lambda: os.getenv("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", "auto"),
+    "MLA_TRANSPOSE_KV_CACHE":
+    env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
 }
 
 

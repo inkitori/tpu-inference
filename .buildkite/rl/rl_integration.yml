@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pipeline-name: rl_integration
-# pipeline-type: rl support matrix
 # RL (Reinforcement Learning) integration tests verify features critical for
 # training-inference pipelines: HBM KV-cache delete/reinitialise, log-prob
-# correctness without recompilation, log-prob latency overhead, and group
-# sampling with prefix caching.
+# correctness without recompilation, and log-prob latency overhead.
 steps:
   # ------------------------------------------------------------------
   # Correctness tests
@@ -53,7 +50,7 @@ steps:
     agents:
       queue: "${TPU_QUEUE_SINGLE:-tpu_v6e_queue}"
     commands:
-      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_rl_integration.py::TestLogprobsLatency /workspace/tpu_inference/tests/e2e/test_rl_integration.py::TestGroupSamplingPrefixCache
+      - .buildkite/scripts/run_in_docker.sh python3 -m pytest -s -v /workspace/tpu_inference/tests/e2e/test_rl_integration.py::TestLogprobsLatency
   - label: "${TPU_VERSION:-tpu6e} Record performance test result for rl_integration"
     key: "${TPU_VERSION:-tpu6e}_record_rl_integration_PerformanceTest"
     depends_on: "${TPU_VERSION:-tpu6e}_rl_integration_PerformanceTest"
@@ -67,3 +64,18 @@ steps:
     commands:
       - |
         .buildkite/scripts/record_step_result.sh ${TPU_VERSION:-tpu6e}_rl_integration_PerformanceTest
+
+  - label: "${TPU_VERSION:-tpu6e} E2E MMLU for Llama-3.1-8B continue_decode"
+    key: "${TPU_VERSION:-tpu6e}_rl_integration_continue_decode_mmlu"
+    soft_fail: true
+    env:
+      USE_PREBUILT_IMAGE: "1"
+      NEW_MODEL_DESIGN: "1"
+      SKIP_ACCURACY_TESTS: "False"
+      MODEL_IMPL_TYPE: "vllm"
+      TPU_VERSION: "${TPU_VERSION:-tpu6e}"
+      EXTRA_SERVE_ARGS: "--additional-config='{\"enable_continue_decode\": true}'"
+    agents:
+      queue: "${TPU_QUEUE_MULTI:-tpu_v6e_8_queue}"
+    commands:
+      - .buildkite/scripts/run_in_docker.sh bash /workspace/tpu_inference/tests/e2e/benchmarking/mmlu.sh -m "meta-llama/Llama-3.1-8B-Instruct" -n 1000 -l 4

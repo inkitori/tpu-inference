@@ -91,6 +91,9 @@ if [ "$BUILDKITE_PULL_REQUEST" != "false" ]; then
     else
       echo "Code files changed. Proceeding with pipeline upload."
     fi
+
+    # Count files not matching the benchmark prefix
+    NON_BENCHMARK_COUNT=$(printf "%s\n" "$NON_SKIPPABLE_FILES" | grep -c -v "^\.buildkite/benchmark" || true)
     
     # Validate custom pipeline metadata (Uniqueness & Completeness)
     if .buildkite/scripts/validate_pipeline_metadata.sh "$NON_SKIPPABLE_FILES"; then
@@ -107,7 +110,6 @@ if [ "$BUILDKITE_PULL_REQUEST" != "false" ]; then
       echo "Some pipelines syntax are invalid. Failing build."
       exit 1
     fi
-
 
     MODEL_FILES="add_model_to_ci\.py|tpu_optimized_model_template\.yml|vllm_native_model_template\.yml"
     FEATURE_FILES="add_feature_to_ci\.py|feature_template\.yml|parallelism_template\.yml"
@@ -126,6 +128,25 @@ fi
 
 # Store changed files in metadata for sub-pipelines (newlines to commas)
 echo "$FILES_CHANGED" | tr '\n' ',' | buildkite-agent meta-data set "changed_files"
+
+# Evaluate which file paths were changed in the PR to dynamically trigger kernel tests.
+# These variables are interpolated into pipeline_jax.yml to skip steps without provisioning TPUs.
+export RUN_KERNEL_TESTS=0
+export RUN_KERNEL_COLLECTIVES_TESTS=0
+
+# Trigger general kernel tests if any of the following are modified:
+# - tpu_inference/kernels/* or tests/kernels/*
+# - tests/conftest.py or requirements.txt
+if echo "$FILES_CHANGED" | grep -qE '^(tpu_inference/kernels|tests/kernels|tests/conftest.py|requirements.txt)'; then
+    export RUN_KERNEL_TESTS=1
+fi
+
+# Trigger collective-specific kernel tests if any of the following are modified:
+# - tpu_inference/kernels/collectives/* or tests/kernels/collectives/*
+# - tests/conftest.py or requirements.txt
+if echo "$FILES_CHANGED" | grep -qE '^(tpu_inference/kernels/collectives|tests/kernels/collectives|tests/conftest.py|requirements.txt)'; then
+    export RUN_KERNEL_COLLECTIVES_TESTS=1
+fi
 
 # Handles the environment state for different TPU generations.
 set_jax_envs() {
@@ -167,10 +188,48 @@ upload_pipeline() {
 
       # buildkite-agent pipeline upload .buildkite/pipeline_torch.yml
       upload_with_priority .buildkite/nightly_releases.yml "$JOB_PRIORITY"
+      upload_with_priority .buildkite/pipeline_pypi.yml "$JOB_PRIORITY"
     fi
 
     upload_with_priority .buildkite/nightly_verify.yml "$JOB_PRIORITY"
-    upload_with_priority .buildkite/pipeline_pypi.yml "$JOB_PRIORITY"
+}
+
+upload_benchmark_pipeline() {
+    export BM_INFRA="true"
+    VLLM_COMMIT_HASH=$(buildkite-agent meta-data get "VLLM_COMMIT_HASH")
+    TPU_COMMIT_HASH=$(git rev-parse HEAD)
+    CODE_HASH="${VLLM_COMMIT_HASH}-${TPU_COMMIT_HASH}-"
+    buildkite-agent meta-data set "CODE_HASH" "${CODE_HASH}"
+    TIMEZONE="America/Los_Angeles"
+    JOB_REFERENCE="$(TZ="$TIMEZONE" date +%Y%m%d_%H%M%S)"
+    buildkite-agent meta-data set "JOB_REFERENCE" "${JOB_REFERENCE}"
+    echo "[BM-DEBUG] Using vllm commit hash: $(buildkite-agent meta-data get "VLLM_COMMIT_HASH")"
+    echo "[BM-DEBUG] Using vllm-tpu commit hash: $(buildkite-agent meta-data get "CODE_HASH")"
+
+    # Upload benchmark pipelines
+    local case_folder=".buildkite/benchmark/cases/ci"
+    local generator_script="${SCRIPT_DIR}/../benchmark/scripts/generate_bk_pipeline.py"
+    local changed_cases=""
+
+    # For PR builds, identify changed benchmark cases outside of ci folder
+    if [ "$BUILDKITE_PULL_REQUEST" != "false" ] && [ -n "${FILES_CHANGED:-}" ]; then
+        echo "--- Identifying changed benchmark cases in PR"
+        export UPLOAD_DB="false"
+        changed_cases=$(echo "$FILES_CHANGED" | grep "^\.buildkite/benchmark/cases/.*\.json$" | grep -v "^\.buildkite/benchmark/cases/ci/" || true)
+        if [ -n "$changed_cases" ]; then
+            echo "Found changed benchmark cases to include:"
+            echo "$changed_cases"
+            # Note: We keep changed_cases as a newline-separated string
+            # to correctly handle filenames with spaces in process_json_benchmark_cases.
+
+            # Upload global case name validation step
+            upload_with_priority .buildkite/validate_benchmark_case_name.yml "$JOB_PRIORITY"
+            export BENCHMARK_VALIDATION_UPLOADED="true"
+        fi
+    fi
+
+    # Process both fixed ci folder and any extra changed cases
+    process_json_benchmark_cases "$case_folder" "$generator_script" "$JOB_PRIORITY" "$changed_cases"
 }
 
 echo "--- Starting Buildkite Bootstrap"
@@ -260,7 +319,11 @@ else
     # If it's a PR, check for the specific label
     if [[ $PR_LABELS == *"ready"* ]]; then
       echo "Found 'ready' label on PR. Uploading main pipeline..."
-      upload_pipeline
+      # Upload main pipeline if file list is empty or contains non-benchmark files
+      if [ -z "${NON_SKIPPABLE_FILES:-}" ] || [ "${NON_BENCHMARK_COUNT:--1}" -ne 0 ]; then
+        upload_pipeline
+      fi
+      upload_benchmark_pipeline
     else
       # Explicitly fail the build because the required 'ready' label is missing.
       echo "Missing 'ready' label on PR. Failing build."
@@ -270,8 +333,12 @@ else
     # If it's NOT a Pull Request (e.g., branch push, tag, manual build)
     echo "This is not a Pull Request build. Uploading main pipeline."
     upload_pipeline
+    upload_benchmark_pipeline
   fi
 fi
 
+# Since Buildkite inserts steps in reverse order, uploading this last 
+# ensures the Docker build steps appear at the very top of the UI.
+upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"
 
 echo "--- Buildkite Bootstrap Finished"

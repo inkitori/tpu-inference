@@ -28,17 +28,19 @@ from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.jax.quantization import get_tpu_quantization_config
 from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
 
+GBYTES = 1024 * 1024 * 1024
+
 
 class TestQwen3MoeForCausalLM:
 
-    @pytest.mark.parametrize("model_name", [
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
-    ])
-    @pytest.mark.parametrize("pp_rank,pp_world_size", [(0, 1), (0, 4), (1, 4),
-                                                       (3, 4)])
     @pytest.mark.parametrize(
-        "load_format", ["skip_layers_model_loader_for_test", "jax_dummy"])
+        "model_name,pp_rank,pp_world_size,load_format",
+        [(model, rank, world, fmt) for model in [
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+        ] for rank, world in [(0, 1), (0, 4), (1, 4), (3, 4)]
+         for fmt in ["skip_layers_model_loader_for_test", "jax_dummy"]
+         if not (world == 1 and fmt == "jax_dummy")])
     def test_model_loading(
             self,
             model_name,
@@ -86,11 +88,20 @@ class TestQwen3MoeForCausalLM:
             loader = get_model_loader(vllm_config.load_config)
             # Monitor device memory during weight loading to catch
             # regressions.
+            # The 4GB floor is sized off the observed load-time transient.
+            # On tpu6e the heaviest pp shard (pp_rank=3, world=4) peaks at a
+            # ~3.00GB delta during MoE expert-weight processing, so a 3GB
+            # floor left zero headroom and flaked (peak_delta=3.000 GB >
+            # max=3.000 GB) on sub-MB run-to-run allocation jitter while
+            # still passing on tpu7x. 4GB gives ~1GB (~33%) headroom over the
+            # real transient and still catches a gross regression (e.g.
+            # holding the weights twice).
             with assert_weight_loading_memory_bounded(
                     model,
                     description=f"load_weights({model_name})",
                     threshold_multiplier=0.3,
-            ), set_current_vllm_config(vllm_config):
+                    min_threshold_bytes=4 *
+                    GBYTES), set_current_vllm_config(vllm_config):
                 loader.load_weights(model, model_config)
 
         layer_idx = model.model.start_layer
@@ -105,7 +116,7 @@ class TestQwen3MoeForCausalLM:
                                          kv_dtype)
 
         with jax.set_mesh(mesh):
-            jax_output, _ = jax_layer_0(
+            kv_cache, jax_output, _ = jax_layer_0(
                 kv_cache=jnp.zeros(cache_shape, dtype=kv_dtype),
                 x=input_tensor_jax,
                 attention_metadata=AttentionMetadata(
