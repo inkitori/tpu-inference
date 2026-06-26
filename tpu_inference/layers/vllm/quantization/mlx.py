@@ -385,7 +385,7 @@ def _make_mlx_moe_bias_loader(layer: "RoutedExperts"):
             expert_data=param.data[local],
             shard_id=shard_id,
             loaded_weight=loaded_weight,
-            tp_rank=layer.tp_rank,
+            tp_rank=layer.moe_config.moe_parallel_config.tp_rank,
             load_full_w2=getattr(param, "load_full_w2", False),
         )
         return True if return_success else None
