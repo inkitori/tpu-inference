@@ -6,6 +6,8 @@
 - **Upstream vLLM source:** `~/vllm` — the upstream vllm repository
 - **TPU helper scripts:** `~/tpu-tooling`
 
+You also have uv installed here, so use that to create venvs and install packages.
+
 ## TPU tooling scripts (`~/tpu-tooling`)
 
 ### `tpu-env.sh` — load the vLLM/JAX-on-TPU env and run a command in it (no sourcing needed)
