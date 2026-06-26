@@ -1,5 +1,9 @@
 # Project: tpu-inference
 
+## Commit and push often
+
+This is a preemptible node, which means all your work can disappear at any moment. Make sure to commit and push often.
+
 ## Local environment paths
 
 - **vLLM venv:** `~/vllm_env` (Python 3.12). Activate with `source ~/vllm_env/bin/activate`, or use the `tpu-env.sh` wrapper below.
@@ -9,6 +13,21 @@
 You also have uv installed here, so use that to create venvs and install packages.
 
 ## TPU tooling scripts (`~/tpu-tooling`)
+
+### Always confirm the GCS bucket is in this VM's region first
+
+Before any operation that uses the VM with the mounted bucket — **serving a model,
+loading a checkpoint, benchmarking** (anything via `tpu-env.sh`, which points
+`HF_HOME` at the gcsfuse-mounted bucket) — first make sure the bucket is in the
+**same region** as this TPU VM. A cross-region bucket means every checkpoint byte
+is a slow, billable cross-region transfer.
+
+```bash
+~/tpu-tooling/check-gcs-region.sh   # exit 0 = same region, 1 = mismatch, 2 = undetermined
+```
+
+`tpu-env.sh` runs this automatically and **refuses to start on a region mismatch**;
+override an intentional cross-region run with `ALLOW_CROSS_REGION=1`.
 
 ### `tpu-env.sh` — load the vLLM/JAX-on-TPU env and run a command in it (no sourcing needed)
 
@@ -27,6 +46,7 @@ Optional env vars (set inline or export first):
 - `MODEL_IMPL_TYPE` — vLLM/JAX impl (default `vllm`)
 - `SKIP_JAX_PRECOMPILE` — faster startup (default `1`)
 - `TPU_GCS_MOUNT` — gcsfuse mount path (default `/tmp/gcs/bucket`)
+- `ALLOW_CROSS_REGION` — set to `1` to bypass the same-region bucket guard (default unset; the guard hard-blocks on a region mismatch)
 
 Example: `OMP_NUM_THREADS=32 TPU_VENV=~/other_env ~/tpu-tooling/tpu-env.sh vllm serve ...`
 
