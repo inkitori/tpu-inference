@@ -422,55 +422,69 @@ def inner_kernel(
 
         acc_list = []
         if cfgs.lhs_cfgs.quant_dtype is None:
-            # Unquantized matmul path.
+            # Unquantized matmul path (W4A16: bf16 lhs, dequant-on-the-fly rhs).
+            #
+            # F1 fold: rhs_scale[b, 0, n] is constant across the rhs_qbs k's in
+            # block b, so (lhs @ q_block) * scale[b, n] == lhs @ (q_block *
+            # scale[b, n]). Folding scale into the dequantized rhs columns lets
+            # us run ONE full-tile_k matmul per n-chunk instead of one width-64
+            # (rhs_qbs) matmul per quant block, keeping the 128-lane MXU
+            # contraction dim fully fed.
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            num_blocks = cfgs.num_quant_blocks_per_tile_k
+
+            # Clamped per-block indices into the scale/groupbias buffers. tile_k
+            # may over-align past size_k, so those buffers hold only
+            # num_quant_blocks_per_tile_k_read real blocks. Clamp so the
+            # over-aligned tail reads an in-bounds (real) block; the tail's q and
+            # lhs are already zeroed by the k-tail mask above, so the folded
+            # contribution of those blocks is 0 regardless of which row is read.
+            n_read = cfgs.num_quant_blocks_per_tile_k_read
+            # Per-block read indices (Python ints) for the over-aligned tail
+            # clamp; used to slice the scale/groupbias buffers per block.
+            block_read_ids = [min(b, n_read - 1) for b in range(num_blocks)]
+
+            # n-independent: hoist the per-block lhs sums (F2) out of the start_n
+            # loop. lhs_block_sums[t, b] = sum_{k in block b} lhs[t, k].
+            if cfgs.rhs_cfgs.has_groupbias:
+                lhs_block_sums = tiled_lhs.reshape(cfgs.tiles.tile_m, num_blocks,
+                                                   rhs_qbs).sum(axis=2)
+
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
 
-                acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size),
-                                  dtype=acc_ref.dtype)
-                for b_id in range(cfgs.num_quant_blocks_per_tile_k):
-                    k_start = b_id * rhs_qbs
-                    k_end = k_start + rhs_qbs
+                # Dequantize the full tile_k of rhs once for this n-chunk.
+                w = tiled_rhs[:, start_n:end_n].astype(acc_ref.dtype)
+                if cfgs.rhs_cfgs.has_scale:
+                    # Gather each block's scale row (clamped tail) -> [num_blocks,
+                    # col], then expand across the rhs_qbs k's per block ->
+                    # [tile_k, col]. Built from static slices (not a captured
+                    # array constant, which Pallas disallows).
+                    rhs_scale = tiled_rhs_ref.get_scale()
+                    sc_blocks = jnp.concatenate(
+                        [rhs_scale[b, :, start_n:end_n] for b in block_read_ids],
+                        axis=0)
+                    sc_exp = jnp.repeat(sc_blocks, rhs_qbs, axis=0)
+                    w = w * sc_exp.astype(acc_ref.dtype)
 
-                    # tile_k is lane-aligned and may over-align past size_k, so
-                    # the scale/groupbias buffer holds only
-                    # num_quant_blocks_per_tile_k_read real blocks (<= b_id range
-                    # when size_k is not a multiple of num_lanes). Clamp the
-                    # block index into the buffer so the over-aligned tail reads
-                    # an in-bounds (real) block instead of out of bounds; that
-                    # block's matmul value and lhs sum are already zeroed by the
-                    # k-tail mask, so its scaled/biased contribution is 0.
-                    b_id_read = min(b_id,
-                                    cfgs.num_quant_blocks_per_tile_k_read - 1)
+                # ONE matmul over the full tile_k.
+                acc_n = jnp.matmul(
+                    tiled_lhs, w,
+                    preferred_element_type=jnp.float32).astype(acc_ref.dtype)
 
-                    block_acc = jnp.matmul(
-                        tiled_lhs[:, k_start:k_end],
-                        tiled_rhs[k_start:k_end, start_n:end_n],
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
+                # Per-group additive bias (MLX affine: w = scale*q + bias). The
+                # contribution out[t, n] += sum_b gbias[b, n] * sum_{k in b}
+                # lhs[t, k] is exactly (lhs_block_sums @ gbias_blocks)[t, n].
+                if cfgs.rhs_cfgs.has_groupbias:
+                    rhs_gbias = tiled_rhs_ref.get_groupbias()
+                    gb_blocks = jnp.concatenate(
+                        [rhs_gbias[b, :, start_n:end_n] for b in block_read_ids],
+                        axis=0)
+                    acc_n += jnp.matmul(
+                        lhs_block_sums, gb_blocks.astype(acc_ref.dtype),
+                        preferred_element_type=jnp.float32).astype(acc_ref.dtype)
 
-                    if cfgs.rhs_cfgs.has_scale:
-                        tiled_rhs_scale = tiled_rhs_ref.get_scale()
-                        block_acc *= tiled_rhs_scale[b_id_read, :,
-                                                     start_n:end_n].astype(
-                                                         acc_ref.dtype)
-
-                    # Per-group additive bias (MLX affine: w = scale*q + bias).
-                    # Contribution to out[t, n] is groupbias[g, n] * sum_k lhs[t, k]
-                    # over the k in this quant block. Added before fuse_act.
-                    if cfgs.rhs_cfgs.has_groupbias:
-                        tiled_rhs_gbias = tiled_rhs_ref.get_groupbias()
-                        block_lhs_sum = jnp.sum(tiled_lhs[:, k_start:k_end],
-                                                axis=1,
-                                                keepdims=True)
-                        block_acc += (
-                            tiled_rhs_gbias[b_id_read, :, start_n:end_n] *
-                            block_lhs_sum).astype(acc_ref.dtype)
-
-                    acc_n += block_acc
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
