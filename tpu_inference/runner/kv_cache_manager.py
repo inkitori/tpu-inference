@@ -564,23 +564,41 @@ class KVCacheManager:
                                 f"draft_layer.{i}"] = self._create_attention_spec(
                                     block_size, num_kv_heads, head_size)
                 elif method == "dflash":
-                    num_kv_heads = common_utils.get_padded_num_heads(
-                        draft_hf_config.num_key_value_heads, model_cnt)
-                    head_size = common_utils.get_padded_head_dim(
-                        draft_hf_config.hidden_size //
-                        draft_hf_config.num_attention_heads)
-                    # DFlash draft has num_hidden_layers layers
-                    draft_num_layers = getattr(draft_hf_config,
-                                               'num_hidden_layers', 1)
-                    for i in range(draft_num_layers):
-                        if self.use_mla:
-                            kv_cache_spec[
-                                f"draft_layer.{i}"] = self._create_attention_spec(
-                                    block_size, 1, mla_head_size)
-                        else:
-                            kv_cache_spec[
-                                f"draft_layer.{i}"] = self._create_attention_spec(
-                                    block_size, num_kv_heads, head_size)
+                    # The torchax/vllm DFlash proposer
+                    # (spec_decode/vllm/dflash.py::DFlashTorchaxProposer) is
+                    # STATELESS: it recomputes the draft context from scratch
+                    # every step (functional_call, use_cache=False) and never
+                    # reads or writes an on-device KV cache. Registering
+                    # `draft_layer.{i}` KV-cache groups for it is not just
+                    # wasteful — it adds extra KV-cache groups with no driving
+                    # attention layer, which flips the TARGET runner onto the
+                    # hybrid/multi-group path (tpu_runner.py:987,
+                    # use_hybrid_kvcache = len(kv_cache_groups) > 1). The target
+                    # forward then builds a kv-cache-update for a group whose
+                    # feature dim is an unbacked symint, and the Pallas RPA
+                    # kv-cache-update async_copy rejects the (block_size,
+                    # <unbacked>) shape -> first-decode crash. So register ZERO
+                    # draft KV groups for the stateless torchax path and keep the
+                    # target on its single-group static-shape path.
+                    if tpu_envs.DRAFT_MODEL_IMPL_TYPE not in ("vllm",
+                                                              "torchax"):
+                        num_kv_heads = common_utils.get_padded_num_heads(
+                            draft_hf_config.num_key_value_heads, model_cnt)
+                        head_size = common_utils.get_padded_head_dim(
+                            draft_hf_config.hidden_size //
+                            draft_hf_config.num_attention_heads)
+                        # DFlash draft has num_hidden_layers layers
+                        draft_num_layers = getattr(draft_hf_config,
+                                                   'num_hidden_layers', 1)
+                        for i in range(draft_num_layers):
+                            if self.use_mla:
+                                kv_cache_spec[
+                                    f"draft_layer.{i}"] = self._create_attention_spec(
+                                        block_size, 1, mla_head_size)
+                            else:
+                                kv_cache_spec[
+                                    f"draft_layer.{i}"] = self._create_attention_spec(
+                                        block_size, num_kv_heads, head_size)
         else:
             # Else propagate attention modules from compilation config.
             layers = get_layers_from_vllm_config(
