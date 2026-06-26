@@ -20,18 +20,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
-
-try:
-    from transformers import Gemma4TextConfig
-except ImportError:
-    print(
-        "Gemma4 is not available until transformers v5.5.0. Please upgrade transformers to use Gemma4 model."
-    )
-
-    class Gemma4TextConfig:
-        pass
-
-
+from transformers import Gemma4TextConfig
 from vllm.config import VllmConfig
 
 from tpu_inference import utils
@@ -43,13 +32,17 @@ from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
-from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear
+from tpu_inference.layers.jax.linear import (JaxEinsum, JaxLinear, JaxLmHead,
+                                             JaxMergedColumnParallelLinear,
+                                             JaxQKVParallelLinear)
 from tpu_inference.layers.jax.moe.moe import JaxMoE
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
-from tpu_inference.layers.jax.rope_interface import apply_rope
+from tpu_inference.layers.jax.rope_interface import (apply_rope,
+                                                     normalize_rope_scaling)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
+from tpu_inference.models.common.kv_share import compute_kv_share_map
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
@@ -69,29 +62,25 @@ class Gemma4MLP(JaxModule):
                  dtype: jnp.dtype,
                  rng: nnx.Rngs,
                  quant_config: VllmQuantConfig,
+                 intermediate_size: int,
                  prefix: str = ""):
         hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
+        # `intermediate_size` is the per-layer MLP width. KV-shared layers
+        # use 2x config.intermediate_size when text_config.use_double_wide_mlp
+        # is set (matches vllm-pytorch `Gemma4DecoderLayer.__init__`'s
+        # `layer_intermediate_size` computation); otherwise it's just
+        # config.intermediate_size. The caller computes this in
+        # Gemma4DecoderLayer and passes it in explicitly.
 
-        self.gate_proj = JaxLinear(
+        self.gate_up_proj = JaxMergedColumnParallelLinear(
             hidden_size,
-            intermediate_size,
+            [intermediate_size] * 2,
             use_bias=False,
             param_dtype=dtype,
             kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
             rngs=rng,
             quant_config=quant_config,
             prefix=prefix + ".gate_proj",
-        )
-        self.up_proj = JaxLinear(
-            hidden_size,
-            intermediate_size,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".up_proj",
         )
         self.down_proj = JaxLinear(
             intermediate_size,
@@ -106,8 +95,9 @@ class Gemma4MLP(JaxModule):
         self.act_fn = partial(nnx.gelu, approximate=True)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate = self.act_fn(self.gate_proj(x))
-        up = self.up_proj(x)
+        gate_up = self.gate_up_proj(x)
+        gate, up = jnp.split(gate_up, 2, axis=-1)
+        gate = self.act_fn(gate)
         fuse = gate * up
         result = self.down_proj(fuse)
         return result
@@ -166,7 +156,7 @@ class Gemma4Router(JaxModule):
         """Returns raw router logits [T, E]."""
         x = self.norm(x)
         x = x * self.root_size
-        x = x * self.scale.value.astype(x.dtype)
+        x = x * self.scale.get_value().astype(x.dtype)
         router_logits = self.proj(x)
         return router_logits
 
@@ -184,7 +174,7 @@ class Gemma4MoE(JaxMoE):
 
     def __init__(
         self,
-        config,
+        config: Gemma4TextConfig,
         dtype,
         mesh,
         rngs: nnx.Rngs,
@@ -218,24 +208,10 @@ class Gemma4MoE(JaxMoE):
             scoring_func=
             "softmax",  # vLLM implementation has a custom routing function, here we just use "softmax" for MVP
             renormalize=True,
+            enable_return_routed_experts=True,
+            num_experts_per_tok=config.top_k_experts,
             quant_config=quant_config,
             prefix=prefix)
-
-    def __call__(self, x_TD: jax.Array, router_logits: jax.Array):
-        """Performs the forward pass of the MoE layer.
-
-        Args:
-            x_TD: Input array of shape (sequence_length, d_model).
-            router_logits: Router logits of shape (sequence_length, num_experts).
-
-        Returns:
-            Output array of shape (sequence_length, d_model) after passing through MoE.
-        """
-        if self.quant_method is not None:
-            return self.quant_method.apply_jax(self,
-                                               x_TD,
-                                               router_logits=router_logits)
-        raise ValueError("Expected quant_method to be set!")
 
     def load_weights(self, weights: Iterable):
         """Load weights for Gemma4 MoE layer.
@@ -253,8 +229,8 @@ class Gemma4MoE(JaxMoE):
                 self.kernel_down_proj_EFD._weights_to_load.clear()
                 # Other MoE models store expert weights in shape (D, F) and permute in *FusedMoEMethod.process_weights_after_loading.
                 # For compatibility, we permute here then expect another permute in process_weights_after_loading.
-                self.kernel_down_proj_EFD.value = jnp.swapaxes(
-                    self.kernel_down_proj_EFD.value, 1, 2)
+                self.kernel_down_proj_EFD.set_value(
+                    jnp.swapaxes(self.kernel_down_proj_EFD.get_value(), 1, 2))
             elif name.endswith("gate_up_proj"):
                 F = tensor.shape[1] // 2
                 load_nnx_param_from_reshaped_torch(self.kernel_gating_EDF,
@@ -271,10 +247,10 @@ class Gemma4MoE(JaxMoE):
                 self.kernel_gating_EDF._weights_to_load.clear()
                 # Other MoE models store expert weights in shape (F, D) and permute in *FusedMoEMethod.process_weights_after_loading.
                 # For compatibility, we permute here then expect another permute in process_weights_after_loading.
-                self.kernel_up_proj_EDF.value = jnp.swapaxes(
-                    self.kernel_up_proj_EDF.value, 1, 2)
-                self.kernel_gating_EDF.value = jnp.swapaxes(
-                    self.kernel_gating_EDF.value, 1, 2)
+                self.kernel_up_proj_EDF.set_value(
+                    jnp.swapaxes(self.kernel_up_proj_EDF.get_value(), 1, 2))
+                self.kernel_gating_EDF.set_value(
+                    jnp.swapaxes(self.kernel_gating_EDF.get_value(), 1, 2))
         return loaded
 
 
@@ -312,8 +288,11 @@ class Gemma4Attention(JaxModule):
             rope_parameters = rope_parameters[self.layer_type]
             self.rope_theta = rope_parameters.get(
                 "rope_theta", getattr(config, "rope_theta", 10000.0))
-            self.rope_scaling = rope_parameters.get(
-                "rope_scaling", getattr(config, "rope_scaling", None))
+            rope_scaling = rope_parameters.get(
+                "rope_scaling", None) or getattr(config, "rope_scaling", None)
+            if rope_scaling is None and "rope_type" in rope_parameters:
+                rope_scaling = rope_parameters
+            self.rope_scaling = normalize_rope_scaling(rope_scaling)
             self.rope_proportion = rope_parameters.get("partial_rotary_factor",
                                                        1.0)
         else:
@@ -343,19 +322,70 @@ class Gemma4Attention(JaxModule):
 
         self.mesh = mesh
 
-        self.q_proj = JaxEinsum(
-            "TD,DNH->TNH",
-            (self.hidden_size, self.num_heads, self.head_dim),
-            bias_shape=(self.num_heads,
-                        self.head_dim) if config.attention_bias else None,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
-            bias_init=nnx.with_partitioning(init_fn, ("model", None))
-            if config.attention_bias else None,
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".q_proj",
-        )
+        # Shard k/v projections along the kv-heads dimension when num_kv_heads
+        # is divisible by tp_size — this matches the ragged-paged-attention
+        # kernel's expected sharding (P(ATTN_DATA, ATTN_HEAD, None)) and avoids
+        # XLA inserting all-to-all reshuffles every layer. When num_kv_heads <
+        # tp_size (e.g. global layers with k_eq_v + num_global_key_value_heads
+        # = 4 at TP=8), fall back to sharding the head_dim axis; the kernel
+        # replicates kv-heads internally for that case.
+        _tp_size = utils.get_mesh_shape_product(mesh, ShardingAxisName.MODEL)
+        _shard_kv_on_k = (_tp_size <= 1) or (self.num_kv_heads % _tp_size == 0)
+        if not _shard_kv_on_k:
+            logger.warning_once(
+                f"num_kv_heads={self.num_kv_heads} is not divisible by TP size {_tp_size}, "
+                "sharding k/v projections on head_dim instead of kv-heads. This may cause "
+                "all-to-all communication overhead.")
+        _kv_kernel_spec = (None, "model",
+                           None) if _shard_kv_on_k else (None, None, "model")
+        _kv_bias_spec = ("model", None) if _shard_kv_on_k else (None, "model")
+
+        if use_k_eq_v:  # TODO: Add QKV fusion logic for k == v case.
+            self.qkv_proj = None
+            self.q_proj = JaxEinsum(
+                "TD,DNH->TNH",
+                (self.hidden_size, self.num_heads, self.head_dim),
+                bias_shape=(self.num_heads,
+                            self.head_dim) if config.attention_bias else None,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn,
+                                                  (None, "model", None)),
+                bias_init=nnx.with_partitioning(init_fn, ("model", None))
+                if config.attention_bias else None,
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".q_proj",
+            )
+            self.k_proj = JaxEinsum(
+                "TD,DKH->TKH",
+                (self.hidden_size, self.num_kv_heads, self.head_dim),
+                bias_shape=(self.num_kv_heads,
+                            self.head_dim) if config.attention_bias else None,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, _kv_kernel_spec),
+                bias_init=nnx.with_partitioning(init_fn, _kv_bias_spec)
+                if config.attention_bias else None,
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".k_proj",
+            )
+            self.v_proj = None
+        else:
+            self.qkv_proj = JaxQKVParallelLinear(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                use_bias=config.attention_bias,
+                dtype=dtype,
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
+
         self.q_norm = JaxRmsNorm(
             self.head_dim,
             epsilon=self.rms_norm_eps,
@@ -365,38 +395,6 @@ class Gemma4Attention(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".q_norm",
         )
-
-        self.k_proj = JaxEinsum(
-            "TD,DKH->TKH",
-            (self.hidden_size, self.num_kv_heads, self.head_dim),
-            bias_shape=(self.num_kv_heads,
-                        self.head_dim) if config.attention_bias else None,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, None, "model")),
-            bias_init=nnx.with_partitioning(init_fn, (None, "model"))
-            if config.attention_bias else None,
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".k_proj",
-        )
-        # --- Shared KV Projection Logic ---
-        if use_k_eq_v:
-            self.v_proj = None
-        else:
-            self.v_proj = JaxEinsum(
-                "TD,DKH->TKH",
-                (self.hidden_size, self.num_kv_heads, self.head_dim),
-                bias_shape=(self.num_kv_heads,
-                            self.head_dim) if config.attention_bias else None,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(init_fn,
-                                                  (None, None, "model")),
-                bias_init=nnx.with_partitioning(init_fn, (None, "model"))
-                if config.attention_bias else None,
-                rngs=rng,
-                quant_config=quant_config,
-                prefix=prefix + ".v_proj",
-            )
 
         self.k_norm = JaxRmsNorm(
             self.head_dim,
@@ -423,7 +421,7 @@ class Gemma4Attention(JaxModule):
             (self.num_heads, self.head_dim, self.hidden_size),
             bias_shape=(self.hidden_size, ) if config.attention_bias else None,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None, None)),
             bias_init=nnx.with_partitioning(init_fn, (None, ))
             if config.attention_bias else None,
             rngs=rng,
@@ -439,9 +437,20 @@ class Gemma4Attention(JaxModule):
             self.kv_cache_quantized_dtype = utils.get_jax_dtype_from_str_dtype(
                 kv_cache_dtype)
 
-        num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
-        assert num_kv_shared_layers == 0, "Expect no shared layers"
-        self.is_kv_shared_layer = False
+        # KV-cache sharing (mirrors vllm-pytorch `Gemma4Attention.__init__`
+        # KV-share derivation). Layers in the last `num_kv_shared_layers`
+        # reuse K/V from earlier layers of matching attention type. The
+        # runner side populates the redirect mapping; this layer just needs
+        # to set is_kv_shared_layer + kv_sharing_target_layer_name.
+        kv_share_map = compute_kv_share_map(config)
+        self.is_kv_shared_layer = layer_idx in kv_share_map
+        self.kv_sharing_target_layer_name: Optional[str] = None
+        if self.is_kv_shared_layer:
+            # The runner uses unprefixed "layer.{i}" keys; this string must
+            # match the keys produced by KVCacheManager's spec-creation loop
+            # and Gemma4Model's layer-name iteration.
+            self.kv_sharing_target_layer_name = (
+                f"layer.{kv_share_map[layer_idx]}")
 
     def __call__(
         self,
@@ -450,13 +459,13 @@ class Gemma4Attention(JaxModule):
         attention_metadata: AttentionMetadata,
     ) -> Tuple[jax.Array, jax.Array]:
         md = attention_metadata
-        k = self.k_proj(x)
-        if self.v_proj is None:
-            v = k
+        if self.qkv_proj is not None:
+            q, k, v = self.qkv_proj(x)
         else:
-            v = self.v_proj(x)
-        # q: (T, N, H)
-        q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = k
+            # q: (T, N, H)
+            q = self.q_proj(x)
         # Q norm (always applied)
         q = self.q_norm(q)
 
@@ -478,7 +487,24 @@ class Gemma4Attention(JaxModule):
 
             v = self.v_norm(v)
         else:
-            raise NotImplementedError("Expect no shared layers")
+            # KV-shared branch (mirrors the `else: # Shared: only apply RoPE
+            # to Q` branch of vllm-pytorch `Gemma4Attention.forward`):
+            # Only Q gets RoPE. K and V are NOT normalized and NOT RoPE-rotated.
+            # The cache slot (redirected by the runner)
+            # holds the source layer's already-normed-and-roped K/V for ALL
+            # positions (source's call ran first in the same step and wrote
+            # them). We pass update_kv_cache=False so the kernel both (a) does
+            # not overwrite the source slot with our raw k,v and (b) reads
+            # everything from cache rather than mixing in the layer's own
+            # input k,v. Shared's input k,v is therefore unused for attention
+            # math; we still allocate q_proj/k_proj/v_proj because gemma-4's
+            # checkpoint stores full Q/K/V weights for shared layers.
+            q = apply_rope(q,
+                           md.input_positions,
+                           self.head_dim_original,
+                           self.rope_theta,
+                           self.rope_scaling,
+                           rope_proportion=self.rope_proportion)
 
         q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
@@ -500,6 +526,7 @@ class Gemma4Attention(JaxModule):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            update_kv_cache=not self.is_kv_shared_layer,
         )
         # (T, D)
         o = self.o_proj(outputs)
@@ -528,6 +555,11 @@ class Gemma4DecoderLayer(JaxModule):
             self.layer_type = text_config.layer_types[layer_idx]
 
         self.is_sliding = self.layer_type == "sliding_attention"
+
+        # PLE (Per-Layer Embedding) — per-layer modules in the decoder.
+        # Active when hidden_size_per_layer_input > 0 (E2B/E4B: 256; 26B/31B: 0).
+        self.hidden_size_per_layer_input = getattr(
+            text_config, "hidden_size_per_layer_input", 0)
 
         self.layer_scalar = nnx.Param(jnp.ones((1, ), dtype=dtype))
 
@@ -568,11 +600,21 @@ class Gemma4DecoderLayer(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".pre_feedforward_layernorm",
         )
+        # Double-wide MLP: KV-shared layers get 2x intermediate_size when
+        # text_config.use_double_wide_mlp is set (mirrors vllm-pytorch's
+        # `Gemma4DecoderLayer.__init__` gating).
+        is_kv_shared = layer_idx in compute_kv_share_map(text_config)
+        use_double_wide_mlp = (getattr(text_config, "use_double_wide_mlp",
+                                       False) and is_kv_shared)
+        layer_intermediate_size = (text_config.intermediate_size *
+                                   (2 if use_double_wide_mlp else 1))
+
         self.mlp = Gemma4MLP(
             config=text_config,
             dtype=dtype,
             rng=rng,
             quant_config=quant_config,
+            intermediate_size=layer_intermediate_size,
             prefix=prefix + ".mlp",
         )
         self.post_feedforward_layernorm = JaxRmsNorm(
@@ -585,6 +627,45 @@ class Gemma4DecoderLayer(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".post_feedforward_layernorm",
         )
+
+        # PLE per-layer modules. Constructed only when
+        # hidden_size_per_layer_input > 0; otherwise these stay None and
+        # the PLE block in __call__ is gated off.
+        if self.hidden_size_per_layer_input > 0:
+            P = self.hidden_size_per_layer_input
+            self.per_layer_input_gate = JaxEinsum(
+                "TD,DP->TP",
+                (hidden_size, P),
+                bias_shape=None,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".per_layer_input_gate",
+            )
+            self.per_layer_projection = JaxEinsum(
+                "TP,PD->TD",
+                (P, hidden_size),
+                bias_shape=None,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".per_layer_projection",
+            )
+            self.post_per_layer_input_norm = JaxRmsNorm(
+                hidden_size,
+                epsilon=rms_norm_eps,
+                param_dtype=dtype,
+                scale_init=nnx.with_partitioning(init_fn, (None, )),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".post_per_layer_input_norm",
+            )
+        else:
+            self.per_layer_input_gate = None
+            self.per_layer_projection = None
+            self.post_per_layer_input_norm = None
 
         # MoE (Mixture of Experts) — router + expert block parallel to MLP
         self.enable_moe_block = getattr(text_config, "enable_moe_block", False)
@@ -638,7 +719,8 @@ class Gemma4DecoderLayer(JaxModule):
         kv_cache: jax.Array,
         x: jax.Array,
         attention_metadata: AttentionMetadata,
-    ) -> Tuple[jax.Array, jax.Array]:
+        per_layer_input: Optional[jax.Array] = None,
+    ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array]]:
         residual = x
         hidden_states = self.input_layernorm(x)
         kv_cache, attn_output = self.self_attn(
@@ -650,6 +732,7 @@ class Gemma4DecoderLayer(JaxModule):
         hidden_states = residual + attn_output
         residual = hidden_states
 
+        expert_ids = None
         if self.enable_moe_block:
             # Dense MLP branch
             hidden_states_1 = self.pre_feedforward_layernorm(hidden_states)
@@ -661,7 +744,8 @@ class Gemma4DecoderLayer(JaxModule):
             # norm + scale internally); experts see separately normed input
             router_logits = self.router(hidden_states)
             hidden_states_2 = self.pre_feedforward_layernorm_2(hidden_states)
-            hidden_states_2 = self.experts(hidden_states_2, router_logits)
+            hidden_states_2, expert_ids = self.experts(hidden_states_2,
+                                                       router_logits)
             hidden_states_2 = self.post_feedforward_layernorm_2(
                 hidden_states_2)
 
@@ -675,9 +759,21 @@ class Gemma4DecoderLayer(JaxModule):
         mlp_output = self.post_feedforward_layernorm(hidden_states)
         outputs = residual + mlp_output
 
-        outputs = outputs * self.layer_scalar.value
+        # PLE per-layer block. Gated on having both a
+        # per_layer_input AND the modules being constructed (the latter
+        # is governed by hidden_size_per_layer_input > 0 in __init__).
+        if per_layer_input is not None and self.per_layer_input_gate is not None:
+            gate = self.per_layer_input_gate(outputs)
+            gate = nnx.gelu(gate, approximate=True)
+            gated_per_layer = gate * per_layer_input
+            per_layer_contribution = self.per_layer_projection(gated_per_layer)
+            per_layer_contribution = self.post_per_layer_input_norm(
+                per_layer_contribution)
+            outputs = outputs + per_layer_contribution
 
-        return kv_cache, outputs
+        outputs = outputs * self.layer_scalar.get_value()
+
+        return kv_cache, outputs, expert_ids
 
 
 class Gemma4Model(JaxModule):
@@ -701,6 +797,14 @@ class Gemma4Model(JaxModule):
         # Gemma 4: Embeddings are scaled by sqrt(hidden_size)
         self.embedding_scale = hidden_size**0.5
 
+        # PLE (Per-Layer Embedding) — model-level modules.
+        # Active when hidden_size_per_layer_input > 0 (E2B/E4B).
+        self.hidden_size_per_layer_input = getattr(
+            text_config, "hidden_size_per_layer_input", 0)
+        self.vocab_size_per_layer_input = getattr(
+            text_config, "vocab_size_per_layer_input", vocab_size)
+        self.num_hidden_layers = text_config.num_hidden_layers
+
         if self.is_first_rank or (hf_config.tie_word_embeddings
                                   and self.is_last_rank):
             self.embed_tokens = JaxEmbed(
@@ -714,6 +818,71 @@ class Gemma4Model(JaxModule):
             )
         else:
             self.embed_tokens = PPMissingLayer()
+
+        # Model-level PLE modules. Constructed only on first rank when
+        # PLE is active, since they're consumed in __call__ before the
+        # decoder loop.
+        if self.hidden_size_per_layer_input > 0 and self.is_first_rank:
+            P = self.hidden_size_per_layer_input
+            L = self.num_hidden_layers
+            # embed_tokens_per_layer: vocab_size_per_layer_input -> L*P.
+            # Replicated across model axis (small enough; gather_output
+            # at use site).
+            self.embed_tokens_per_layer = JaxEmbed(
+                num_embeddings=self.vocab_size_per_layer_input,
+                features=L * P,
+                param_dtype=dtype,
+                embedding_init=nnx.with_partitioning(init_fn, (None, None)),
+                rngs=rng,
+                quant_config=vllm_config.quant_config,
+                prefix=prefix + ".embed_tokens_per_layer",
+            )
+            # PLE is non-standard so we set its weight_loader here (per the
+            # guidance in weight_utils.py:883) rather than adding a new
+            # special case to the central pattern list. HF stores
+            # embed_tokens_per_layer.weight as (V_ple, L*P); JaxEmbed expects
+            # the same shape — explicit permute_dims=(0,1) suppresses the
+            # default 2D-transpose that load_nnx_param_from_reshaped_torch
+            # applies when permute_dims is None.
+            self.embed_tokens_per_layer.weight.set_metadata(
+                "weight_loader",
+                partial(load_nnx_param_from_reshaped_torch,
+                        permute_dims=(0, 1),
+                        param_name=prefix + ".embed_tokens_per_layer.weight"))
+            # per_layer_model_projection: H -> L*P. ColumnParallelLinear
+            # with gather_output=True in vllm; we replicate output.
+            self.per_layer_model_projection = JaxEinsum(
+                "TD,DM->TM",
+                (hidden_size, L * P),
+                bias_shape=None,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, None)),
+                rngs=rng,
+                quant_config=vllm_config.quant_config,
+                prefix=prefix + ".per_layer_model_projection",
+            )
+            # RMSNorm over P (last dim of [T, L, P]).
+            self.per_layer_projection_norm = JaxRmsNorm(
+                P,
+                epsilon=rms_norm_eps,
+                param_dtype=dtype,
+                scale_init=nnx.with_partitioning(init_fn, (None, )),
+                rngs=rng,
+                quant_config=vllm_config.quant_config,
+                prefix=prefix + ".per_layer_projection_norm",
+            )
+            # Constants as Python floats (single-ownership).
+            # NOTE: gemma-4 uses H^-0.5 (gemma-3n flipped to H^0.5).
+            self.embed_scale_per_layer = float(P)**0.5
+            self.per_layer_input_scale = 1.0 / (2.0**0.5)
+            self.per_layer_projection_scale = float(hidden_size)**-0.5
+        else:
+            self.embed_tokens_per_layer = None
+            self.per_layer_model_projection = None
+            self.per_layer_projection_norm = None
+            self.embed_scale_per_layer = 0.0
+            self.per_layer_input_scale = 0.0
+            self.per_layer_projection_scale = 0.0
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             text_config.num_hidden_layers,
@@ -741,6 +910,78 @@ class Gemma4Model(JaxModule):
         else:
             self.norm = PPMissingLayer()
 
+    def compute_per_layer_inputs(
+        self,
+        input_ids: Optional[jax.Array],
+        inputs_embeds: jax.Array,
+        is_multimodal: Optional[jax.Array] = None,
+    ) -> Optional[jax.Array]:
+        """Compute per_layer_inputs of shape [T, L, P].
+
+        See vllm/model_executor/models/gemma4.py:Gemma4SelfDecoderLayers.
+        get_per_layer_inputs / project_per_layer_inputs for the reference
+        algorithm: Track A is an embed_tokens_per_layer lookup scaled by
+        sqrt(P) and reshaped to (T, L, P); Track B is a linear projection
+        of inputs_embeds (post embedding-scale) scaled by 1/sqrt(H), reshaped
+        to (T, L, P) and RMSNorm'd over P. The result is
+        `(track_a + track_b) * 1/sqrt(2)`.
+
+        Returns None when PLE is disabled (hidden_size_per_layer_input=0)
+        or when the model-level PLE modules aren't constructed (non-first
+        pp rank).
+
+        Args:
+          input_ids: [T] token ids. Real inference always provides this;
+            the precompile path
+            (compilation_manager._precompile_backbone_with_inputs_embeds)
+            passes None. In that case we synthesize zeros so the JIT trace
+            shape matches real inference — the precompile output is
+            discarded.
+          inputs_embeds: [T, H] post-scaling residual stream (already
+            multiplied by embedding_scale + multimodal-merged).
+          is_multimodal: [T] bool. Multimodal positions are masked to
+            slot 0 in the embed_tokens_per_layer lookup.
+        """
+        if (self.hidden_size_per_layer_input == 0
+                or self.embed_tokens_per_layer is None):
+            return None
+        if input_ids is None:
+            # Precompile path with inputs_embeds-only entry. Zeros produce
+            # a shape-identical compute (all PLE lookups hit slot 0) so the
+            # JIT cache key matches the real-inference trace.
+            input_ids = jnp.zeros((inputs_embeds.shape[0], ), dtype=jnp.int32)
+        T = input_ids.shape[0]
+        L = self.num_hidden_layers
+        P = self.hidden_size_per_layer_input
+
+        # Multimodal masking: MM positions look up slot 0.
+        if is_multimodal is not None:
+            ple_input_ids = jnp.where(is_multimodal, 0, input_ids)
+        else:
+            ple_input_ids = input_ids
+
+        # Out-of-vocab masking: when vocab_size_per_layer_input
+        # < vocab_size, mask high token ids to 0.
+        ple_input_ids = jnp.where(
+            ple_input_ids < self.vocab_size_per_layer_input, ple_input_ids, 0)
+
+        # Track A — embedding lookup.
+        per_layer_embeds = self.embed_tokens_per_layer(ple_input_ids)
+        per_layer_embeds = per_layer_embeds * self.embed_scale_per_layer
+        per_layer_embeds = per_layer_embeds.reshape(T, L, P)
+
+        # Track B — projection of inputs_embeds.
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = (per_layer_projection *
+                                self.per_layer_projection_scale)
+        per_layer_projection = per_layer_projection.reshape(T, L, P)
+        per_layer_projection = self.per_layer_projection_norm(
+            per_layer_projection)
+
+        # Combine.
+        return ((per_layer_projection + per_layer_embeds) *
+                self.per_layer_input_scale)
+
     def __call__(
         self,
         kv_caches: List[jax.Array],
@@ -748,7 +989,8 @@ class Gemma4Model(JaxModule):
         attention_metadata: AttentionMetadata,
         inputs_embeds: Optional[jax.Array] = None,
         layer_name_to_kv_cache: Optional[dict] = None,
-    ) -> Tuple[List[jax.Array], jax.Array]:
+        is_multimodal: Optional[jax.Array] = None,
+    ) -> Tuple[List[jax.Array], jax.Array, Optional[jax.Array]]:
 
         if inputs_embeds is not None:
             x = inputs_embeds
@@ -757,9 +999,17 @@ class Gemma4Model(JaxModule):
             # Gemma4: Apply embedding scaling
             x = x * self.embedding_scale
 
+        # PLE: compute per_layer_inputs once; slice [T, layer_idx, :] per layer.
+        # Returns None for non-PLE configs (e.g. 26B/31B), in which case each
+        # decoder layer gates the PLE block off via its own per_layer_input=None.
+        per_layer_inputs = self.compute_per_layer_inputs(
+            input_ids, x, is_multimodal=is_multimodal)
+
+        all_expert_ids = []
         for i, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer)):
-            layer_name = f"layer.{i + self.start_layer}"
+            layer_idx = i + self.start_layer
+            layer_name = f"layer.{layer_idx}"
             if isinstance(attention_metadata, dict):
                 layer_attn_metadata = attention_metadata[layer_name]
             else:
@@ -768,20 +1018,38 @@ class Gemma4Model(JaxModule):
             if layer_name_to_kv_cache and layer_name in layer_name_to_kv_cache:
                 cache_idx = layer_name_to_kv_cache[layer_name]
             else:
-                cache_idx = i + self.start_layer
+                cache_idx = layer_idx
 
             kv_cache = kv_caches[cache_idx]
-            kv_cache, x = layer(
+            layer_per_input = (per_layer_inputs[:, layer_idx, :]
+                               if per_layer_inputs is not None else None)
+            kv_cache, x, expert_ids = layer(
                 kv_cache,
                 x,
                 layer_attn_metadata,
+                per_layer_input=layer_per_input,
             )
+            if expert_ids is not None:
+                all_expert_ids.append(expert_ids)
             kv_caches[cache_idx] = kv_cache
         x = self.norm(x)
-        return kv_caches, x
+        stacked_expert_ids = jnp.stack(all_expert_ids,
+                                       axis=0) if all_expert_ids else None
+        return kv_caches, x, stacked_expert_ids
 
 
 class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
     WeightLoader = StandardWeightLoader
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
@@ -807,12 +1075,11 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
             if self.model.is_last_rank:
                 vocab_size = model_config.get_vocab_size()
                 hidden_size = model_config.hf_config.text_config.hidden_size
-                self.lm_head = JaxEinsum(
-                    einsum_str="TD,DV->TV",
-                    kernel_shape=(hidden_size, vocab_size),
+                self.lm_head = JaxLmHead(
+                    hidden_size=hidden_size,
+                    vocab_size=vocab_size,
                     dtype=model_config.dtype,
                     rngs=rng,
-                    quant_config=vllm_config.quant_config,
                     prefix="lm_head",
                 )
             else:
@@ -846,7 +1113,7 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
         is_last_rank: bool = True,
         *args,
     ) -> Tuple[List[jax.Array], jax.Array | JaxIntermediateTensors,
-               List[jax.Array]]:
+               List[jax.Array], Optional[jax.Array]]:
 
         if not is_first_rank:
             assert intermediate_tensors is not None
@@ -854,18 +1121,20 @@ class Gemma4ForCausalLM(JaxModule, LoadableWithIterator):
 
         layer_name_to_kv_cache = dict(
             _layer_name_to_kv_cache) if _layer_name_to_kv_cache else None
-        kv_caches, x = self.model(
+        # Text-only causal LM has no multimodal tokens; pass None.
+        kv_caches, x, expert_indices = self.model(
             kv_caches,
             input_ids,
             attention_metadata,
             inputs_embeds,
             layer_name_to_kv_cache=layer_name_to_kv_cache,
+            is_multimodal=None,
         )
 
         if not is_last_rank:
             x = JaxIntermediateTensors(tensors={"hidden_states": x}, )
 
-        return kv_caches, x, []
+        return kv_caches, x, [], expert_indices
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if hasattr(self, 'lm_head'):

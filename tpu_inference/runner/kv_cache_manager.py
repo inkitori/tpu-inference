@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import os
 from typing import TYPE_CHECKING, List
 
 import jax
@@ -19,22 +20,28 @@ import jax.numpy as jnp
 import vllm.envs as envs
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
-from vllm.config import get_layers_from_vllm_config
+from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mla import MLAAttention
+from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
+                                               DeepseekV4IndexerCache)
+from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.backends.utils import (get_kv_cache_layout,
                                               set_kv_cache_layout)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
 
+from tpu_inference import envs as tpu_envs
 from tpu_inference import utils
 from tpu_inference import utils as common_utils
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
+from tpu_inference.models.common.kv_share import compute_kv_share_map
 from tpu_inference.offload.utils import get_kv_connector_cache_layout
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
@@ -51,6 +58,17 @@ logger = init_logger(__name__)
 # default layout (order) used by kv cache manager
 # N=num_blocks, H=num_heads and D=head_size
 DEFAULT_KV_CACHE_LAYOUT = "NHD"
+
+
+def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
+    return isinstance(attn_module, DeepseekV4IndexerCache) or isinstance(
+        attn_module, DeepseekV4SWACache) or isinstance(
+            attn_module, DeepseekV4Attention) or isinstance(
+                attn_module, CompressorStateCache)
+
+
+def is_ds_v4(vllm_config):
+    return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
 
 
 class KVCacheManager:
@@ -70,6 +88,17 @@ class KVCacheManager:
         # on the TPU side (where we duplicate the shared tensor per layer
         # because mamba and attention caches have different shapes).
         self._hybrid_uniform_page_size_bytes: int | None = None
+        # Per-mamba-layer leading-dim cap for hybrid models. Mamba state is
+        # recurrent (one slot per *active* request), so the `num_blocks`
+        # slots vLLM hands out are mostly idle. Set by
+        # `_maybe_set_compact_mamba_num_blocks_override`; when set,
+        # `initialize_kv_cache` allocates this many slots per mamba layer
+        # while attention layers keep the full `num_blocks` from the
+        # (correspondingly enlarged) attention pool. The GDN op indexes
+        # mamba state with `attn_metadata.mamba_state_indices` (in
+        # `[0, max_num_reqs]`) so it stays in-bounds for the smaller arrays.
+        self._mamba_num_blocks: int | None = None
+        self.actual_mamba_num_blocks: int | None = None
 
     def _create_attention_spec(
             self,
@@ -252,59 +281,66 @@ class KVCacheManager:
         self.runner.cache_config.mamba_page_size_padded = int(
             uniform_page_size_bytes)
 
-        # Pin vLLM's num_blocks via a two-step flooring that keeps peak
-        # HBM within `gpu_memory_utilization × total_hbm` at high
-        # utilization. See `_maybe_set_num_blocks_override` for the
-        # formula and rationale; the short version is that vLLM's
-        # single-step `floor(avail / (uniform × group_size))` can land
-        # one block higher than the two-step value, and that extra
-        # block × group_size × uniform bytes is enough to push past the
-        # budget against imprecision in vLLM's `avail` estimate.
-        self._maybe_set_num_blocks_override(attn_page_size_bytes,
-                                            int(uniform_page_size_bytes),
-                                            group_size)
+        # Cap each mamba layer at `max_num_reqs+1` slots and grow the
+        # attention pool with the freed HBM. See
+        # `_maybe_set_compact_mamba_num_blocks_override`.
+        self._maybe_set_compact_mamba_num_blocks_override(
+            attn_page_size_bytes, int(unpadded_mamba_page_size),
+            num_attn_groups, num_mamba_groups, num_attn, num_mamba, group_size)
 
-    def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
-                                       uniform_page_size_bytes: int,
-                                       group_size: int) -> None:
-        """Pin `cache_config.num_gpu_blocks_override` to the two-step
-        flooring value that keeps peak HBM within the user-set
-        `gpu_memory_utilization` budget at high utilization.
+    def _maybe_set_compact_mamba_num_blocks_override(
+            self, attn_page_size_bytes: int,
+            unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
+            num_mamba_groups: int, num_attn_layers: int, num_mamba_layers: int,
+            group_size: int) -> None:
+        """Cap mamba layers at `max_num_reqs+1` slots and pin
+        `num_gpu_blocks_override` so the freed HBM grows the attention pool.
 
-        Formula:
-          `num_blocks_attn = floor(avail / (attn_page × group_size))`
-          `num_blocks_tpu  = floor(attn_page × num_blocks_attn / uniform)`
+        Tradeoff vs. the uniform num_blocks layout
+        ------------------------------------------
+        Mamba state is recurrent: one slot per *active* request, regardless
+        of context length. The uniform layout gives every layer the same
+        `num_blocks`, leaving `num_blocks − max_num_reqs` mamba slots idle
+        forever. The compact layout caps mamba at `max_num_reqs + 1` (the
+        `+1` is vLLM's null block), which is strictly better for any model
+        where `num_blocks > max_num_reqs` — i.e. all production hybrid
+        configs we run.
+        Cost: a small bookkeeping invariant in the GDN op (it must index
+        mamba state by per-request slot id rather than by `block_tables`,
+        since the mamba leading dim is now smaller than the attn pool).
+        See `gdn_attention_op.gdn_attention_core_tpu`.
+        Skipped if the user pinned `num_gpu_blocks_override` or
+        `hbm_usage_bytes` cannot read HBM (e.g. CPU-only tests). In those
+        cases vLLM keeps its uniform sizing; the page-size padding done in
+        the caller still keeps the per-layer block-ID range correct.
 
-        The two-step flooring can land 1 block lower than vLLM's
-        single-step `floor(avail / (uniform × group_size))`. Since
-        `uniform > attn_page`, that 1-block gap costs `group_size × uniform`
-        bytes of HBM, which — against the imprecision in vLLM's `avail`
-        estimate — is enough to tip high-utilization configurations into
-        OOM. Pinning to `num_blocks_tpu` preserves the headroom the
-        single-step formula silently removes.
-
-        No internal safety margin is applied — `gpu_memory_utilization` is
-        the knob users already have for reserving headroom. Adding a
-        silent reduction here would conflict with their explicit budget.
-
-        Skipped if the user has explicitly set `num_gpu_blocks_override` or
-        if HBM usage isn't readable (e.g. in tests without real devices).
-        Spec padding alone still fixes the OOB bug in that case; only the
-        ~1-block-per-tensor flooring-boundary precision is lost.
+        Sizing math
+        -----------
+        Each kv-cache tensor is shared across `num_attn_groups +
+        num_mamba_groups` layers; there are `group_size` such tensors.
+        Per-tensor budget `B = avail / group_size`. With
+        `N_mamba = max_num_reqs + 1`,
+            N_attn = floor((B − num_mamba_groups × N_mamba × mamba_unpadded)
+                            / (num_attn_groups × attn_page))
+        rounded down to the sharding divisor.
 
         Args:
-            attn_page_size_bytes: TPU-actual bytes per block for one
-                attention layer, from `get_attention_page_size_bytes`
-                (accounts for dtype packing like fp8).
-            uniform_page_size_bytes: bytes per block for one `KVCacheTensor`
-                shared across `num_attn_groups + num_mamba_groups` layers
-                (the `_hybrid_uniform_page_size_bytes` value set above).
-            group_size: number of layers per vLLM kv-cache group, used by
-                vLLM to compute `num_blocks` from the attention tensor size.
+            attn_page_size_bytes: TPU-actual bytes per block per attention
+                layer (accounts for dtype packing like fp8).
+            unpadded_mamba_page_size_bytes: bytes per slot per mamba layer
+                (`prod(shape) × dtype_size`, no padding).
+            num_attn_groups: # vLLM kv-cache groups holding attention layers.
+            num_mamba_groups: # vLLM kv-cache groups holding mamba layers.
+            num_attn_layers: total attention layers (logging only).
+            num_mamba_layers: total mamba layers (logging only).
+            group_size: layers per kv-cache group; equals the # of
+                `KVCacheTensor`s vLLM allocates per kv-cache group.
 
         Returns:
-            None. Side effect: sets `cache_config.num_gpu_blocks_override`
-            if all preconditions hold; otherwise leaves it unset.
+            None. On success: sets `cache_config.num_gpu_blocks_override`
+            and `_mamba_num_blocks` so `initialize_kv_cache` allocates the
+            smaller mamba arrays. On any preconditions-fail path: leaves
+            both unset.
         """
         cache_config = self.runner.cache_config
         if cache_config.num_gpu_blocks_override is not None:
@@ -315,10 +351,9 @@ class KVCacheManager:
             hbm_usage = utils.hbm_usage_bytes(devices)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
-                "Skipping num_gpu_blocks_override: hbm_usage_bytes failed "
-                "(%s). Spec padding alone still fixes the OOB bug; the "
-                "scheduler's pool may exceed per-layer TPU capacity by one "
-                "block at flooring boundaries.", exc)
+                "Compact-mamba sizing skipped: hbm_usage_bytes failed (%s). "
+                "vLLM will size the block pool from the uniform spec; "
+                "page-size padding keeps per-layer block IDs in range.", exc)
             return
 
         total_limit = sum(limit for _, limit in hbm_usage)
@@ -328,24 +363,86 @@ class KVCacheManager:
         if avail <= 0:
             return
 
-        naive_vllm_num_blocks = avail // (attn_page_size_bytes * group_size)
-        if naive_vllm_num_blocks <= 0:
-            return
-        naive_tensor_size = attn_page_size_bytes * naive_vllm_num_blocks
-        num_blocks_tpu = naive_tensor_size // uniform_page_size_bytes
-        if num_blocks_tpu <= 0:
+        # Sharding divisor: per-layer num_blocks must be a multiple of the
+        # per-axis device count so JAX shardings don't round up. MLA shards
+        # over MLP_TENSOR (unless DP attention is on); other layouts shard
+        # over ATTN_DATA. Match `initialize_kv_cache` exactly so what we
+        # compute here is what gets allocated.
+        if self.use_mla and not self.runner.vllm_config.additional_config.get(
+                "sharding", {}).get("sharding_strategy", {}).get(
+                    "enable_dp_attention", False):
+            divisor = common_utils.get_mesh_shape_product(
+                self.runner.mesh, ShardingAxisName.MLP_TENSOR)
+        else:
+            divisor = common_utils.get_mesh_shape_product(
+                self.runner.mesh, ShardingAxisName.ATTN_DATA)
+        # `get_mesh_shape_product` returns 1 for an absent axis, but be
+        # defensive against an empty mesh shape that produces 0.
+        divisor = max(divisor, 1)
+
+        # Mamba slot budget: one per persistent-batch slot plus the null
+        # block, rounded up to the sharding divisor. `runner.max_num_reqs`
+        # already includes the DP multiplier
+        # (= `dp_size × scheduler_config.max_num_seqs`).
+        mamba_num_blocks = self.runner.max_num_reqs + 1
+        mamba_num_blocks = (
+            (mamba_num_blocks + divisor - 1) // divisor) * divisor
+
+        # Attention block count: fits into HBM left after mamba.
+        # `attn_page_size_bytes` is per-block per-attention-layer; the
+        # per-tensor cost is `num_attn_groups × N_attn × attn_page` because
+        # one tensor backs `num_attn_groups` attention layers.
+        avail_per_tensor = avail // group_size
+        mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
+                            unpadded_mamba_page_size_bytes)
+        attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
+        if attn_per_tensor_avail <= 0:
+            # Mamba already saturates the budget — pathological
+            # configuration (e.g., mamba_unpadded × max_num_reqs alone
+            # exceeds gpu_memory_utilization × total_hbm). Skip the
+            # override and let vLLM fall back to its uniform sizing; if
+            # the model genuinely doesn't fit, vLLM will OOM with the
+            # uniform layout too and we want that signal to surface.
+            logger.warning(
+                "Compact-mamba sizing skipped: mamba alone (mamba_num_blocks="
+                "%d × num_mamba_groups=%d × mamba_unpadded=%d) exceeds "
+                "per-tensor budget %d. Lower `gpu_memory_utilization` or "
+                "`max_num_seqs`.", mamba_num_blocks, num_mamba_groups,
+                unpadded_mamba_page_size_bytes, avail_per_tensor)
             return
 
-        cache_config.num_gpu_blocks_override = int(num_blocks_tpu)
+        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
+                                                    attn_page_size_bytes)
+        attn_num_blocks = (attn_num_blocks // divisor) * divisor
+        if attn_num_blocks <= 0:
+            logger.warning(
+                "Compact-mamba sizing skipped: attn_num_blocks=0 after "
+                "rounding to divisor=%d (avail_per_tensor=%d, "
+                "mamba_per_tensor=%d). Lower `gpu_memory_utilization` or "
+                "`max_num_seqs`.", divisor, avail_per_tensor, mamba_per_tensor)
+            return
+
+        cache_config.num_gpu_blocks_override = int(attn_num_blocks)
+        self._mamba_num_blocks = int(mamba_num_blocks)
+
+        attn_bytes = num_attn_layers * attn_num_blocks * attn_page_size_bytes
+        mamba_bytes = (num_mamba_layers * mamba_num_blocks *
+                       unpadded_mamba_page_size_bytes)
         logger.info(
-            "Hybrid KV cache: setting num_gpu_blocks_override=%d to align "
-            "the scheduler's block pool with per-layer TPU allocation "
-            "(avail=%d, naive_vllm_num_blocks=%d).", num_blocks_tpu, avail,
-            naive_vllm_num_blocks)
+            "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
+            "_mamba_num_blocks=%d. HBM split: attn=%d layers × %d blocks "
+            "× %d B = %.2f GiB; mamba=%d layers × %d slots × %d B = "
+            "%.2f GiB; total=%.2f GiB / avail=%.2f GiB.", attn_num_blocks,
+            mamba_num_blocks, num_attn_layers, attn_num_blocks,
+            attn_page_size_bytes, attn_bytes / (2**30), num_mamba_layers,
+            mamba_num_blocks, unpadded_mamba_page_size_bytes,
+            mamba_bytes / (2**30), (attn_bytes + mamba_bytes) / (2**30),
+            avail / (2**30))
 
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
+        block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
@@ -362,10 +459,13 @@ class KVCacheManager:
             # Individually pad the RopE and latents
             qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", 0)
             padded_kv_lora_rank = common_utils.align_to(
-                text_config.kv_lora_rank, 128)
-            padded_qk_rope_head_dim = common_utils.align_to(
-                qk_rope_head_dim, 128)
-            mla_head_size = padded_kv_lora_rank + padded_qk_rope_head_dim
+                getattr(text_config, "kv_lora_rank", 0), 128)
+            if tpu_envs.MLA_TRANSPOSE_KV_CACHE:
+                mla_qk_rope_head_dim = qk_rope_head_dim
+            else:
+                mla_qk_rope_head_dim = common_utils.align_to(
+                    qk_rope_head_dim, 128)
+            mla_head_size = padded_kv_lora_rank + mla_qk_rope_head_dim
 
         if len(self.runner.vllm_config.compilation_config.
                static_forward_context) == 0:
@@ -373,7 +473,23 @@ class KVCacheManager:
             base_num_kv_heads = model_config.get_total_num_kv_heads()
             base_head_size = model_config.get_head_size()
 
+            # KV-share (JAX path): vllm-side models declare KV-share via
+            # per-Attention `kv_sharing_target_layer_name`; the JAX-side
+            # models have no equivalent runtime declaration. Derive the
+            # same mapping from the HF text_config attributes. Returns {}
+            # for models that don't use KV-share, so this is a no-op for
+            # the common case.
+            kv_share_map = compute_kv_share_map(text_config)
+
             for i in range(model_config.get_num_layers(parallel_config)):
+                # If this layer is KV-shared, register the redirect and skip
+                # spec creation (so no slot is allocated). The forward-time
+                # remap at line ~835 picks the source layer's slot.
+                if i in kv_share_map:
+                    self.shared_kv_cache_layers[
+                        f"layer.{i}"] = f"layer.{kv_share_map[i]}"
+                    continue
+
                 if self.use_mla:
                     kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
                         block_size, 1, mla_head_size)
@@ -385,18 +501,24 @@ class KVCacheManager:
                         layer_type = text_config.layer_types[i]
 
                     is_sliding = layer_type == "sliding_attention"
+                    # Use `or` instead of getattr default so we also handle
+                    # the case where the attribute is present but None
+                    # (e.g. Gemma-4 E2B has num_global_key_value_heads=None).
+                    # `or` also coerces 0 → fallback, which is fine because
+                    # 0 num_kv_heads / head_dim is never a valid config and
+                    # would crash get_padded_num_heads downstream anyway.
                     if not is_sliding:
-                        num_kv_heads = getattr(text_config,
-                                               "num_global_key_value_heads",
-                                               base_num_kv_heads)
-                        head_size = getattr(text_config, "global_head_dim",
-                                            base_head_size)
+                        num_kv_heads = (getattr(
+                            text_config, "num_global_key_value_heads", None)
+                                        or base_num_kv_heads)
+                        head_size = (getattr(text_config, "global_head_dim",
+                                             None) or base_head_size)
                     else:
-                        num_kv_heads = getattr(text_config,
-                                               "num_key_value_heads",
-                                               base_num_kv_heads)
-                        head_size = getattr(text_config, "head_dim",
-                                            base_head_size)
+                        num_kv_heads = (getattr(text_config,
+                                                "num_key_value_heads", None)
+                                        or base_num_kv_heads)
+                        head_size = (getattr(text_config, "head_dim", None)
+                                     or base_head_size)
                     # Pad num_kv_heads to multiple of TP size.
                     num_kv_heads = common_utils.get_padded_num_heads(
                         num_kv_heads, model_cnt)
@@ -409,27 +531,43 @@ class KVCacheManager:
                         head_size,
                         sliding_window=sliding_window)
 
-            if self.runner.speculative_config and self.runner.speculative_config.method == "eagle3":
-                draft_model_config = self.runner.speculative_config.draft_model_config
-                hf_config = draft_model_config.hf_config
-                num_kv_heads = common_utils.get_padded_num_heads(
-                    hf_config.num_key_value_heads, model_cnt)
-                head_size = common_utils.get_padded_head_dim(
-                    hf_config.hidden_size // hf_config.num_attention_heads)
-                # Eagle3 has only 1 layer
-                for i in range(1):
-                    if self.use_mla:
-                        kv_cache_spec[
-                            f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size, 1, mla_head_size)
-                    else:
-                        kv_cache_spec[
-                            f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size, num_kv_heads, head_size)
+            speculative_config = self.runner.speculative_config
+            if speculative_config:
+                method = speculative_config.method
+                draft_model_config = speculative_config.draft_model_config
+                draft_hf_config = draft_model_config.hf_config
+
+                if speculative_config.use_gemma4_mtp():
+                    from tpu_inference.models.common.kv_share import \
+                        compute_mtp_kv_share_map
+
+                    # Gemma4-MTP draft layers share target verifier model caches entirely.
+                    # Compute cross-model redirects and register them directly in shared_kv_cache_layers.
+                    redirects = compute_mtp_kv_share_map(
+                        draft_hf_config, text_config)
+                    for draft_layer, target_layer in redirects.items():
+                        self.shared_kv_cache_layers[draft_layer] = target_layer
+                elif method == "eagle3":
+                    num_kv_heads = common_utils.get_padded_num_heads(
+                        draft_hf_config.num_key_value_heads, model_cnt)
+                    head_size = common_utils.get_padded_head_dim(
+                        draft_hf_config.hidden_size //
+                        draft_hf_config.num_attention_heads)
+                    # Eagle3 has only 1 layer
+                    for i in range(1):
+                        if self.use_mla:
+                            kv_cache_spec[
+                                f"draft_layer.{i}"] = self._create_attention_spec(
+                                    block_size, 1, mla_head_size)
+                        else:
+                            kv_cache_spec[
+                                f"draft_layer.{i}"] = self._create_attention_spec(
+                                    block_size, num_kv_heads, head_size)
         else:
             # Else propagate attention modules from compilation config.
             layers = get_layers_from_vllm_config(
-                self.runner.vllm_config, (Attention, MLAAttention, MambaBase))
+                self.runner.vllm_config,
+                (Attention, MLAAttention, MambaBase, AttentionLayerBase))
 
             has_attention = any(
                 isinstance(attn_module, (Attention))
@@ -455,7 +593,8 @@ class KVCacheManager:
             # throw exception for non-matched dimension between kv_cache
             # and actual dims. Disable sliding window for workaround.
             head_size_set = {
-                common_utils.get_padded_head_dim(attn_module.head_size)
+                common_utils.get_padded_head_dim(
+                    getattr(attn_module, "head_size", 0))
                 for attn_module in layers.values()
                 if not isinstance(attn_module, MambaBase)
             }
@@ -465,6 +604,13 @@ class KVCacheManager:
 
             for layer_name, attn_module in layers.items():
                 if isinstance(attn_module, MambaBase):
+                    spec = attn_module.get_kv_cache_spec(
+                        self.runner.vllm_config)
+                    if spec is not None:
+                        kv_cache_spec[layer_name] = spec
+                    continue
+
+                if is_cache_for_ds_v4(attn_module):
                     spec = attn_module.get_kv_cache_spec(
                         self.runner.vllm_config)
                     if spec is not None:
@@ -534,6 +680,9 @@ class KVCacheManager:
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details.")
+            num_speculative_tokens = 0
+            if self.runner.vllm_config.speculative_config:
+                num_speculative_tokens = self.runner.vllm_config.speculative_config.num_speculative_tokens
             new_input_batch = InputBatch(
                 max_num_reqs=self.runner.max_num_reqs,
                 max_model_len=self.runner.max_model_len,
@@ -541,6 +690,8 @@ class KVCacheManager:
                 pin_memory=False,
                 vocab_size=self.runner.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
+                num_speculative_tokens=num_speculative_tokens,
+                dp_size=self.runner.dp_size,
             )
             self.runner.input_batch = new_input_batch
             self.runner.persistent_batch_manager.input_batch = new_input_batch
@@ -599,14 +750,18 @@ class KVCacheManager:
                         "MambaSpec does not support shared layers for now, defaulting to single KV cache per layer..."
                     )
                     duplicate_shared_layers = True
-                    # assert that each kv_cache_tensor in kv_cache_config.kv_cache_tensors has the same number of shared layers
-                    # This is needed for models like Qwen3.5 where every 4 layers share the same KV cache (3 linear attn and 1 full attn)
-                    num_shared_layers = len(
-                        kv_cache_config.kv_cache_tensors[0].shared_by)
-                    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                        assert len(
-                            kv_cache_tensor.shared_by
-                        ) == num_shared_layers, f"Expected all kv_cache_tensors to have the same number of shared layers {num_shared_layers}, but found {len(kv_cache_tensor.shared_by)}"
+                    non_mtp_tensors = [
+                        t for t in kv_cache_config.kv_cache_tensors
+                        if not any("mtp" in name for name in t.shared_by)
+                    ]
+                    if non_mtp_tensors:
+                        # assert that each kv_cache_tensor in kv_cache_config.kv_cache_tensors has the same number of shared layers
+                        # This is needed for models like Qwen3.5 where every 4 layers share the same KV cache (3 linear attn and 1 full attn)
+                        num_shared_layers = len(non_mtp_tensors[0].shared_by)
+                        for kv_cache_tensor in non_mtp_tensors:
+                            assert len(
+                                kv_cache_tensor.shared_by
+                            ) == num_shared_layers, f"Expected all non-MTP kv_cache_tensors to have the same number of shared layers {num_shared_layers}, but found {len(kv_cache_tensor.shared_by)}"
                     break
 
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
@@ -632,6 +787,18 @@ class KVCacheManager:
                             spec.num_kv_heads, spec.head_size, spec.dtype,
                             self.use_mla)
                 num_blocks = kv_cache_tensor.size // total_group_page_size
+            elif kv_cache_tensor.block_stride:
+                # DeepseekV4 packed layout: vLLM overlays every cache
+                # (main MLA latent + indexer k_cache + compressor state +
+                # SWA) into one contiguous per-block backing buffer, so each
+                # KVCacheTensor reports the *full* packed `size`, the combined
+                # per-block stride (== sum of all packed page sizes), and its
+                # own `offset`. `size` is a multiple of `block_stride`, not of
+                # any single layer's page size, and every packed layer shares
+                # the same `num_blocks`.
+                assert kv_cache_tensor.size % kv_cache_tensor.block_stride == 0
+                num_blocks = (kv_cache_tensor.size //
+                              kv_cache_tensor.block_stride)
             else:
                 # If sharing KV cache, compute `num_blocks` using the page size
                 # of the first layer.
@@ -640,19 +807,29 @@ class KVCacheManager:
                 assert kv_cache_tensor.size % page_size_bytes == 0
                 num_blocks = kv_cache_tensor.size // page_size_bytes
 
-            if self.use_mla and not self.runner.vllm_config.additional_config.get(
-                    "sharding", {}).get("sharding_strategy", {}).get(
-                        "enable_dp_attention", False):
-                # MLA KV cache is sharded over MLP_TENSOR
-                divisor = common_utils.get_mesh_shape_product(
-                    self.runner.mesh, ShardingAxisName.MLP_TENSOR)
-            else:
-                # Default KV cache is sharded over ATTN_DATA
-                divisor = common_utils.get_mesh_shape_product(
-                    self.runner.mesh, ShardingAxisName.ATTN_DATA)
+            # Default KV cache is sharded over (BATCH=(dp, attn_dp))
+            divisor = common_utils.get_mesh_shape_product(
+                self.runner.mesh, ShardingAxisName.BATCH)
 
             # num_blocks must be a multiple of the sharding divisor
             num_blocks = (num_blocks // divisor) * divisor
+
+            if self.runner.cache_config.num_gpu_blocks_override is not None:
+                num_blocks = min(
+                    num_blocks,
+                    self.runner.cache_config.num_gpu_blocks_override)
+
+            # When compact-mamba sizing succeeded (set by
+            # `_maybe_set_compact_mamba_num_blocks_override`), mamba layers
+            # allocate `_mamba_num_blocks` (= max_num_reqs + 1) slots while
+            # attention layers keep the full `num_blocks`. When that override
+            # didn't run (CPU tests, user-pinned `num_gpu_blocks_override`),
+            # mamba and attn use the same `num_blocks` — vLLM's uniform sizing.
+            mamba_num_blocks = (self._mamba_num_blocks
+                                if self._mamba_num_blocks is not None else
+                                num_blocks)
+            if self.actual_mamba_num_blocks is None:
+                self.actual_mamba_num_blocks = mamba_num_blocks
 
             for j, layer_name in enumerate(kv_cache_tensor.shared_by):
                 layer_spec = layer_name_to_spec[layer_name]
@@ -661,7 +838,7 @@ class KVCacheManager:
                     for state_index, (shape, dtype) in enumerate(
                             zip(layer_spec.shapes, layer_spec.dtypes)):
                         jax_dtype = t2j_dtype(dtype)
-                        cache_shape = (num_blocks, *shape)
+                        cache_shape = (mamba_num_blocks, *shape)
                         if state_index == 0:
                             # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
                             spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
@@ -703,23 +880,58 @@ class KVCacheManager:
                     # We should only init a new kv cache for the first layer in shared_by
                     # if duplicate_shared_layers is False.  Otherwise, if duplicate_shared_layers
                     # is True, we should init a new kv cache for each layer in shared_by
-                    model_config = self.runner.model_config
-                    text_config = getattr(
-                        model_config, "hf_text_config",
-                        getattr(model_config, "hf_config", None))
                     if j == 0 or duplicate_shared_layers:
                         # NOTE: we'll multiply the num_kv_heads by 2 in the function
-                        if self.use_mla:
+                        block_size = layer_spec.storage_block_size
 
-                            head_size = text_config.kv_lora_rank + \
-                                text_config.qk_rope_head_dim
-                        else:
-                            head_size = layer_spec.head_size
+                        if is_ds_v4(self.runner.vllm_config):
+                            os.environ["MLA_TRANSPOSE_KV_CACHE"] = "False"
+                            # DSV4 FP8 format is packed as unit8
+                            os.environ["MLA_KV_PACKING_SIZE"] = "4"
+
+                            contains_indexer_cache = any(
+                                "indexer" in layer
+                                for layer in kv_cache_tensor.shared_by)
+                            if contains_indexer_cache:
+                                # Indexer's compressor state cache kv cache must be overlay on
+                                # Indexer's compressed kv cache.
+                                # Main attn's compressor state cache kv cache and sliding window
+                                # cache must overlay on main attn's compressed kv cache.
+                                assert all(
+                                    "indexer" in layer
+                                    for layer in kv_cache_tensor.shared_by
+                                ), " kv_cache_tensor.shared_by: " + str(
+                                    kv_cache_tensor.shared_by)
+
+                            mla_spec = None
+                            for layer in kv_cache_tensor.shared_by:
+                                if isinstance(layer_name_to_spec[layer],
+                                              MLAAttentionSpec):
+                                    mla_spec = layer_name_to_spec[layer]
+                                    break
+                            # In DSV4, compressor-state-cache and sliding-window-cache
+                            # overlay on the same tensor as the main kv cache.
+                            # The created kv cache will based on the shape of the
+                            # main kv cache's spec.
+                            if mla_spec is not None:
+                                layer_spec = mla_spec
+                                block_size = layer_spec.storage_block_size
+                            if mla_spec is None:
+                                # Edge case handling: for DSV4 Flash,
+                                # There are 21 CSA layers, 43 SWA caches,
+                                # since 43 % 21 !=0, there is one SWA cache
+                                # not sharing a KV tensor with other caches.
+                                assert "swa_cache" in kv_cache_tensor.shared_by[
+                                    0]
+                                assert len(kv_cache_tensor.shared_by) == 1
+                                block_size = (kv_caches[-1].shape[1] *
+                                              kv_caches[-1].shape[2])
+
                         kv_cache = create_kv_caches(
                             num_blocks=num_blocks,
-                            block_size=layer_spec.block_size,
+                            block_size=block_size,
                             num_kv_heads=layer_spec.num_kv_heads,
-                            head_size=head_size,
+                            head_size=layer_spec.head_size,
                             mesh=self.runner.mesh,
                             layer_names=[f'kv_cache_tensor.{i}'],
                             cache_dtype=t2j_dtype(layer_spec.dtype),
@@ -738,7 +950,8 @@ class KVCacheManager:
                 # if duplicate_shared_layers is False.  Otherwise, if duplicate_shared_layers
                 # is True, we should add the blocks for each layer in shared_by.
                 if j == 0 or duplicate_shared_layers:
-                    num_blocks_list.append(num_blocks)
+                    num_blocks_list.append(mamba_num_blocks if isinstance(
+                        layer_spec, MambaSpec) else num_blocks)
                 layer_idx = (i * num_shared_layers
                              ) + j if duplicate_shared_layers else i
                 self.runner.layer_name_to_kvcache_index[layer_name] = layer_idx
@@ -807,7 +1020,7 @@ class KVCacheManager:
 
         # Explicitly delete each JAX array to release HBM.
         for kv_cache in kv_caches:
-            kv_cache.delete()
+            jax.tree.map(lambda x: x.delete(), kv_cache)
         self.runner.kv_caches.clear()
         self.runner.layer_name_to_kvcache_index.clear()
 
@@ -838,7 +1051,8 @@ class KVCacheManager:
             f"hbm_before="
             f"{utils.hbm_usage_gb(self.runner.mesh.devices.flatten())}Gb")
 
-        self.initialize_kv_cache(kv_cache_config)
+        with set_current_vllm_config(self.runner.vllm_config):
+            self.initialize_kv_cache(kv_cache_config)
 
     @staticmethod
     @jax.jit

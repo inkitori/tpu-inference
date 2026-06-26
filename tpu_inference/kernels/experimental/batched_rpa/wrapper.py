@@ -85,6 +85,9 @@ def prepare_inputs(
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2,
                                              kv_packing)
+    assert num_kv_heads_x2_aligned % 2 == 0, (
+        f"kv_packing={kv_packing} produces an odd aligned head count "
+        f"{num_kv_heads_x2_aligned}")
     new_kv_hbm = jnp.pad(
         jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                  actual_num_kv_heads_x2,
@@ -101,6 +104,7 @@ def prepare_inputs(
         kv_packing,
         aligned_head_dim,
     )
+
     return o_hbm_alias_q_hbm, new_kv_hbm
 
 
@@ -329,6 +333,7 @@ def calculate_block_sizes(
         "debug_mode",
         "out_dtype",
         "use_causal_mask",
+        "update_kv_cache",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -356,6 +361,7 @@ def ragged_paged_attention(
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
+    update_kv_cache: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -483,6 +489,7 @@ def ragged_paged_attention(
             kv_lens,
             distribution,
             cfgs=cfgs,
+            update_kv_cache=update_kv_cache,
         )
         return kernel.rpa_kernel(
             cu_q_lens,

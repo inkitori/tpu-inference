@@ -75,9 +75,12 @@ from jax.sharding import Mesh
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics, KVConnectorStats, PromMetric, PromMetricT)
 from vllm.utils.math_utils import round_down
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
@@ -89,8 +92,12 @@ from tpu_inference import envs
 from tpu_inference.distributed.host_kv_pool import HostKVPool
 from tpu_inference.distributed.kv_transfer import (copy_to_host,
                                                    multi_layer_copy)
+from tpu_inference.distributed.tpu_connector_stats import (
+    TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.tpu_runner import TPUModelRunner
+from tpu_inference.runner.utils import (get_kv_transfer_metadata,
+                                        trim_request_id_suffix)
 from tpu_inference.utils import device_array
 
 ReqId = str
@@ -132,7 +139,9 @@ class TPUConnectorMetadata(KVConnectorMetadata):
 
 class TPUConnector(KVConnectorBase_V1):
 
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
+    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
+                 kv_cache_config: KVCacheConfig):
+        super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self._connector_metadata = None
 
@@ -222,6 +231,32 @@ class TPUConnector(KVConnectorBase_V1):
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """
+        Get the KV transfer stats for the connector.
+        """
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_kv_connector_stats()
+
+    @classmethod
+    def build_kv_connector_stats(
+            cls,
+            data: dict[str, Any] | None = None) -> KVConnectorStats | None:
+        return (TpuKVConnectorStats(
+            data=data) if data is not None else TpuKVConnectorStats())
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TpuKVConnectorPromMetrics(vllm_config, metric_types, labelnames,
+                                         per_engine_labelvalues)
 
 
 class TPUConnectorScheduler():
@@ -466,6 +501,7 @@ class TPUConnectorWorker:
 
         self.kv_transfer_server = None
         self.zmq_cxt = zmq.Context()
+        self.transfer_stats = TpuKVConnectorStats()
         if self.is_producer:
             self.kv_d2h_executor = ThreadPoolExecutor(max_workers=128)
             ready_event = threading.Event()
@@ -645,6 +681,19 @@ class TPUConnectorWorker:
                         f"TPUConnector Worker {self.node_id} --> req_id={req_id}, skip insert_kv_chunks."
                     )
 
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """
+        Get the KV transfer stats for the worker.
+        """
+        self.transfer_stats.record_queue_lengths(
+            num_requests_being_pulled=len(self.reqs_pulling),
+            num_requests_waiting_pull=len(self.reqs_wait_pull),
+        )
+        # Clear stats for next iteration
+        if not self.transfer_stats.is_empty():
+            return self.transfer_stats.clone_and_reset()
+        return None
+
     def _prepare_kv_and_wait(self, req_id: str, req_meta: SendMeta):
         local_block_ids = req_meta.local_block_ids
         # TODO(xiang): pad block_ids to avoid recompilation
@@ -664,7 +713,19 @@ class TPUConnectorWorker:
                 kv, req_meta.expiration_time, buffer_idx
             ]
             self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
-            self.kv_transfer_server.await_pull(req_meta.uuid, kv)
+
+            if jax.profiler.TraceAnnotation.is_enabled():
+                dims_str, kv_size_bytes = get_kv_transfer_metadata(kv)
+
+                with jax.profiler.TraceAnnotation(
+                        "KV_Cache_Await_Pull",
+                        uuid=req_meta.uuid,
+                        request_id=trim_request_id_suffix(req_id),
+                        bytes=kv_size_bytes,
+                        dimensions=dims_str):
+                    self.kv_transfer_server.await_pull(req_meta.uuid, kv)
+            else:
+                self.kv_transfer_server.await_pull(req_meta.uuid, kv)
 
     def _async_d2h_and_transfer(self, req_id: str, req_meta: SendMeta,
                                 kv_src: list[jax.Array],
@@ -701,16 +762,35 @@ class TPUConnectorWorker:
                 break
             time.sleep(0.001)
 
+        d2h_slice_time = (time_1 - start_time) * 1000
+        d2h_transfer_time = (end_time - time_1) * 1000
         logger.info(
-            f"Worker {self.node_id} --> Done D2H kv transfer for req_id={req_id} | slice time={(time_1 - start_time)*1000:.2f}ms | copy time={(end_time - time_1)*1000:.2f}ms"
+            f"Worker {self.node_id} --> Done D2H kv transfer for req_id={req_id} | slice time={d2h_slice_time:.2f}ms | copy time={d2h_transfer_time:.2f}ms"
         )
+        self.transfer_stats.record_d2h_transfer(d2h_slice_time,
+                                                d2h_transfer_time)
 
         # 4. Network transfer
         self.reqs_wait_pull[req_id] = [
             dest_buffer, req_meta.expiration_time, buffer_idx
         ]
         self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
-        self.kv_transfer_server.await_pull(req_meta.uuid, updated_dest_buffer)
+
+        if jax.profiler.TraceAnnotation.is_enabled():
+            dims_str, kv_size_bytes = get_kv_transfer_metadata(
+                updated_dest_buffer)
+
+            with jax.profiler.TraceAnnotation(
+                    "KV_Cache_Await_Pull",
+                    uuid=req_meta.uuid,
+                    request_id=trim_request_id_suffix(req_id),
+                    bytes=kv_size_bytes,
+                    dimensions=dims_str):
+                self.kv_transfer_server.await_pull(req_meta.uuid,
+                                                   updated_dest_buffer)
+        else:
+            self.kv_transfer_server.await_pull(req_meta.uuid,
+                                               updated_dest_buffer)
 
     def _maybe_build_kv_connection(self, req_meta: LoadMeta) -> Any:
         if isinstance(req_meta.remote_host, list):
@@ -743,7 +823,18 @@ class TPUConnectorWorker:
             f"Worker {self.node_id} --> kv transfer | start pull req_id={req_id} | uuid={req_meta.uuid}"
         )
         start_time = time.perf_counter()
-        kv = conn.pull(req_meta.uuid, kv_spec)
+        if jax.profiler.TraceAnnotation.is_enabled():
+            dims_str, expected_bytes = get_kv_transfer_metadata(kv_spec)
+            with jax.profiler.TraceAnnotation(
+                    "KV_Cache_Pull",
+                    uuid=req_meta.uuid,
+                    request_id=trim_request_id_suffix(req_id),
+                    bytes=expected_bytes,
+                    dimensions=dims_str,
+                    source=f"{req_meta.remote_host}:{req_meta.remote_port}"):
+                kv = conn.pull(req_meta.uuid, kv_spec)
+        else:
+            kv = conn.pull(req_meta.uuid, kv_spec)
         kv_size_mb = sum(k.nbytes for k in kv) / (1024 * 1024)
         end_time_0, end_time_1 = time.perf_counter(), None
         prepare_time_ms = (end_time_0 - start_time) * 1000
@@ -763,16 +854,21 @@ class TPUConnectorWorker:
                     f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
                     f"pull time={pull_time_ms:.2f}ms | size={kv_size_mb:.2f}MB"
                 )
+                self.transfer_stats.record_successful_transfer(
+                    prepare_time_ms, pull_time_ms, kv_size_mb)
             else:
                 logger.warning(
                     f"Worker {self.node_id} --> kv transfer | failed to pull req_id={req_id} with in {pull_time_ms:.2f}ms | "
                     f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
                     f"size={kv_size_mb:.2f}MB")
+                self.transfer_stats.record_failed_transfer()
         else:
             logger.info(
                 f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | "
                 f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
                 f"size={kv_size_mb:.2f}MB")
+            self.transfer_stats.record_successful_transfer(
+                prepare_time_ms, pull_time_ms, kv_size_mb)
         return kv
 
     def _get_kv_spec(self, num_blocks: int) -> list[jax.ShapeDtypeStruct]:

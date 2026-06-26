@@ -22,13 +22,8 @@ from compressed_tensors.quantization import (QuantizationArgs,
 from jax.sharding import NamedSharding, PartitionSpec
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
-from vllm.model_executor.kernels.linear import (FP8ScaledMMLinearKernel,
-                                                register_linear_kernel)
-from vllm.model_executor.kernels.linear.scaled_mm import \
-    FP8ScaledMMLinearLayerConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import \
     CompressedTensorsW8A8Fp8
-from vllm.platforms import PlatformEnum
 
 from tpu_inference.layers.common.linear import sharded_quantized_matmul
 from tpu_inference.layers.common.process_weights.linear_weights import (
@@ -36,6 +31,8 @@ from tpu_inference.layers.common.process_weights.linear_weights import (
     to_parameter_list)
 from tpu_inference.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
+from tpu_inference.layers.common.quantization.fp8 import \
+    process_blockwise_fp8_linear_weights
 from tpu_inference.layers.common.utils import \
     slice_sharded_tensor_for_concatenation
 from tpu_inference.layers.vllm.quantization.configs import \
@@ -48,37 +45,6 @@ P = PartitionSpec
 logger = init_logger(__name__)
 
 
-class TpuFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
-    """Stub FP8 kernel registered for TPU platform.
-
-    VllmCompressedTensorsW8A8Fp8 fully overrides apply_weights and
-    process_weights_after_loading, so apply_scaled_mm is never called.
-    This class exists solely so that init_fp8_linear_kernel (called by the
-    upstream create_weights) can select a kernel without raising a KeyError
-    for the TPU platform.
-    """
-
-    @classmethod
-    def is_supported(
-            cls,
-            compute_capability: int | None = None) -> tuple[bool, str | None]:
-        return True, None
-
-    @classmethod
-    def can_implement(
-            cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
-        return True, None
-
-    def apply_scaled_mm(self, *, A, B, out_dtype, As, Bs, bias,
-                        output_shape) -> torch.Tensor:
-        raise NotImplementedError(
-            "TpuFP8ScaledMMLinearKernel.apply_scaled_mm should never be called"
-        )
-
-
-register_linear_kernel(TpuFP8ScaledMMLinearKernel, PlatformEnum.TPU, "fp8")
-
-
 class VllmCompressedTensorsW8A8Fp8(CompressedTensorsW8A8Fp8):
 
     def __init__(
@@ -87,17 +53,60 @@ class VllmCompressedTensorsW8A8Fp8(CompressedTensorsW8A8Fp8):
         is_static_input_scheme: bool,
         linear_config: VllmQuantLinearConfig,
     ):
+        # Per https://github.com/vllm-project/vllm/pull/32929,
+        # init_fp8_linear_kernel is now called by super().__init__
+        # but does not support TPU backends as expected.
+        # use_marlin was also changed to be determined via isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel).
+        # We need to monkeypatch init_fp8_linear_kernel and explicitly set use_marlin = True
+        # in order to bypass using native vLLM's vllm/vllm/model_executor/layers/quantization/utils/quant_utils.py:scaled_quantize.
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes import \
+            compressed_tensors_w8a8_fp8 as vllm_ct_fp8
+        vllm_ct_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
+
+        # Monkeypatch expose_input_quant_key to handle None kernel on TPU/non-GPU platforms
+        original_expose = vllm_ct_fp8.expose_input_quant_key
+
+        def safe_expose_input_quant_key(layer, kernel):
+            if kernel is None:
+                return
+            original_expose(layer, kernel)
+
+        vllm_ct_fp8.expose_input_quant_key = safe_expose_input_quant_key
+
         CompressedTensorsW8A8Fp8.__init__(
             self,
             weight_quant=weight_quant,
             is_static_input_scheme=is_static_input_scheme)
+        self.use_marlin = True
 
         self.linear_config = linear_config
 
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # Per https://github.com/vllm-project/vllm/pull/33892, use_marlin is set again
+        # in vllm/model_executor/layers/quantization/fp8.py `create_weights`.
+        # The flag is set on whether a specific type of GPU kernel is being used which
+        # means it is set to False for TPU.
+        # We need to return it back to True here.
+        super().create_weights(layer, input_size_per_partition,
+                               output_partition_sizes, input_size, output_size,
+                               params_dtype, **extra_weight_attrs)
+        self.use_marlin = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = t2j(layer.weight, use_dlpack=False)
+        weight = jnp.transpose(weight)
         delattr(layer, "weight")
         weight_scale = t2j(layer.weight_scale, use_dlpack=False)
+        weight_scale = jnp.transpose(weight_scale)
         delattr(layer, "weight_scale")
 
         if layer.bias is not None and not layer.skip_bias_add:
@@ -125,14 +134,22 @@ class VllmCompressedTensorsW8A8Fp8(CompressedTensorsW8A8Fp8):
                         self.linear_config.output_sizes):
                     end = start + output_size
                     weights.append(
-                        dequantize_tensor(weight[start:end], weight_scale[i]))
+                        dequantize_tensor(weight[:, start:end],
+                                          weight_scale[i]))
                     start = end
-                weight = jnp.concat(weights, axis=0)
+                weight = jnp.concat(weights, axis=1)
                 # Requantize into per-tensor.
                 weight, weight_scale = quantize_tensor(jnp.float8_e4m3fn,
                                                        weight, None)
             else:
-                weight_scale = jnp.squeeze(weight_scale, -1)
+                # Handle 2D blockwise scales correctly for quantized_matmul_kernel
+                # which expects 3D dims for blockwise ops.
+                # In standard per-channel quantization, the weight_scale is
+                # typically 2D with a singleton dimension which can be safely
+                # squeezed to 1D. However, in blockwise quantization, the
+                # scale is truly 2D.
+                if weight_scale.ndim == 2:
+                    weight_scale = jnp.squeeze(weight_scale)
 
             return process_linear_weights(
                 LinearWeights(
@@ -145,9 +162,26 @@ class VllmCompressedTensorsW8A8Fp8(CompressedTensorsW8A8Fp8):
                 output_sizes=self.linear_config.output_sizes,
                 reorder_size=self.linear_config.n_shards,
                 per_tensor=per_tensor,
+                enable_kernel=self.linear_config.
+                enable_quantized_matmul_kernel,
             )
 
-        weights = process_fp8_linear_weights(weight, weight_scale, bias)
+        if self.weight_block_size is not None:
+            weights = process_blockwise_fp8_linear_weights(
+                weight=weight,
+                weight_scale=weight_scale,
+                bias=bias,
+                weight_block_size=tuple(self.weight_block_size),
+                requant_block_size=self.linear_config.requant_block_size,
+                output_sizes=tuple(self.linear_config.output_sizes),
+                requant_weight_dtype=self.linear_config.requant_weight_dtype,
+                fuse_matmuls=self.linear_config.fuse_matmuls,
+                n_shards=self.linear_config.n_shards,
+                enable_kernel=self.linear_config.enable_quantized_matmul_kernel
+            )
+        else:
+            weights = process_fp8_linear_weights(weight, weight_scale, bias)
+
         weights = torch_view(
             shard_linear_weights(
                 weights,
@@ -208,7 +242,7 @@ class VllmCompressedTensorsW8A8Fp8(CompressedTensorsW8A8Fp8):
             outs = jax.lax.dot_general(
                 x_q,
                 weight_jax,
-                (((1, ), (1, )), ((), ())),
+                (((1, ), (0, )), ((), ())),
                 preferred_element_type=jnp.float32,
             )
             outs *= weight_scale_jax
@@ -249,7 +283,7 @@ class VllmCompressedTensorsW8A8Fp8(CompressedTensorsW8A8Fp8):
                 out = jax.lax.dot_general(
                     x_q,
                     weight_jax,
-                    (((1, ), (1, )), ((), ())),
+                    (((1, ), (0, )), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
                 # TODO(kyuyeunk): Investigate performance gain from merging scales.

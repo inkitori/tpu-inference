@@ -37,10 +37,10 @@ RUN apt-get update && apt-get install -y \
     bc \
     ca-certificates \
     unzip \
+    build-essential \
+    cmake \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
-
-# Suppress noisy XLA CPU AOT loader warnings
-ENV TF_CPP_MIN_LOG_LEVEL=3
 
 # Conditionally install google-cloud-cli for benchmarking infrastructure
 RUN if [ "$BM_INFRA" = "true" ]; then \
@@ -62,14 +62,15 @@ RUN git clone $VLLM_REPO . && \
     fi
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/tpu.txt --retries 3
-RUN --mount=type=cache,target=/root/.cache/pip VLLM_TARGET_DEVICE="tpu" pip install -e .
+RUN --mount=type=cache,target=/root/.cache/pip pip install setuptools-rust>=1.9.0
+RUN --mount=type=cache,target=/root/.cache/pip VLLM_TARGET_DEVICE="tpu" pip install --no-build-isolation -e .
 
 # Install test dependencies
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e tests/vllm_test_utils
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     git+https://github.com/thuml/depyf.git \
     pytest-asyncio \
-    "lm-eval[api]==0.4.11" \
+    "lm-eval[api,math]==0.4.12" \
     pytest-cov \
     tblib
 
