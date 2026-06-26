@@ -21,11 +21,9 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
-from vllm.model_executor.layers.fused_moe import (FusedMoE,
-                                                  FusedMoEMethodBase)
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.layer import \
-    FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.linear import LinearBase, set_weight_attrs
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
