@@ -30,7 +30,7 @@ Optional env vars (set inline or export first):
 
 Example: `OMP_NUM_THREADS=32 TPU_VENV=~/other_env ~/tpu-tooling/tpu-env.sh vllm serve ...`
 
-Note, this sets SKIP_JAX_PRECOMPILE=1 which is equivalent to --enforce-eager and will cause JIT XLA compilations. Benchmarks will be affected if the XLA cache isn't warm, so make sure to do a warmup bench first and check if any of the requests took suspiciously long to return.
+Note, this sets SKIP_JAX_PRECOMPILE=1 which behaves like --enforce-eager for benchmarking (cold XLA compiles on first use) and will cause JIT XLA compilations. Benchmarks will be affected if the XLA cache isn't warm, so make sure to do a warmup bench first and check if any of the requests took suspiciously long to return.
 
 ### `free-tpu.sh` — fully release the TPU and clean up leftover processes/cruft
 
