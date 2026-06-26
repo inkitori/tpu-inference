@@ -35,3 +35,7 @@ Example: `OMP_NUM_THREADS=32 TPU_VENV=~/other_env ~/tpu-tooling/tpu-env.sh vllm 
 ```
 
 Kills processes holding TPU device nodes (`/dev/vfio/*` on v6e/v5, `/dev/accel*` on v4), removes stale libtpu lockfile + shm segments, verifies with `tpu-info`. Safe anytime — ignores Cloud-TPU host agents, gcsfuse cache, and the current shell. If vLLM runs in Docker, `docker stop` the container first (the script kills the host process but the container may restart it).
+
+## Skills
+
+- **`tpu-model-workflow`** (`.claude/skills/tpu-model-workflow/`) — the workflow + testing/benchmarking discipline for adding model / quant / spec-decode support and doing perf work. Invoke it whenever starting that kind of task.
