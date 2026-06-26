@@ -22,7 +22,7 @@ from jax.sharding import PartitionSpec as P
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
+    FusedMoEMethodBase, FusedMoeWeightScaleSupported, RoutedExperts)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.linear import LinearBase, set_weight_attrs
 from vllm.model_executor.layers.quantization import \
@@ -131,7 +131,7 @@ class VllmMLXConfig(QuantizationConfig, VllmQuantConfig):
                         VllmUnquantizedLinearMethod
                     return VllmUnquantizedLinearMethod(linear_config)
                 return VllmMLXLinearMethod(self, linear_config)
-            case FusedMoE():
+            case RoutedExperts():
                 layer.moe_config = self.get_moe_config(layer)
                 return VllmMLXMoEMethod(self, layer, self.mesh)
             case _:
@@ -347,7 +347,7 @@ class VllmMLXLinearMethod(QuantizeMethodBase):
             return torch_view(jnp.concatenate(outs, axis=-1))
 
 
-def _make_mlx_moe_bias_loader(layer: "FusedMoE"):
+def _make_mlx_moe_bias_loader(layer: "RoutedExperts"):
     """Custom per-param ``weight_loader`` for MLX MoE affine biases.
 
     vLLM's ``FusedMoE.weight_loader`` routes by substring: names containing
@@ -481,7 +481,7 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         is SIGNED int4, we shift codes by -8 and fold the offset back into the
         groupbias: ``(q-8)*scale + (bias + 8*scale) == q*scale + bias``.
         """
-        assert isinstance(layer, FusedMoE)
+        assert isinstance(layer, RoutedExperts)
         bits = self.quant_config.bits
 
         # Loaded params are CPU torch tensors; cross into JAX with t2j (the AWQ/
@@ -557,7 +557,7 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         jax.effects_barrier()
 
     def apply_monolithic(self,
-                         layer: "FusedMoE",
+                         layer: "RoutedExperts",
                          x: torch.Tensor,
                          router_logits: torch.Tensor,
                          input_ids: Optional[torch.Tensor] = None
