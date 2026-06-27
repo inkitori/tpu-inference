@@ -95,6 +95,13 @@ confound), NOT a verifier bug — exactly the FP-near-tie behavior GOAL allows a
 near-tie probes that were clean (0.125/0.375 nats) corroborate; the 2 "confounded" ones are not valid
 counterevidence (wrong-shape re-prefill). The matched-shape oracle (d) is the decisive word: 8/8.
 
+### (e) Matched-shape 8-STEP corroboration, no logprobs, batch=8: 8/8 IDENTICAL.
+spec-on vs target-only, max_tokens=8 each, matched concurrent batch=8. ALL 8 prompts' full 8-token
+output byte-identical (Paris.../2,3,5/Au.../Jupiter.../12.../red,blue,and green/oxygen.../George
+Washington...). Slot 5 here = "red, blue, and green" identical both sides (the earlier 64-tok
+"yellow" split was pure later-step request-shape drift, not a verifier issue). Confirms agreement
+holds 8 steps deep under matched shape, not just step 1.
+
 ## VERDICT (batched correctness)
 - Perfect-draft per-slot (uniform b=16, ragged b=16, ragged b=32 @ GOAL concurrency): 100% accept,
   every window mean 8.00 / per-pos 1.000×7. 2422 total accepted == 2422 drafted across all windows.

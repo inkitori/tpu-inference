@@ -48,6 +48,26 @@
   (rejection_sample_greedy, accept = draft==target_argmax) — NOT DFlash-specific. PR#1868 added the
   proposer; "#1869"=a03d42e4 wired runner; "#1870"=fix cluster (5f4047cd lm_head proj = 0%-accept fix).
 
+## Confirmed facts (batched)
+- [2026-06-27][test-batched] **BATCHED CORRECTNESS DONE.** Perfect-draft per-slot PASS at
+  uniform b=16 (448/448 accept), ragged b=16 (672/672), and ragged b=32 @ GOAL concurrency
+  (1302/1302) — every metrics window mean accept len 8.00, per-pos 1.000×7, Accepted==Drafted.
+  Aggregate metric is a valid per-slot detector under perfect-draft (one mis-indexed slot drags the
+  global mean down). HBM FITS at c=32/len1024/util0.75 (no RESOURCE_EXHAUSTED). Details: 05-test-batched.md.
+- [2026-06-27][test-batched] **BATCHED GREEDY LOSSLESS.** Matched-shape oracle (both servers same
+  request shape, NO logprobs): step-1 batch=8 8/8 next-token IDENTICAL spec-on vs target-only (incl a
+  0.062-nat near-tie slot, still matched); 8-step batch=8 8/8 byte-identical. The 4/8 deep divergences
+  in free-running 64-tok completions are later-step request-shape numeric drift landing on
+  high-entropy near-ties (the 02-test confound), NOT verifier bugs.
+- [2026-06-27][test-batched] L3 code audit of per-slot _ctx_buf: CLEAN, no slot cross-contamination
+  (covers the one bug class perfect-draft can't — drafter slot-mixing). Minor: dead num_rejected_tokens
+  param in prepare_inputs; inert draft_attn_metadata (propose() never reads attn_metadata on torchax).
+- [2026-06-27][test-batched] **NEW GOTCHA (worse than 02-test's):** requesting LOGPROBS on the
+  SPEC-ON server CRASHES the engine — OverflowError in async_llm output_handler (logprobs.py:97
+  detokenizes an out-of-range id in the top-k logprobs stream). Out-of-range id is in the LOGPROBS
+  tensor, NOT the emitted sequence (sampled tokens fine). For spec-on probing use max_tokens=1 with
+  NO logprobs. Worth fixing eventually but not a generation/verifier bug.
+
 ## Known blockers / gotchas
 - [2026-06-27][impl] **c=32 BLOCKER RESOLVED.** Batched/multi-seq DFlash torchax decode
   IMPLEMENTED + smoke-verified. The num_reqs<=1 assert is gone; server serves --max-num-seqs 32
