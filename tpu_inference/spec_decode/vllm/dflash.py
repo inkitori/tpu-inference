@@ -239,14 +239,17 @@ class DFlashTorchaxProposer:
             self._ctx_buf = self._batched_ctx_write(self._ctx_buf, raw_dummy,
                                                     slot_idx, dst_row, valid)
 
-        # Warm the slot-permutation gather (mirrors condense/swap moves). It has
-        # exactly one static shape -- gather_src is always (max_num_reqs,) -- so
-        # one identity warm-up covers every runtime move. prepare_inputs() runs
-        # inside maybe_forbid_compile, so an unwarmed move step would hard-fail
-        # under VLLM_XLA_CHECK_RECOMPILATION the first time a condense fires.
-        identity_src = device_array(
-            self.mesh, np.arange(self.max_num_reqs, dtype=np.int32))
-        self._ctx_buf = self._permute_ctx_rows(self._ctx_buf, identity_src)
+        # Warm the sparse slot-move scatter (mirrors condense/swap moves) for
+        # EVERY K bucket prepare_inputs() can emit. Each bucket is one static
+        # (dst_slots, src_slots) shape (K,). prepare_inputs() runs inside
+        # maybe_forbid_compile, so any unwarmed K would hard-fail under
+        # VLLM_XLA_CHECK_RECOMPILATION the first time a condense of that size
+        # fires. Warm with self-copy pairs (dst==src==slot 0): an idempotent
+        # no-op that leaves _ctx_buf bit-unchanged.
+        for k in self._move_bucket_sizes():
+            zeros_k = device_array(self.mesh, np.zeros(k, dtype=np.int32))
+            self._ctx_buf = self._move_ctx_rows(self._ctx_buf, zeros_k,
+                                                zeros_k)
 
         logger.info("DFlash torchax precompile complete.")
 
@@ -263,6 +266,33 @@ class DFlashTorchaxProposer:
         if n <= block:
             return block
         return ((n + block - 1) // block) * block
+
+    def _move_bucket_sizes(self) -> list[int]:
+        """Static K buckets for the sparse ctx-row move (``_move_ctx_rows``).
+
+        The move scatters K padded (dst, src) pairs; K is bucketed so XLA traces
+        only a handful of static shapes (all warmed in precompile()) while the
+        COMMON sparse case (1-2 moved slots per condense) stays a tiny gather.
+        Powers of two up to max_num_reqs, plus max_num_reqs itself so the
+        worst-case full-permutation condense (every slot moves, no unmoved slot
+        to pad with) is always representable. At max_num_reqs=32 this is
+        {1,2,4,8,16,32} -- six warmed traces.
+        """
+        n = self.max_num_reqs
+        sizes: list[int] = []
+        k = 1
+        while k < n:
+            sizes.append(k)
+            k *= 2
+        sizes.append(n)
+        return sizes
+
+    def _bucket_move_count(self, num_moves: int) -> int:
+        """Smallest static bucket >= num_moves (num_moves assumed >= 1)."""
+        for k in self._move_bucket_sizes():
+            if k >= num_moves:
+                return k
+        return self.max_num_reqs  # unreachable: top bucket == max_num_reqs
 
     @functools.partial(jax.jit, static_argnums=(0, 3, 4))
     def _build_noise_block(
@@ -340,32 +370,52 @@ class DFlashTorchaxProposer:
         return ctx_buf.at[slot_idx, dst_row].set(merged)
 
     @functools.partial(jax.jit, static_argnums=(0, ), donate_argnums=(1, ))
-    def _permute_ctx_rows(
+    def _move_ctx_rows(
         self,
         ctx_buf: jax.Array,
-        gather_src: jax.Array,
+        dst_slots: jax.Array,
+        src_slots: jax.Array,
     ) -> jax.Array:
-        """Reorder ctx_buf's leading (slot) axis by a full permutation.
+        """Mirror a vLLM slot move onto ctx_buf via a SPARSE in-place scatter.
 
-        Mirrors a vLLM ``InputBatch.condense`` / ``swap_states`` slot move onto
-        the proposer's per-slot context buffer: after compaction/reorder, the
-        request that now occupies physical slot ``i`` previously lived in slot
-        ``gather_src[i]`` (or ``i`` itself if it did not move / is brand new).
-        A single leading-axis gather rebuilds the buffer in the new layout.
+        Replaces the old full leading-axis gather (``ctx_buf[gather_src]``),
+        which always rematerialized a fresh full ~4 GiB buffer (a transient that
+        OOMs at gpu_memory_utilization=0.75). condense / swap_states / _reorder
+        moves are SPARSE -- typically only 1-2 of the 32 slots actually move per
+        step -- so we gather ONLY the K moved rows and scatter them in place
+        into their destinations, donating ``ctx_buf`` so XLA mutates it without
+        a full second copy.
 
-        Donating ``ctx_buf`` lets XLA reuse the storage; the gather materializes
-        the reordered rows into the result before the donated input is reclaimed,
-        so swaps and cyclic moves (src/dst overlap) are safe -- no aliasing.
+        For each k: the request now in physical slot ``dst_slots[k]`` previously
+        lived in slot ``src_slots[k]``. The RHS ``ctx_buf[src_slots]`` is a
+        (K, buf_len, D) gather of just the moved source rows, evaluated against
+        the OLD (pre-move) buffer; ``.at[dst_slots].set(...)`` then writes them
+        in place. JAX functional semantics guarantee the RHS value is computed
+        from the input array BEFORE the in-place store (donation only reuses
+        storage, it does not reorder the dataflow), so swaps (i<->j) and cyclic
+        moves (a->b->c->a) read the correct pre-move occupants -- verified
+        numerically (identity / single / swap / 3-cycle / full permutation).
 
-        Shape never varies: ``gather_src`` is always (max_num_reqs,), so this has
-        exactly one static trace (warmed once in precompile()).
+        ``dst_slots``/``src_slots`` are built host-side (prepare_inputs) and
+        padded to a fixed bucket size K so XLA sees only a small set of static
+        shapes (all warmed in precompile()). Padding pairs are self-copies of an
+        UNMOVED slot p -- ``(dst=p, src=p)`` writes ctx_buf[p] back unchanged --
+        and p is never a real dst, so the padded indices never collide with a
+        real destination (duplicate-index scatter ordering can't corrupt a real
+        move). The full-permutation worst case uses K == max_num_reqs, where no
+        padding (hence no unmoved slot) is needed.
+
+        Peak extra HBM for the move is O(K * buf_len * D); with K bucketed to the
+        actual (small) move count it is a small fraction of the old full-gather
+        transient.
 
         Args:
-          ctx_buf:    (max_num_reqs, buf_len, D) bf16 buffer (donated).
-          gather_src: (max_num_reqs,) int32 source slot for each destination
-                      slot; the identity for unmoved/new slots.
+          ctx_buf:   (max_num_reqs, buf_len, D) bf16 buffer (donated).
+          dst_slots: (K,) int32 destination slot per moved pair.
+          src_slots: (K,) int32 source slot per moved pair (read pre-move).
         """
-        return ctx_buf[gather_src]
+        moved_rows = ctx_buf[src_slots]  # (K, buf_len, D) -- only K rows
+        return ctx_buf.at[dst_slots].set(moved_rows)
 
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _sample_block_draft_tokens(
@@ -419,10 +469,15 @@ class DFlashTorchaxProposer:
             if rid is not None:
                 old_slot_of[rid] = j
 
-        # gather_src[i] = old slot whose request now occupies slot i (identity
-        # for unmoved/new slots). Drives a single device gather over _ctx_buf.
-        gather_src = np.arange(self.max_num_reqs, dtype=np.int32)
-        moved = False
+        # Collect ONLY the slots that actually move this step (dst <- src,
+        # src != dst). condense moves are sparse (usually 1-2 of 32 slots), so
+        # we mirror them with a sparse in-place scatter (_move_ctx_rows) over
+        # just these rows rather than a full leading-axis gather of all 32.
+        # is_unmoved[i] tracks slots that keep their row (identity), used to pick
+        # an idempotent padding slot below.
+        moved_dst: list[int] = []
+        moved_src: list[int] = []
+        is_unmoved = np.ones(self.max_num_reqs, dtype=bool)
         new_ctx_len = self._ctx_len.copy()
         new_prev_seq_len = self._prev_seq_len.copy()
         new_last_req_id: list[Optional[str]] = [None] * self.max_num_reqs
@@ -434,23 +489,43 @@ class DFlashTorchaxProposer:
             src = old_slot_of.get(cur)
             if src is None:
                 # Brand-new request in this slot: reset its host state. Its
-                # buffer row is left as-is (gather identity); ctx_len 0 means
-                # every stale row is attention-masked, so contents are inert.
+                # buffer row is left as-is (no move); ctx_len 0 means every
+                # stale row is attention-masked, so contents are inert.
                 new_ctx_len[i] = 0
                 new_prev_seq_len[i] = 0
             elif src != i:
                 # Request moved src -> i: carry its full state along.
-                gather_src[i] = src
+                moved_dst.append(i)
+                moved_src.append(src)
+                is_unmoved[i] = False
                 new_ctx_len[i] = self._ctx_len[src]
                 new_prev_seq_len[i] = self._prev_seq_len[src]
-                moved = True
-            # src == i: unmoved, keep existing state (identity gather).
+            # src == i: unmoved, keep existing state (no move).
         self._ctx_len = new_ctx_len
         self._prev_seq_len = new_prev_seq_len
         self._last_req_id = new_last_req_id
-        if moved:
-            self._ctx_buf = self._permute_ctx_rows(
-                self._ctx_buf, device_array(self.mesh, gather_src))
+        if moved_dst:
+            # Pad the moved pairs up to a static bucket K so XLA traces only the
+            # set of shapes warmed in precompile(). Padding pairs are self-copies
+            # of an UNMOVED slot p -- (dst=p, src=p) writes _ctx_buf[p] back
+            # unchanged. p is never a real dst, so padded indices never collide
+            # with a real destination (duplicate-index scatter can't corrupt a
+            # real move). The full-permutation worst case (no unmoved slot) maps
+            # to the K == max_num_reqs bucket, where n_pad == 0.
+            k = self._bucket_move_count(len(moved_dst))
+            n_pad = k - len(moved_dst)
+            if n_pad > 0:
+                unmoved_idx = np.flatnonzero(is_unmoved)
+                # Guaranteed non-empty: a non-full bucket implies < max_num_reqs
+                # real moves, hence at least one unmoved slot exists.
+                pad_slot = int(unmoved_idx[0])
+                moved_dst.extend([pad_slot] * n_pad)
+                moved_src.extend([pad_slot] * n_pad)
+            dst_arr = np.asarray(moved_dst, dtype=np.int32)
+            src_arr = np.asarray(moved_src, dtype=np.int32)
+            self._ctx_buf = self._move_ctx_rows(
+                self._ctx_buf, device_array(self.mesh, dst_arr),
+                device_array(self.mesh, src_arr))
 
         # accepted context length per request this step (host int array).
         seq_lens_host = np.asarray(jax.device_get(attn_metadata.seq_lens))
