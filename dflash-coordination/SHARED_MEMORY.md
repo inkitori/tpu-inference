@@ -8,6 +8,21 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][reconcile] **HEAD VERIFIED KNOWN-GOOD — shard_map head-shard IS the real, effective fix; the
+  revert did NOT clobber it.** Git history is LINEAR: revert cc735253 (of the inert _pin) lands BEFORE the
+  fix 36ecb75c, so nothing lost; `git diff 88862fdb HEAD models/vllm/dflash.py` = +79-line SUPERSET (adds
+  _sharded_attention/shard_map), NOT reverted-to-baseline; `_draft_forward_cached` calls _sharded_attention
+  (eager_attention_forward removed); spec_decode KV cache head-sharded intact. EMPIRICAL on HEAD (real v6e-8,
+  probe_headshard_cached + probe_hlo): cached draft fwd @C=4096/N=32 = **9.71ms, all-gathers=0, max|diff| vs
+  replicated 0.0, greedy-argmax 100%** ⇒ head-shard ACTIVE + bit-exact. (The 84ms baseline does NOT reproduce
+  in-probe because the probe's (C) only replicates projection WEIGHTS — the old eager replicated ALGORITHM is
+  deleted; all A/B/C = ~10ms = shard_map path. all-gather=0 is the structural proof, not the timing delta.)
+  Report A correct; Report B's "needs a hand-rolled grouped-attn rewrite" is WRONG — shard_map IS that, and
+  works (B's pessimism applies ONLY to the GSPMD/with_sharding_constraint path it tested). DO NOT pursue B's
+  rewrite. Unit tests 19 pass / 1 fail = ONLY the known pre-existing test_dflash_torchax_wrapper_fns (stale
+  sig, not a regression). HEAD=865c7516==origin/dflash. No restore needed. ⇒ NEEDS_TEST: real serve
+  lossless re-verify of the sharded path (perfect-draft thru condense + greedy-vs-target; attn formulation
+  changed since 13-test), THEN Lever B + serve bench. Details: 20-reconcile.md.
 - [2026-06-27][impl-headshard] **HEAD-SHARD LANDED via jax.shard_map — cached draft fwd 83.8→9.7ms (8.6x),
   BIT-EXACT (max|diff| 0.0, greedy-argmax 100%), all-gathers 72→0, full context KEPT (accept stays ~6) ⇒
   the draft attn is NO LONGER the bottleneck; binding constraint is now Lever B (~40ms FIXED overhead).**
@@ -25,26 +40,11 @@
   NEEDS_TEST: real serve perfect-draft-through-condense + greedy-vs-target lossless re-verify (attn formul.
   changed), THEN Lever B + serve bench. Probes pushed. Details: 19-impl-headshard.md.
 
-- [2026-06-27][redteam-attn] **17's "FLOP-bound dead end" is FALSE — the draft attn is REPLICATION/
-  MEMORY-bound and ~60x FIXABLE ⇒ ACHIEVABLE, NEEDS_IMPL.** Physics: useful attn FLOPs 1.55e11 ⇒ floor
-  0.17ms @918TFLOP/s; measured eager 48.7ms = **0.35% of MXU peak** (a FLOP-bound kernel runs 30-70%,
-  never 0.35%). DECOMPOSE (real 8-chip): repeat_kv alone = 9.5ms @ 2285 GB/s = **139% of single-chip HBM
-  peak** (pure-memory smoking gun: the 8x GQA-expanded K/V is written then RE-READ by both matmuls);
-  f32-score materialization = +8ms (secondary). FIX (measured, real mesh, correct to bf16 max|diff|
-  1.9e-3): the draft attn runs REPLICATED (`PartitionSpec()`) so all 8 chips redundantly do all 64 heads
-  — **HEAD-SHARD the 64 q-heads 8/chip on the `model` axis (SAME eager math) = 48.78→1.49ms (33x)**; +
-  GQA-native K/V reads (KVH=8) + bf16 scores → **0.82ms (~60x)** @C=4608. 17 was wrong because its bench
-  compared two REPLICATED formulations (eager + flash) and never sharded the embarrassingly-parallel head
-  axis. Flash is NOT needed (replicated flash w/ sane tiling = 153ms WORSE than 17's 84; head-sharded
-  flash 17.7ms still loses to eager head-sharded — tiny q-block B=8). Head-sharding KEEPS FULL CONTEXT ⇒
-  accept stays ~6 (unlike windowing). PROJECTION (attn 52→~1ms; step=FIXED+verify9.08+draft~10): FIXED40
-  (today) 0.86x, **FIXED25 1.16x, FIXED15 1.50x, FIXED8 1.88x B=3752** (accept→5 sensitivity still clears
-  B once overhead cut). ⇒ this REVALIDATES 15's two-lever plan with a 60x (not 8x-windowing) draft lever;
-  the ONLY remaining gap is Lever B (cut the ~40ms FIXED host overhead, already scoped). NO new draft
-  model, NO sparse-attn research, NO dropping c=32. **NEEDS_IMPL: (1) head-shard the draft attn in
-  models/vllm/dflash.py (shard Hq on MLP_TENSOR; exact per-head), (2) GQA-native+bf16 scores [keep softmax
-  f32 — pure-bf16 softmax SIGSEGVs the v6e conv-emitter; use lax.dot_general], (3) Lever B overhead cut.**
-  Microbenches committed (0333f8fa, 32264ef4); source untouched. Details: 18-redteam-attn.md.
+- [2026-06-27][redteam-attn] (SUPERSEDED by impl-headshard+reconcile — fix landed+verified). 17's
+  "FLOP-bound dead end" was FALSE: the draft attn was REPLICATION/MEMORY-bound (eager 48.7ms = 0.35% MXU
+  peak; repeat_kv 139% HBM peak), ~60x fixable by HEAD-SHARDING the 64 q-heads 8/chip on the 'model' axis
+  (NOT a kernel swap; flash NOT needed). XLA gotcha (still live): pure-bf16 softmax SIGSEGVs the v6e
+  conv-emitter — keep softmax f32. Details: 18-redteam-attn.md.
 - [2026-06-27][impl-window] **LEVER A (windowing) DEAD (kills accept 6→2.5, window-insensitive). LEVER B
   landed + sound (KEEP). Its open question "need a cheaper FULL-CONTEXT draft attn, not windowing" is now
   ANSWERED by impl-headshard (shard_map).** Lever B (numerics-NEUTRAL, KEEP): on the KV path _ctx_buf is
@@ -115,7 +115,6 @@
   alongside as cross-check now). ⇒ NEEDS_TEST (real serve-path perfect-draft c=32 + greedy-vs-target
   with flag ON) then NEEDS_BENCH with num_spec tuned DOWN to clear the marginal flip. Commits ebb2b44c,
   39e2f91f, e1fa4115, d7a4300b, b5d5c7b4. Details: 12-impl-kvcache.md.
-- [2026-06-27][bench-v3] Superseded by bench-sweep (B=3752 authoritative). Details: 11-bench-c32-v3.md.
 - [2026-06-27][impl-condense] **CONDENSE/SLOT DESYNC FIXED + VERIFIED ACROSS A REAL CONDENSE EVENT ⇒
   NEEDS_BENCH.** The 09 out=4096/c=32 broadcast crash (dflash.py:421) is GONE. PROPER fix (b94fc366,
   found already-committed from a prior session): mirror vLLM InputBatch.condense slot-moves onto the
