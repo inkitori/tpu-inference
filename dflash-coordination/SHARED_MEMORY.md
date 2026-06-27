@@ -8,6 +8,23 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][bench-v2] **GATE PASS, but BENCH BLOCKED: a DETERMINISTIC CRASH at the out=4096/c=32
+  bench point.** Perfect-draft gate at c=32/SHORT outputs = 100% per-slot (mean 8.00, per-pos 1.000×7,
+  5 windows) ⇒ 6b6acd49 did NOT break verify. BUT serving DFlash at out=4096/c=32 CRASHES ~69s in
+  (seqs ~1500-3300 tok, kv 2.3% — NOT OOM): `ValueError: could not broadcast (3184,) into (176,)` at
+  **dflash.py:421** in prepare_inputs. ROOT CAUSE = a PRE-EXISTING batched bug EXPOSED (not caused) by
+  6b6acd49: `_ctx_len[i]` is keyed by SLOT, `num_new=seq_len-ctx_len_i` uses the FULL accepted length
+  (num_tokens_no_spec); when a finished slot is backfilled by InputBatch.condense with a still-long
+  request, the slot-change guard resets _ctx_len[i]=0 ⇒ num_new=whole-seq (3184) but raw_hidden's query
+  segment has only ~176 rows ⇒ overrun. OLD eager path SILENTLY CLAMPED (wrote wrong rows = silent
+  draft-context corruption, no crash); the new host index-plan turns it into a hard crash. ⇒ The 07
+  "358 tok/s / 10.6x" A-number was measured on a SILENTLY-CORRUPT run; treat it as unreliable. B
+  (target-only 3789 tok/s) is still honest. FIX (candidate b): drive copy width from the segment width
+  `num_new = qsl[i+1]-qsl[i]` (not seq_len-ctx_len), keep end=ctx_len+num_new. CAVEAT: that stops the
+  crash but a condensed-in request LOSES its pre-move _ctx_buf history ⇒ acceptance degrades for it
+  (NOT a losslessness break) — a fuller fix carries _ctx_buf across condense or keys state by req_id.
+  ⇒ **NEEDS_IMPL** (fix the slot/condense desync, then re-GATE at out≥512 to trigger condense, then
+  re-bench A vs B). Details: 09-bench-c32-v2.md.
 - [2026-06-27][impl-perf] **LEVER #2 (write fix) LANDED — commit 6b6acd49.** Replaced the
   eager 32x lax.dynamic_update_slice loop in dflash.py prepare_inputs() with ONE jitted+donated
   masked-scatter `_batched_ctx_write` (in-place). ISOLATED microbench: per-step _ctx_buf WRITE
