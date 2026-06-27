@@ -108,6 +108,9 @@ def _make_proposer(num_speculative_tokens=2, block_size=3):
     proposer.block_size = block_size
     proposer.mask_token_id = 0
     proposer.max_model_len = 128
+    # Small pad block so these tiny-shape tests still exercise the rounding /
+    # slicing logic (the production default is 512).
+    proposer._ctx_pad_block = 16
     proposer._raw_hidden_dim = 16
     proposer._ctx_len = 0
     proposer._prev_seq_len = 0
@@ -227,6 +230,9 @@ def test_torchax_proposer_lifecycle_flow(mock_wrapper_cls, mesh):
     mock_wrapper.get_compute_logits_fn.return_value = mock_compute_logits
 
     proposer = DFlashTorchaxProposer(vllm_config, runner)
+    # Small pad block (production default is 512) so the tiny max_model_len=128
+    # test still rounds to 128 and exercises multiple padded_ctx shapes.
+    proposer._ctx_pad_block = 16
 
     # 1. Test load_model
     with jax.set_mesh(mesh):
@@ -242,8 +248,9 @@ def test_torchax_proposer_lifecycle_flow(mock_wrapper_cls, mesh):
 
     # 2. Test precompile
     proposer.precompile()
-    # Padded shapes: 16, 32, 64, 128 (4 shapes)
-    assert mock_draft_forward.call_count == 4
+    # Padded shapes: multiples of _ctx_pad_block (16) up to max_model_len 128
+    # => 16, 32, 48, 64, 80, 96, 112, 128 (8 shapes).
+    assert mock_draft_forward.call_count == 8
     # compute_logits is called within _sample_block_draft_tokens. Since _sample_block_draft_tokens
     # is JIT-compiled and the input shape is always the same, JAX caches the trace and only
     # executes the Python body (which calls the mock) once.

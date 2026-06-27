@@ -75,6 +75,18 @@ class DFlashTorchaxProposer:
                                      self.hidden_size)
         self._raw_hidden_dim = self._num_target_layers * target_hidden_size
 
+        # Context padding granularity. The persistent per-slot context buffer
+        # _ctx_buf is sized to a multiple of this block, and every per-step
+        # forward slices a width that is also a multiple of this block, so the
+        # downstream JIT cache only ever sees ~max_model_len/_CTX_PAD_BLOCK
+        # context shapes regardless of batch size. Using a fixed block (rather
+        # than rounding up to the next power of two) keeps the persistent buffer
+        # close to the real max_model_len need: pow2 rounding of e.g. 4224 -> 8192
+        # nearly doubles the buffer (32 * D=14400 * bf16 = ~7 GiB replicated),
+        # which OOMs at concurrency 32. This is a pure memory-layout / shape
+        # change: padding rows are attention-masked to ~0 and consumed only by
+        # per-position ops, so produced draft tokens are bit-identical.
+        self._ctx_pad_block = 512
         self.rng_key = jax.random.key(self.vllm_config.model_config.seed)
         self.max_num_tokens = runner.max_num_tokens
         self.max_model_len = runner.max_model_len
@@ -134,15 +146,15 @@ class DFlashTorchaxProposer:
         max_num_reqs = getattr(self.runner, "max_num_reqs",
                                getattr(self.runner, "max_num_seqs", 1))
 
-        # Match the rounded-up size that prepare_inputs() actually uses,
-        # otherwise non-power-of-two max_model_len leaves the largest shape
-        # unwarmed.
+        # Warm exactly the set of padded_ctx widths prepare_inputs() can emit:
+        # every multiple of _ctx_pad_block from one block up to the rounded-up
+        # max_model_len. Any runtime width is _next_padded_size(max_ctx) for
+        # 1 <= max_ctx <= max_model_len, which is always a member of this set,
+        # so propose() (running inside maybe_forbid_compile) never hits an
+        # unwarmed shape under VLLM_XLA_CHECK_RECOMPILATION.
         target_max = self._next_padded_size(self.max_model_len)
-        padded_sizes: list[int] = []
-        p = 16
-        while p <= target_max:
-            padded_sizes.append(p)
-            p *= 2
+        block = self._ctx_pad_block
+        padded_sizes: list[int] = list(range(block, target_max + 1, block))
 
         logger.info("Precompiling DFlash torchax for %d padded_ctx shapes...",
                     len(padded_sizes))
@@ -197,15 +209,19 @@ class DFlashTorchaxProposer:
 
         logger.info("DFlash torchax precompile complete.")
 
-    @staticmethod
-    def _next_padded_size(n: int) -> int:
-        """Round n up to the next power-of-two, min 16."""
-        if n <= 16:
-            return 16
-        p = 16
-        while p < n:
-            p *= 2
-        return p
+    def _next_padded_size(self, n: int) -> int:
+        """Round n up to the next multiple of the context pad block (min one block).
+
+        Used for both the persistent _ctx_buf width and the per-step forward
+        slice width; the two MUST share this granularity so the slice never
+        exceeds the allocation. A fixed block (vs next-power-of-two) keeps the
+        persistent buffer near the real max_model_len need without nearly
+        doubling it. Numerics are unaffected (padding is attention-masked).
+        """
+        block = self._ctx_pad_block
+        if n <= block:
+            return block
+        return ((n + block - 1) // block) * block
 
     @functools.partial(jax.jit, static_argnums=(0, 3, 4))
     def _build_noise_block(
@@ -308,9 +324,11 @@ class DFlashTorchaxProposer:
                 (i, int(self._ctx_len[i]), 0))
             self._ctx_len[i] = end
 
-        # All slots share one rectangular padded context width = power-of-two
-        # over the max accepted length, so the downstream JIT cache only sees
-        # ~log2(max_model_len) shapes regardless of batch size.
+        # All slots share one rectangular padded context width = the max
+        # accepted length rounded up to _ctx_pad_block, so the downstream JIT
+        # cache only sees ~max_model_len/_ctx_pad_block shapes regardless of
+        # batch size. This width never exceeds buf_len (both round up with the
+        # same block, and max_ctx <= max_model_len), so the slice is in-bounds.
         ctx_lens = self._ctx_len[:num_reqs].astype(np.int32)
         max_ctx = int(ctx_lens.max()) if num_reqs > 0 else 1
         padded_ctx = self._next_padded_size(max(max_ctx, 1))
