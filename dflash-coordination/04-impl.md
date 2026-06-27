@@ -42,8 +42,36 @@ The cap is GLUE-CODE, not a model limit. HF DFlash forward is fully batch-generi
 - _sample_block_draft_tokens: `hidden[:, 1:1+num_spec]` → argmax → (N, num_spec).
 - precompile: warm with N=max_num_reqs batch shapes.
 
+## Adversarial review (L3) — 1 BUG found + fixed, rest clean
+- BUG: precompile only warmed N in {1, max} but active batch fluctuates over
+  [1,max] and N is a STATIC jit axis; propose() runs inside maybe_forbid_compile
+  -> unwarmed N hard-fails under recompilation guard (else mid-decode stall).
+  FIX: warm batch_sizes = range(1, max_num_reqs+1). (commit f9947f43)
+- Clean: ragged slice (qsl[i]:qsl[i]+n_copy, leading rows = accepted), per-row
+  positions/mask (ctx_valid per (slot,pos)), stale-buffer masking on req change,
+  num_reqs source consistency, draft_token_ids (num_reqs, num_spec) alignment,
+  noise-block/position consistency, out_shardings ranks, no leftover scalar reads.
+
 ## Status
-- [ ] implement  [ ] smoke serve @ max-num-seqs 32  [ ] coherent output  [ ] commit+push
+- [x] implement  [x] adversarial review + fix  [ ] smoke serve @ max-num-seqs 32
+- [ ] coherent output  [x] commit+push (code)
+
+## Smoke result so far
+- Server LAUNCHES + serves at --max-num-seqs 32 (assert gone). Startup clean.
+- First smoke attempt (max-model-len 2048, default util): batched path RUNS (no
+  assert, no logic error) but RESOURCE_EXHAUSTED at the _ctx_buf
+  dynamic_update_slice — tried to alloc 1.76G, only 970M free. This is the
+  HBM-pressure SECOND risk the bench manager flagged, NOT a correctness bug.
+  Root cause: vLLM memory profiler grabs ~all HBM for KV cache (2.04M tokens)
+  before the proposer's full (32, buf_len, raw_hidden_dim) _ctx_buf is exercised.
+  _ctx_buf ≈ 32 × buf_len × raw_hidden_dim(~13440) × 2B; at buf_len 2048 = 1.76G.
+- PERF NOTE (follow-up, not blocking smoke): each prepare_inputs does up to
+  num_reqs separate lax.dynamic_update_slice on the FULL _ctx_buf, eager =>
+  full-buffer transient per call per step. A jitted batched scatter would avoid
+  this. Next perf/opt manager should address.
+- Retry config: max-model-len 1024, --gpu-memory-utilization 0.75 (shrinks KV +
+  halves _ctx_buf to ~0.88G). Launch: scratchpad/serve.sh -> serve2.log.
 
 ## Commits
-(pending)
+- 9410b793 batched DFlash decode (per-slot ctx buffers, ragged slicing, batched fwd)
+- f9947f43 precompile warm all batch sizes 1..max_num_reqs
