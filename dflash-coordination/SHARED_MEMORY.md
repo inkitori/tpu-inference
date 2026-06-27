@@ -8,6 +8,16 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][bench-c32] **SPEED VERDICT: DFlash is ~10.6x SLOWER than target-only at the
+  GOAL bench point (in=1, out=4096, c=32, WARM cache).** A(DFlash)=358.65 sys out tok/s,
+  TPOT 0.317s; B(target-only)=3788.53 sys out tok/s, TPOT 0.0084s. Per-step is ~37x slower.
+  Acceptance is HEALTHY (mean ~5.5/step at full c=32, per-pos 0.85→0.52) ⇒ this is a PERF
+  bug, not accept/correctness. ⇒ Phase-1 SPEED requirement FAILS as-is → NEEDS_IMPL (perf).
+  Bottlenecks (07-bench-c32.md): (1) dflash.py:~324 eager non-donated _ctx_buf
+  dynamic_update_slice inside a 32x per-req loop (full ~4GiB copy/step); (2) STATELESS draft
+  recomputes fc+8 attn over the FULL context every step (O(ctx), grows with out len, no KV
+  cache); (3) per-step device_get host syncs. Both servers gave byte-identical greedy probe
+  output (same target). HBM is NOT the gap (A 39.7 / B 24.1 GiB total).
 - [2026-06-26][L1-seed] Branch `dflash` has substantial prior DFlash work. `STATE.md`
   at repo root documents a claimed "working DFlash gpt-oss-20b serve recipe". Recent
   commits fixed: 0% accept (project draft logits through target lm_head, not input

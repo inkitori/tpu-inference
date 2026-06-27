@@ -29,6 +29,11 @@ on the **torchax** path.
   gcsfuse bucket; it enforces same-region. `~/tpu-tooling/free-tpu.sh` releases the TPU.
 - Relevant skills: `tpu-model-workflow` (correctness/bench discipline on torchax path),
   `setup-env` (env/scratch-venv setup). Use them.
+- **SCOPE GUARD (user directive):** Only fix DFlash / spec-decode-SPECIFIC problems. If an issue also
+  reproduces on plain `gpt-oss-20b` WITHOUT DFlash (i.e. it is not spec-decode-specific), it is OUT OF
+  SCOPE — note it and move on; do NOT go fix general gpt-oss issues. Example: the spec-on `logprobs`
+  OverflowError — if it's a general gpt-oss/logprobs issue, leave it; the workaround is to probe
+  without logprobs. Stay focused on getting DFlash working.
 
 ## Correctness test ladder (use these, cheapest first)
 1. **PERFECT-DRAFT MACHINERY TEST (run FIRST):** inject the target's own greedy tokens
@@ -43,6 +48,14 @@ on the **torchax** path.
 4. **DISTRIBUTIONAL (temp>0):** KL / chi-squared over first-token dist vs target-only.
    Final confirmation only — expensive + noisy, not a debugging tool.
 
-## Definition of DONE
+## Definition of DONE (Phase 1)
 All three hard requirements verified with recorded evidence, code committed + pushed,
-and a final report file written. Only then return STATUS: DONE to L1.
+and a final report file written. Only then is Phase 1 done.
+
+## Phase 2 — async scheduling (ONLY after Phase 1 is verified DONE)
+User directive: once Phase 1 is DONE (DFlash proven correct/lossless AND faster than target-only at
+input=1/output=4096/concurrency=32), ALSO get DFlash working with **async scheduling**. The current
+recipe runs with `--no-async-scheduling` (a bring-up workaround). Enable async scheduling, then
+re-verify: (a) correctness/losslessness still holds, and (b) it still serves and is still faster at
+the bench point. Do NOT begin Phase 2 before Phase 1 is verified DONE. Only return STATUS: DONE to L1
+after Phase 2 is also complete (or report Phase 1 DONE + Phase 2 status explicitly).
