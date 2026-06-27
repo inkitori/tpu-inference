@@ -49,6 +49,19 @@
   proposer; "#1869"=a03d42e4 wired runner; "#1870"=fix cluster (5f4047cd lm_head proj = 0%-accept fix).
 
 ## Known blockers / gotchas
+- [2026-06-27][bench] **GOAL bench point (concurrency 32) NOT RUNNABLE — hard blocker.** DFlash
+  torchax decode is single-seq ONLY: `assert self.runner.input_batch.num_reqs <= 1`,
+  "DFlash does not support batched (multi-request) decoding", in
+  speculative_decoding_manager.py:111 (also asserts dp_size==1, no async). Fires the instant the
+  scheduler batches >=2 reqs into a decode step ⇒ `--max-num-seqs 32` CRASHES (AssertionError),
+  not silently clamped. Intentional: wiring commit a03d42e4 is titled "wire DFlash into the
+  torchax pipeline (concurrency 1)". ⇒ NEEDS_IMPL: add batched/multi-seq DFlash decode
+  (relax that assert + make propose_dflash_draft_token_ids / host_extract_sampled_tokens /
+  spec_decode/vllm/dflash.py handle a real batch) BEFORE the c=32 speed bench is possible.
+- [2026-06-27][bench] Config A (DFlash) serves fine at max-num-seqs 1 / max-model-len 5120 (fits
+  in=1+out=4096). HBM ~28.7-28.9 GiB / 31.25 per chip ⇒ only ~2.3 GiB headroom — KV for 32
+  concurrent 5120-len seqs is a SECOND risk once the assert is lifted. c=1 A-vs-B throughput was
+  NOT finalized (blocker took priority). Details: 03-bench.md.
 - [2026-06-26][research] v6e-only workarounds in place (not general): MXFP4→fp8_e4m3fn requant
   (layers/vllm/quantization/mxfp4.py); v1 ragged gather mandatory. EP mandatory (plain TP8 dies
   IndivisibleError). gcsfuse root-only → stage to local HF cache HF_HOME=/home/enyouki/local_hf.
