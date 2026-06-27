@@ -6,16 +6,27 @@ in=1/out=4096/c=32. Date: 2026-06-27. Manager: impl-window. Builds on
 cache + cached forward this builds on), 10-impl-condense (per-slot state must
 follow condense).
 
-## TL;DR / VERDICT — BOTH LEVERS LANDED + MICROBENCH-PROVEN ⇒ NEEDS_TEST
-The isolated real-8-chip microbench shows the windowed cached draft forward is
-now FLAT in context (~14.2ms @W=256, ~17.5ms @W=512, constant C=1024→4608) vs
-the full-context cached forward that scaled 26→86ms — a ~6x cut at C=4608.
-Combined projection clears B=3752 across the realistic post-Lever-B overhead
-band (W=256: 1.12–1.78x B for FIXED 8–25ms; W=512: 1.04–1.60x B). Lever B
-(drop redundant _ctx_buf write + batch device_gets + free 3.96 GiB) is
-numerics-NEUTRAL and moves FIXED from ~40ms toward 15–25ms. ⇒ NEEDS_TEST:
-lossless re-verify of the WINDOWED path through condense + a real-draft
-acceptance check at W (the window changes proposals), then BENCH.
+## TL;DR / VERDICT — LEVER A IS A DEAD END (kills acceptance); LEVER B LANDED ⇒ BLOCKED_USER
+**LEVER A (windowing) does NOT beat B — it craters acceptance.** The isolated
+microbench was beautiful (windowed cached fwd FLAT ~14.2ms@W=256, ~6x cheaper),
+BUT the real-draft serve acceptance check at c=32 is DECISIVE: mean accept len
+collapses to **~2.5** at BOTH W=256 and W=512 (vs ~6.0–6.7 full-context
+baseline). Doubling the window 256→512 recovered NOTHING ⇒ the loss is INTRINSIC
+to truncating the DFlash draft's context, not a tunable knob in this range. At
+accept 2.5 the ~6x-cheaper draft yields only ~0.6–0.74x B (W=256 @ device step
+20.67ms: FIXED=8 → 2790 tok/s = 0.74x; FIXED=15 → 2243 = 0.60x). **The
+projection needed accept ≳4 to win; we are at 2.5.** Lever A as implemented
+should NOT be shipped at any W tried; if a recovery point exists it is well above
+512, which erodes the speedup premise. ⇒ the windowing lever is REJECTED on
+evidence; a fresh approach to the O(C·B) draft attn-score matmul is needed (one
+that keeps full context). **LEVER B (numerics-NEUTRAL) LANDED + is sound + still
+useful** (frees 3.96 GiB → util 0.75 fits, cuts real per-step overhead, does NOT
+touch proposals so full-context accept stays ~6) — keep it. ⇒ BLOCKED_USER: the
+two-lever feasibility plan's Lever A is invalid; the path to beat B needs a
+design decision (see "DEAD END" + "WHAT REMAINS").
+
+The code remains in-tree, flag-gated and OFF by default (DFLASH_DRAFT_WINDOW=0),
+so it is harmless and available if a future approach wants the gather machinery.
 
 ## WHICH LEVERS + HOW (both flag-gated under DFLASH_KV_CACHE=1)
 
@@ -92,21 +103,22 @@ W=512 23.98ms. kv_project(B=8) 0.539ms.
 only O(W·B) remains) — ~14.2ms @W=256 regardless of context, vs 85.6ms full-
 context cached @C=4608 = **~6x** cut, vs 98.4ms FULL recompute = ~6.9x.
 
-## COMBINED PROJECTION vs B = 3752 tok/s (step = FIXED + device_step; accept=6 assumed)
+## PROJECTION — was promising at assumed accept=6, but COLLAPSES at the MEASURED accept=2.5
+With the ASSUMED accept=6 the windowed projection cleared B (W=256: 1.78x@FIXED8,
+1.12x@FIXED25). But the MEASURED real-draft accept at W is **2.5**, so the honest
+projection (tput = accept·32/step):
 ```
-  W=256 (device step @C=4608 = 20.67ms):
-    FIXED= 8ms -> 6696 tok/s = 1.78x B   FIXED=15 -> 5382 = 1.43x
-    FIXED=25ms -> 4204 tok/s = 1.12x B   FIXED=40 -> 3164 = 0.84x (pre-Lever-B)
-  W=512 (device step @C=4608 = 23.98ms):
-    FIXED= 8ms -> 6005 = 1.60x   FIXED=15 -> 4926 = 1.31x
-    FIXED=25ms -> 3920 = 1.04x   FIXED=40 -> 3001 = 0.80x
+  W=256 (device step @C=4608 = 20.67ms), accept=2.5:
+    FIXED= 8ms -> step=28.67ms -> 2790 tok/s = 0.74x B   [LOSES]
+    FIXED=15ms -> step=35.67ms -> 2243 tok/s = 0.60x B   [LOSES]
+    FIXED=25ms -> step=45.67ms -> 1752 tok/s = 0.47x B   [LOSES]
+  W=512 (device step @C=4608 = 23.98ms), accept=2.5: ~0.43–0.70x B  [LOSES]
 ```
-Lever B moves FIXED from ~40ms (pre) toward 15–25ms (dropped the ~6.5ms device
-_ctx_buf write + a device_get + freed HBM; async = Phase 2, NOT done here). So
-the realistic post-Lever-B point is ~1.1–1.4x B for W=256. **Both levers
-together clear B; Lever A alone (FIXED still 40) does NOT (0.84x) — matches
-15-feasibility.** Even if windowing drops accept 6→4, W=256 @ FIXED≤25 still
-clears B (~2800–4460 tok/s at accept 4) — but the accept check is required.
+**Windowing LOSES at every FIXED because the accept drop (6→2.5, a 2.4x hit)
+outweighs the draft-fwd cut (the draft fwd was only ~part of the step; the
+target verify + overhead don't shrink, and now yield 2.5 tokens not 6).** The
+accept-drop sensitivity note in 15-feasibility was too optimistic — it assumed
+accept stayed ≳4; the real drop is to 2.5 and is window-insensitive.
 
 ## NUMERICS / CORRECTNESS NOTES
 - Lever B: bit-NEUTRAL on the flag-on path (nothing read _ctx_buf there).
@@ -131,25 +143,45 @@ this round (microbench only) — the BENCH manager should confirm at util 0.75.
 - c620d4cd Lever A (windowed draft attn) + Lever B (drop redundant _ctx_buf)
 - 28f9a432 update DFlash unit tests for the win_start 6-tuple (17/17)
 
-## WHAT REMAINS
-1. NEEDS_TEST (the gate before bench, because the draft path changed):
-   - Real-draft ACCEPTANCE at DFLASH_DRAFT_WINDOW=256 (and 512) on the serve
-     path c=32 — confirm mean accept len stays high enough (≳4) that the
-     projection still beats B. If 256 craters accept, use 512.
-   - Lossless greedy re-verify of the WINDOWED path through condense
-     (perfect-draft 100% per-slot + greedy-vs-target) — the GOAL ladder, since
-     proposals changed. (Lever B alone is bit-neutral; Lever A needs this.)
-2. Then NEEDS_BENCH: A(DFLASH_KV_CACHE=1, DFLASH_DRAFT_WINDOW=256, util 0.75)
-   vs B(target-only) at in=1/out=4096/c=32, WARM. Confirm A>B and util 0.75 fits.
-3. Phase 2 (later, gated): async scheduling to cut FIXED further.
+## DEAD END — do NOT repeat: windowing the DFlash draft attention
+Truncating the DFlash draft's context to a window (W≤512) to cheapen the O(C·B)
+attn-score matmul DESTROYS acceptance (6→2.5, window-insensitive 256 vs 512).
+The DFlash draft genuinely USES its long context to propose well; a short window
+makes it a much worse predictor and the lost tokens dwarf the per-step savings.
+Net throughput LOSES at every overhead level. The "two-lever" feasibility plan's
+Lever A is therefore INVALID. Any future attempt to cut the O(C·B) draft matmul
+must KEEP full context (e.g. a genuinely cheaper full-context attention kernel,
+or a structurally different draft) — not window it.
+
+## WHAT REMAINS / OPEN DESIGN QUESTION (BLOCKED_USER)
+The economic case (15-feasibility: R=1.58 << accept, target verify NOT the
+ceiling) still holds — a CHEAP-ENOUGH draft would win big. But windowing is not
+the way to cheapen it. Open options for a fresh manager / user decision:
+1. **A cheaper FULL-CONTEXT draft attention** — the O(C·B) score matmul over the
+   full C is the cost; a fused/flash-style or RPA Pallas kernel for the draft
+   (instead of the eager HF q@k^T+softmax) might cut it WITHOUT dropping context.
+   This keeps accept ~6. (Most promising; biggest effort.)
+2. **Accept the loss / lower num_spec with full context + Lever B only** — but
+   14-bench already showed full-context num_spec sweep PLATEAUS ~1300 tok/s, so
+   Lever B alone (no draft-fwd cut) will NOT beat B. Not a path on its own.
+3. **Re-examine whether c=32 spec-decode is the right goal** — at c=32 the target
+   is already weight-bound + batched (B=3752, TPOT 8.5ms); the draft has to be
+   extremely cheap to win. Spec-decode's natural win is LOW concurrency. (User
+   goal is fixed at c=32 per GOAL, so this is a flag-for-user note, not a pivot.)
+DECISION NEEDED: pursue option 1 (cheaper full-context draft kernel) as the next
+impl round, or reassess. Lever B should be KEPT regardless (free HBM + real
+overhead cut, numerics-neutral) — it is a prerequisite for any winning config.
 
 ## STATUS
-- [x] Lever A implemented (windowed gather, flag DFLASH_DRAFT_WINDOW)
-- [x] Lever B implemented (drop _ctx_buf alloc/write/move + batch device_get)
+- [x] Lever A implemented (windowed gather, flag DFLASH_DRAFT_WINDOW) — works,
+      microbench ~6x, but REJECTED on acceptance evidence (kept flag-OFF in tree)
+- [x] Lever B implemented (drop _ctx_buf alloc/write/move + batch device_get) —
+      SOUND, numerics-neutral, frees 3.96 GiB, KEEP
 - [x] CPU gather numeric check (prefix/mid/near-end + clamp) PASS
 - [x] unit tests 17/17 green
-- [x] isolated real-8-chip microbench: windowed fwd FLAT ~14.2ms (~6x), step
-      total 20.67ms @W=256, projection clears B at FIXED≤25ms
-- [ ] real-draft acceptance at W (NEEDS_TEST)
-- [ ] lossless re-verify of windowed path through condense (NEEDS_TEST)
-- [ ] full serve A-vs-B bench at util 0.75 (NEEDS_BENCH, the bench manager)
+- [x] isolated real-8-chip microbench: windowed fwd FLAT ~14.2ms (~6x cut)
+- [x] real-draft ACCEPTANCE at W=256 AND W=512: ~2.5 (vs ~6 baseline) ⇒ Lever A
+      LOSES (0.6–0.74x B). Windowed serve came UP clean at c=32 (path runtime-OK).
+- [n/a] lossless re-verify of windowed path: moot (Lever A rejected; not shipping)
+- [ ] Lever B-only serve at util 0.75 (confirm HBM win) — for the BENCH manager
+- [ ] OPEN: cheaper FULL-CONTEXT draft attention (option 1) — fresh impl round

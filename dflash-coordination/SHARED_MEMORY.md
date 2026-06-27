@@ -8,24 +8,26 @@
 >   true and lean.
 
 ## Current best-known status
-- [2026-06-27][impl-window] **BOTH LEVERS LANDED + MICROBENCH-PROVEN ⇒ NEEDS_TEST (then BENCH).**
-  LEVER A (windowed draft attn, env `DFLASH_DRAFT_WINDOW=W`, default 0=off, KV-cache path only):
-  per-slot GATHER the cached draft K/V to the LAST W ctx positions before the score matmul
-  (win_start[i]=max(0,ctx_len_i-W); vmap dynamic_slice in the cached-fwd jit; W static). Cache stays
-  full buf_len; writes/moves/condense UNTOUCHED. Lossless for target; only proposals change. LEVER B
-  (numerics-NEUTRAL, KV path): _ctx_buf is written but NEVER read on the KV path — DROP its alloc
-  (frees ~3.96 GiB → util 0.75 fits again, kills the 13-test HBM blocker), its per-step
-  _batched_ctx_write, its condense _move_ctx_rows, + their warms; BATCH the 2 device_gets into 1.
-  Flag-OFF path byte-unchanged; win_start=0 == old prefix slice (CPU-exact + clamp-safe). DECISIVE
-  real-8-chip N=32 microbench: windowed cached fwd is **FLAT in C** ~14.2ms@W=256 / 17.5ms@W=512
-  (vs full-context cached 26→86ms, FULL recompute 21→98ms) = **~6x cut @C=4608**. Windowed STEP total
-  20.67ms@W=256. PROJECTION vs B=3752 (accept=6): W=256 → 1.78x@FIXED8 / 1.43x@15 / 1.12x@25 /
-  0.84x@40(pre-LeverB); W=512 → 1.60/1.31/1.04/0.80. **Lever A ALONE (FIXED still 40) LOSES (0.84x) —
-  BOTH needed; together clear B at FIXED≤25ms.** Unit tests 17/17. ⇒ NEEDS_TEST: (1) real-draft
-  ACCEPTANCE at W=256 (does accept stay ≳4 so projection still beats B? else W=512); (2) lossless
-  greedy re-verify of the WINDOWED path through condense (proposals changed → GOAL ladder required;
-  Lever B alone is bit-neutral). Then BENCH A(KV_CACHE=1,DRAFT_WINDOW=256,util0.75) vs B at
-  out=4096/c=32. Commits c620d4cd, 28f9a432. Details: 16-impl-window.md.
+- [2026-06-27][impl-window] **LEVER A (windowing) IS A DEAD END — kills acceptance ⇒ BLOCKED_USER.
+  LEVER B landed + sound (KEEP).** Lever A (windowed draft attn, env `DFLASH_DRAFT_WINDOW=W`, KV path,
+  default 0=off): per-slot GATHER cached K/V to last W ctx positions before the score matmul. The
+  isolated microbench was great — windowed cached fwd FLAT ~14.2ms@W=256 / 17.5@W=512 (vs full-ctx
+  cached 26→86ms) = ~6x cut. **BUT the real-draft serve ACCEPTANCE check is DECISIVE: mean accept
+  collapses 6.0–6.7 → ~2.5 at BOTH W=256 AND W=512 (window-insensitive ⇒ INTRINSIC, not a knob).**
+  At accept 2.5 the projection LOSES at every overhead: W=256 → 0.74x B @FIXED8, 0.60x @FIXED15.
+  The DFlash draft genuinely USES its long context; truncating it makes a much worse predictor and the
+  lost tokens dwarf the per-step savings. ⇒ **Lever A REJECTED on evidence — 15-feasibility's two-lever
+  plan is INVALID** (its accept-drop note assumed accept stayed ≳4; real drop is to 2.5). DEAD END: do
+  NOT window the DFlash draft attn. Windowed serve DID come up clean at c=32 (path runtime-OK). LEVER B
+  (numerics-NEUTRAL, KEEP): _ctx_buf is written but NEVER read on the KV path — DROP its alloc (frees
+  ~3.96 GiB → util 0.75 fits, kills 13-test HBM blocker), per-step _batched_ctx_write, condense
+  _move_ctx_rows + warms; BATCH the 2 device_gets into 1. Does NOT touch proposals (full-ctx accept
+  stays ~6). Flag-off path byte-unchanged. Unit tests 17/17. ⇒ **BLOCKED_USER / NEEDS_IMPL: the path to
+  beat B needs a CHEAPER FULL-CONTEXT draft attn (e.g. flash/RPA Pallas kernel for the draft q@k^T
+  instead of eager HF), NOT windowing** — full-ctx num_spec sweep already PLATEAUS ~1300 (Lever B alone
+  won't beat B). Note: at c=32 the target is weight-bound+batched (B=3752); spec-decode's natural win
+  is LOW concurrency. Code in-tree flag-OFF (harmless). Commits c620d4cd, 28f9a432, de781d72.
+  Details: 16-impl-window.md.
 - [2026-06-27][feasibility] **FEASIBLE at c=32 — target VERIFY is NOT the ceiling — but needs TWO
   levers, not one ⇒ NEEDS_IMPL.** Decisive isolated 8-chip microbench (target gpt-oss-20b, batch 32):
   T_decode32=5.8ms, T_verify(k=7)=9.1ms @C4096 ⇒ **R=1.58 << accept_len ~5.8** ⇒ one verify forward
