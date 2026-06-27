@@ -53,6 +53,14 @@ class _DFlashRunner(torch.nn.Module):
         elif "kv_project_raw" in kwargs:
             return self._kv_project(kwargs["kv_project_raw"],
                                     kwargs["kv_position_ids"])
+        elif "cached_k" in kwargs:
+            return self._draft_forward_cached(
+                kwargs["noise_embedding"],
+                kwargs["cached_k"],
+                kwargs["cached_v"],
+                kwargs["noise_position_ids"],
+                kwargs["attention_mask"],
+            )
         else:
             return self._draft_forward(
                 kwargs["noise_embedding"],
@@ -167,6 +175,107 @@ class _DFlashRunner(torch.nn.Module):
         k_all = torch.stack(k_layers, dim=0)  # (L, N, M, KVH, hd)
         v_all = torch.stack(v_layers, dim=0)  # (L, N, M, KVH, hd)
         return k_all, v_all
+
+    def _draft_forward_cached(
+        self,
+        noise_embedding: torch.Tensor,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        noise_position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cache-consuming draft forward (DFLASH_KV_CACHE=1 path).
+
+        Re-drives the DFlash decoder torchax-side WITHOUT recomputing context
+        K/V. The context K (post-RoPE) and V for every cached row were projected
+        and written into the per-slot caches in earlier steps (via
+        ``_kv_project`` / ``_batched_kv_write``); here each layer only projects
+        the B NOISE rows and attends over ``[cached ctx K/V | fresh noise K/V]``.
+        This makes the per-step draft cost O(B) instead of O(C) -- the whole
+        point of the KV cache. Numerically equivalent to ``_draft_forward`` over
+        the full [ctx|noise] concat (the cached ctx K may differ ~1 bf16 ULP from
+        a same-graph recompute because RoPE FMA fuses differently across the
+        kv_project jit and this jit; greedy argmax is robust to it).
+
+        Args:
+            noise_embedding: (N, B, D) embedded noise block.
+            cached_k: (L, N, C, KVH, hd) cached context K (post-RoPE), already
+                      sliced to the active (num_reqs, padded_ctx) sub-block.
+            cached_v: (L, N, C, KVH, hd) cached context V (no norm, no RoPE).
+            noise_position_ids: (N, B) absolute positions of the noise rows
+                                (the last B columns of the full position_ids);
+                                drive RoPE for the noise q/k only.
+            attention_mask: (N, 1, 1, C+B) additive float bias (bf16): 0.0 for
+                            valid ctx/noise keys, finfo(bf16).min for padding
+                            ctx keys. Added onto attn_weights, masks KEYS only.
+        Returns:
+            hidden_states: (N, B, D) draft output after the final norm.
+        """
+        from transformers.models.qwen3.modeling_qwen3 import (
+            eager_attention_forward, rotate_half)
+
+        cfg = self.dflash.config
+        kvh = cfg.num_key_value_heads
+        nh = cfg.num_attention_heads
+        hd = getattr(cfg, "head_dim",
+                     cfg.hidden_size // cfg.num_attention_heads)
+
+        hidden_states = noise_embedding  # (N, B, D)
+        n, b = hidden_states.shape[:2]
+
+        # RoPE tables at the NOISE positions only (the cached ctx K already has
+        # its RoPE baked in at write time). cos/sin: (N, B, hd). Applied to both
+        # noise q and noise k below (q_len == B, so cos[..., -B:, :] == cos).
+        cos, sin = self.dflash.rotary_emb(hidden_states, noise_position_ids)
+        c = cos.unsqueeze(1)  # (N, 1, B, hd) -> broadcasts over head axis
+        s = sin.unsqueeze(1)
+
+        for layer_idx, layer in enumerate(self.dflash.layers):
+            sa = layer.self_attn
+            residual = hidden_states
+            hs = layer.input_layernorm(hidden_states)  # (N, B, D)
+
+            # noise q/k/v ONLY (no context projection).
+            q = sa.q_proj(hs).view(n, b, nh, hd)
+            q = sa.q_norm(q).transpose(1, 2)  # (N, Hq, B, hd)
+            k_noise = sa.k_proj(hs).view(n, b, kvh, hd)
+            v_noise = sa.v_proj(hs).view(n, b, kvh, hd)
+            k_noise = sa.k_norm(k_noise).transpose(1, 2)  # (N, KVH, B, hd)
+            v_noise = v_noise.transpose(1, 2)  # (N, KVH, B, hd)
+
+            # RoPE on noise q and noise k (noise positions).
+            q = q * c + rotate_half(q) * s
+            k_noise = k_noise * c + rotate_half(k_noise) * s
+
+            # cached ctx K/V for this layer: (N, C, KVH, hd) -> (N, KVH, C, hd)
+            # to match the noise k/v layout, then concat along the key axis.
+            k_ctx = cached_k[layer_idx].transpose(1, 2)  # (N, KVH, C, hd)
+            v_ctx = cached_v[layer_idx].transpose(1, 2)  # (N, KVH, C, hd)
+            k = torch.cat([k_ctx, k_noise], dim=2)  # (N, KVH, C+B, hd)
+            v = torch.cat([v_ctx, v_noise], dim=2)  # (N, KVH, C+B, hd)
+
+            # GQA expansion (KVH -> Hq) happens INSIDE eager_attention_forward;
+            # pass KVH-head k/v. Mask (N,1,1,C+B) broadcasts over (N,Hq,B,C+B).
+            attn_output, _ = eager_attention_forward(
+                sa,
+                q,
+                k,
+                v,
+                attention_mask,
+                scaling=sa.scaling,
+                dropout=0.0,
+                sliding_window=sa.sliding_window,
+            )
+            attn_output = attn_output.reshape(n, b, -1)
+            attn_output = sa.o_proj(attn_output)
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hs = layer.post_attention_layernorm(hidden_states)
+            hs = layer.mlp(hs)
+            hidden_states = residual + hs
+
+        return self.dflash.norm(hidden_states)  # (N, B, D)
 
     @staticmethod
     def _compute_logits(
@@ -377,6 +486,82 @@ class DFlashTorchaxWrapper:
                 return jax_view(output)
 
         return draft_forward
+
+    def get_draft_forward_cached_fn(self):
+        """Return a JIT-compiled cache-consuming draft forward function.
+
+        Signature::
+
+            draft_forward_cached(params, noise_input_ids, k_cache, v_cache,
+                                 position_ids, embed_weight, attention_mask,
+                                 num_reqs, padded_ctx) -> hidden_states
+
+        The DFLASH_KV_CACHE=1 analogue of ``get_draft_forward_fn``. Instead of
+        the raw context buffer it consumes the FULL per-slot K/V caches
+        ``(L, max_num_reqs, buf_len, KVH, hd)`` and slices the active
+        ``[:, :num_reqs, :padded_ctx]`` sub-block INSIDE this jit (so XLA fuses
+        the slice and we never materialize a standalone copy of the caches).
+        ``num_reqs``/``padded_ctx`` are static so the trace shape is fixed (one
+        trace per (N, C), matching ``draft_forward``). Per-step compute is O(B):
+        only the B noise rows are projected; the context K/V come straight from
+        the caches. Output sharding matches ``draft_forward``.
+        """
+        model = self.model
+
+        hidden_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, None, None))
+
+        @functools.partial(jax.jit,
+                           out_shardings=hidden_sharding,
+                           static_argnums=(7, 8))
+        def draft_forward_cached(
+            params: dict,
+            noise_input_ids: jax.Array,
+            k_cache: jax.Array,
+            v_cache: jax.Array,
+            position_ids: jax.Array,
+            embed_weight: jax.Array,
+            attention_mask: jax.Array,
+            num_reqs: int,
+            padded_ctx: int,
+        ) -> jax.Array:
+            with torchax.default_env():
+                # Slice the active (L, N, C, KVH, hd) sub-block out of the full
+                # caches here so the slice fuses into the consuming attention.
+                k_cache = k_cache[:, :num_reqs, :padded_ctx]
+                v_cache = v_cache[:, :num_reqs, :padded_ctx]
+                p = torch_view(params)
+                noise_ids_t = torch_view(noise_input_ids)  # (N, B)
+                embed_w_t = torch_view(embed_weight)
+                noise_emb = torch.nn.functional.embedding(
+                    noise_ids_t, embed_w_t)  # (N, B, D)
+
+                k_t = torch_view(k_cache)  # (L, N, C, KVH, hd)
+                v_t = torch_view(v_cache)
+                pos = torch_view(position_ids)  # (N, C+B)
+                # The last B columns are the noise positions (RoPE for noise
+                # q/k); the cached ctx K already has its RoPE baked in.
+                noise_pos = pos[:, padded_ctx:]  # (N, B)
+                # attention_mask is an additive float bias (N, C+B); reshape to
+                # (N, 1, 1, C+B) so it broadcasts over (N, Hq, B, C+B) keys.
+                mask_t = torch_view(attention_mask)  # (N, C+B)
+                mask = mask_t.reshape(mask_t.shape[0], 1, 1, mask_t.shape[1])
+
+                output = torch.func.functional_call(
+                    model,
+                    p,
+                    kwargs={
+                        "noise_embedding": noise_emb,
+                        "cached_k": k_t,
+                        "cached_v": v_t,
+                        "noise_position_ids": noise_pos,
+                        "attention_mask": mask,
+                    },
+                    tie_weights=False,
+                )
+                return jax_view(output)
+
+        return draft_forward_cached
 
     def get_combine_hidden_fn(self):
         """Return a JIT-compiled combine_hidden_states function.
