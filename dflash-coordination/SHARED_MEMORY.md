@@ -8,6 +8,24 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][impl-window] **BOTH LEVERS LANDED + MICROBENCH-PROVEN ⇒ NEEDS_TEST (then BENCH).**
+  LEVER A (windowed draft attn, env `DFLASH_DRAFT_WINDOW=W`, default 0=off, KV-cache path only):
+  per-slot GATHER the cached draft K/V to the LAST W ctx positions before the score matmul
+  (win_start[i]=max(0,ctx_len_i-W); vmap dynamic_slice in the cached-fwd jit; W static). Cache stays
+  full buf_len; writes/moves/condense UNTOUCHED. Lossless for target; only proposals change. LEVER B
+  (numerics-NEUTRAL, KV path): _ctx_buf is written but NEVER read on the KV path — DROP its alloc
+  (frees ~3.96 GiB → util 0.75 fits again, kills the 13-test HBM blocker), its per-step
+  _batched_ctx_write, its condense _move_ctx_rows, + their warms; BATCH the 2 device_gets into 1.
+  Flag-OFF path byte-unchanged; win_start=0 == old prefix slice (CPU-exact + clamp-safe). DECISIVE
+  real-8-chip N=32 microbench: windowed cached fwd is **FLAT in C** ~14.2ms@W=256 / 17.5ms@W=512
+  (vs full-context cached 26→86ms, FULL recompute 21→98ms) = **~6x cut @C=4608**. Windowed STEP total
+  20.67ms@W=256. PROJECTION vs B=3752 (accept=6): W=256 → 1.78x@FIXED8 / 1.43x@15 / 1.12x@25 /
+  0.84x@40(pre-LeverB); W=512 → 1.60/1.31/1.04/0.80. **Lever A ALONE (FIXED still 40) LOSES (0.84x) —
+  BOTH needed; together clear B at FIXED≤25ms.** Unit tests 17/17. ⇒ NEEDS_TEST: (1) real-draft
+  ACCEPTANCE at W=256 (does accept stay ≳4 so projection still beats B? else W=512); (2) lossless
+  greedy re-verify of the WINDOWED path through condense (proposals changed → GOAL ladder required;
+  Lever B alone is bit-neutral). Then BENCH A(KV_CACHE=1,DRAFT_WINDOW=256,util0.75) vs B at
+  out=4096/c=32. Commits c620d4cd, 28f9a432. Details: 16-impl-window.md.
 - [2026-06-27][feasibility] **FEASIBLE at c=32 — target VERIFY is NOT the ceiling — but needs TWO
   levers, not one ⇒ NEEDS_IMPL.** Decisive isolated 8-chip microbench (target gpt-oss-20b, batch 32):
   T_decode32=5.8ms, T_verify(k=7)=9.1ms @C4096 ⇒ **R=1.58 << accept_len ~5.8** ⇒ one verify forward
@@ -119,9 +137,6 @@
   ~250-334ms), DOMINATED by the O(ctx) fc/attn forward = **LEVER #1 (KV-cache the context),
   next round** — breaks even only for C≲2k, 99ms at C=4608. Details: 08-impl-perf.md.
   Chip task_d0ad4933 (the donated-write task) is DONE.
-- [2026-06-27][bench-c32] (SUPERSEDED by bench-v3 above — the "10.6x / 358 tok/s" A was a
-  silently-corrupt run; B=3788.53 tok/s / TPOT 0.0084 was the honest target-only and matches
-  bench-v3's B. Bottleneck map preserved in 07-bench-c32.md if needed.)
 - [2026-06-26][L1-seed] Branch `dflash` has substantial prior DFlash work. `STATE.md`
   at repo root documents a claimed "working DFlash gpt-oss-20b serve recipe". Recent
   commits fixed: 0% accept (project draft logits through target lm_head, not input
