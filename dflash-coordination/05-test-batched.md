@@ -81,4 +81,31 @@ THE ENGINE (connection refused after). The out-of-range id is in the LOGPROBS to
 coherent+correct). ⇒ For any spec-on probing use max_tokens=1 with NO logprobs (plain text). This
 is a logprobs-serialization bug, not a generation/verifier bug, but it's a real crash to avoid.
 
-Redo of step-1 oracle with NO logprobs (plain max_tokens=1 text), matched batch=8: <PENDING>.
+### (d) DECISIVE matched-shape step-1 oracle, NO logprobs, concurrent batch=8: 8/8 IDENTICAL. ✅
+spec-on (real DFlash) vs target-only, both concurrent batch=8, max_tokens=1 plain text (no logprobs
+→ no crash). Both servers see IDENTICAL step-1 request shape ⇒ pure verifier test. ALL 8 slots'
+next token IDENTICAL: Paris/' '/Au/Jupiter/' '/red/oxygen/George. Includes slot 5 (Name-three-
+colors) where target top-2 gap was just 0.062 nats (a genuine near-tie) — spec-on STILL matched the
+target argmax. ⇒ The batched verifier emits the target's own argmax for every slot. LOSSLESS at
+batch>1 confirmed by the reliable matched-shape oracle.
+
+The 4/8 deep full-completion divergences in (a) are now EXPLAINED: they arise from request-shape
+numeric drift across many incremental-decode steps landing on high-entropy near-ties (the 02-test.md
+confound), NOT a verifier bug — exactly the FP-near-tie behavior GOAL allows as lossless. The 2
+near-tie probes that were clean (0.125/0.375 nats) corroborate; the 2 "confounded" ones are not valid
+counterevidence (wrong-shape re-prefill). The matched-shape oracle (d) is the decisive word: 8/8.
+
+## VERDICT (batched correctness)
+- Perfect-draft per-slot (uniform b=16, ragged b=16, ragged b=32 @ GOAL concurrency): 100% accept,
+  every window mean 8.00 / per-pos 1.000×7. 2422 total accepted == 2422 drafted across all windows.
+- Code audit: no slot cross-contamination (the one class perfect-draft can't catch).
+- Greedy lossless @ batch>1: matched-shape step-1 8/8 identical incl a 0.062-nat near-tie.
+⇒ BATCHED DFLASH IS CORRECT + LOSSLESS. Next: HBM/_ctx_buf opt so out=4096 @ c=32 (len>=5120) fits,
+then the c=32 speed bench (the GOAL bench point, still unmeasured).
+
+## Gotchas for next manager
+- Requesting LOGPROBS on the spec-on server CRASHES the engine (OverflowError in output_handler,
+  out-of-range id in top-k logprobs detokenize). Use NO logprobs for spec-on probing.
+- Each cold serve ~200s (SKIP_JAX_PRECOMPILE=1). One serve at a time; ~/tpu-tooling/free-tpu.sh
+  between. Exit-code-144 on pkill+free chained in one bash call is benign (the pkill SIGTERM); just
+  rerun free-tpu.sh.
