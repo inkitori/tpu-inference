@@ -8,6 +8,17 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][impl-perf] **LEVER #2 (write fix) LANDED — commit 6b6acd49.** Replaced the
+  eager 32x lax.dynamic_update_slice loop in dflash.py prepare_inputs() with ONE jitted+donated
+  masked-scatter `_batched_ctx_write` (in-place). ISOLATED microbench: per-step _ctx_buf WRITE
+  ~234ms → **~2.2ms (~106x)** at decode on the real 8-chip mesh. **BIT-IDENTICAL** to the old
+  loop (np.array_equal full buffer, all edge cases) — but it TOUCHED the proven write path ⇒
+  per GOAL, NEEDS_TEST (re-run perfect-draft b=32 lossless before trusting). **HBM UNCHANGED**
+  at GOAL (max_model_len=4224 → buf_len stays 4608, 3.96 GiB; the dead-row bump only fires when
+  max_model_len is an exact multiple of 512). Unit tests 5/5. Per-step now ~17-101ms (was
+  ~250-334ms), DOMINATED by the O(ctx) fc/attn forward = **LEVER #1 (KV-cache the context),
+  next round** — breaks even only for C≲2k, 99ms at C=4608. Details: 08-impl-perf.md.
+  Chip task_d0ad4933 (the donated-write task) is DONE.
 - [2026-06-27][bench-c32] **SPEED VERDICT: DFlash is ~10.6x SLOWER than target-only at the
   GOAL bench point (in=1, out=4096, c=32, WARM cache).** A(DFlash)=358.65 sys out tok/s,
   TPOT 0.317s; B(target-only)=3788.53 sys out tok/s, TPOT 0.0084s. Per-step is ~37x slower.
@@ -88,12 +99,10 @@
   1st OOM site). Both change only memory layout, not values. _raw_hidden_dim = **14400**
   (5 target layers × 2880), NOT 13440. Unit tests now 5/5 (torchax) + 5/5 (jax-native).
   Details: 06-impl-hbm.md. ⇒ NEXT = NEEDS_BENCH (c=32 speed bench, util 0.75 len 4224).
-- [2026-06-27][impl-hbm] **Headroom is TIGHT: util 0.75 fits, util 0.80 OOMs** at a NEW site
-  (dflash.py:324, the eager per-step `dynamic_update_slice` WRITE — also copies the full
-  3.96 GiB buffer since it's a non-donated functional update). The read-slice fix removed the
-  336 transient; this write transient is the next lever. Fix = jit+donate the write (in-place
-  update). Spawned as chip task_d0ad4933. Bench at util 0.75; do NOT push util/len higher
-  until that lands. chip-0 is the binding constraint (~0.4 GiB margin at 0.75).
+- [2026-06-27][impl-hbm→impl-perf] Headroom was TIGHT (util 0.75 fits, 0.80 OOMs) due to the
+  eager per-step write transient (old dflash.py:324). **RESOLVED by 6b6acd49** (jitted+donated
+  in-place write) — the 3.96 GiB write transient is gone, which should also unlock util ≥ 0.80
+  / longer context (a re-bench can confirm; not re-measured this round). chip task_d0ad4933 DONE.
 - [2026-06-27][impl] **c=32 ASSERT BLOCKER RESOLVED.** Batched/multi-seq DFlash torchax decode
   IMPLEMENTED + smoke-verified. The num_reqs<=1 assert is gone; server serves --max-num-seqs 32
   and 32/32 concurrent greedy requests return COHERENT output (Paris / George Washington / Au /
