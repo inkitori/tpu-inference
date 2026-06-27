@@ -37,12 +37,37 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _pin(t: torch.Tensor, spec: PartitionSpec, mesh: Mesh) -> torch.Tensor:
+    """Pin a torchax tensor's layout to ``spec`` via with_sharding_constraint.
+
+    Head-sharding the draft attention projection WEIGHTS is not enough on the
+    torchax path: the per-step forward reshapes q/k/v with ``.view(n,b,nh,hd)``
+    and ``repeat_kv`` expands KVH->Hq with ``.expand().reshape()``; those ops
+    cross the sharded head axis, so XLA inserts all-gathers and runs the score
+    matmul REPLICATED (an 8-chip HLO dump showed 72 all-gathers, incl. the
+    bf16[N,64,B,C+B] SCORES tensor gathered back to all 64 heads -- no
+    speedup). Round-tripping the activation through ``jax_view`` and pinning it
+    with ``jax.lax.with_sharding_constraint`` forces XLA to KEEP the head axis
+    sharded across those reshapes, so the score matmul / softmax / scores@v run
+    head-parallel (an isolated JAX probe measured 0.44ms head-sharded vs 4.27ms
+    replicated, 9.6x). Pure layout constraint -- same math, same dtypes.
+    """
+    return torch_view(
+        jax.lax.with_sharding_constraint(jax_view(t),
+                                         NamedSharding(mesh, spec)))
+
+
 class _DFlashRunner(torch.nn.Module):
     """Wrapper that adapts the HF DFlash model for ``functional_call``."""
 
-    def __init__(self, dflash_model: torch.nn.Module):
+    def __init__(self, dflash_model: torch.nn.Module, mesh: Mesh | None = None):
         super().__init__()
         self.dflash = dflash_model
+        # Mesh the forward runs under; needed by _draft_forward_cached to pin
+        # the attention head axis (see _pin). MUST be the same mesh the jit
+        # runs on, so it is threaded in from DFlashTorchaxWrapper. Optional only
+        # for unit tests that exercise the non-cached routing (which never pins).
+        self._mesh = mesh
 
     def forward(self, **kwargs) -> torch.Tensor:
         if "hidden_state" in kwargs:
@@ -254,6 +279,18 @@ class _DFlashRunner(torch.nn.Module):
             k = torch.cat([k_ctx, k_noise], dim=2)  # (N, KVH, C+B, hd)
             v = torch.cat([v_ctx, v_noise], dim=2)  # (N, KVH, C+B, hd)
 
+            # PIN the head axes so XLA keeps the attention sharded instead of
+            # all-gathering q/k/v back to replicated across the .view/repeat_kv
+            # reshapes (see _pin). q head axis = axis 1 (Hq); k/v head axis =
+            # axis 1 (KVH). With these pinned, repeat_kv's KVH->Hq expand and
+            # the score matmul stay head-parallel.
+            q = _pin(q, PartitionSpec(None, ShardingAxisName.ATTN_HEAD, None,
+                                      None), self._mesh)
+            k = _pin(k, PartitionSpec(None, ShardingAxisName.KV_CACHE_HEAD,
+                                      None, None), self._mesh)
+            v = _pin(v, PartitionSpec(None, ShardingAxisName.KV_CACHE_HEAD,
+                                      None, None), self._mesh)
+
             # GQA expansion (KVH -> Hq) happens INSIDE eager_attention_forward;
             # pass KVH-head k/v. Mask (N,1,1,C+B) broadcasts over (N,Hq,B,C+B).
             attn_output, _ = eager_attention_forward(
@@ -325,7 +362,7 @@ class DFlashTorchaxWrapper:
             )
             hf_model.eval()
 
-        self.model = _DFlashRunner(hf_model)
+        self.model = _DFlashRunner(hf_model, self.mesh)
         self.params = shard_model_to_tpu(self.model, self.mesh)
         # shard_model_to_tpu returns torchax tensors; convert to JAX view
         # so JAX JIT can trace through them.

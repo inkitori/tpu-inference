@@ -8,6 +8,23 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][impl-headshard] **HEAD-SHARD LANDED IN CODE (88862fdb) but WEIGHT-SHARDING ALONE DID NOT
+  TAKE EFFECT on the torchax path — XLA all-gathers the heads back to replicated ⇒ ZERO speedup (cached
+  fwd 85→84ms). FIX IN PROGRESS: add with_sharding_constraint (EDIT 4).** Landed: reshard q/k/v_proj.weight
+  →P(ATTN_HEAD,None), o_proj.weight→P(None,ATTN_HEAD) in DFlashTorchaxWrapper.load; KVH-shard the K/V cache
+  + kv_project out (models/vllm/dflash.py + spec_decode/vllm/dflash.py). Unit tests 17/17. ROOT CAUSE
+  (decisive HLO dump, scratchpad/probe_hlo.py): the torchax `.view(n,b,nh,hd)` + repeat_kv's
+  `.expand().reshape()` cross the sharded head axis ⇒ XLA inserts 72 all-gathers + 24 all-reduces (incl
+  all-gather bf16[32,64,64,4104] = the SCORES tensor gathered back to all 64 heads, + the KV cache gathered
+  back to full KVH), runs the score matmul REPLICATED. PROOF the math IS ~10x when sharding holds: isolated
+  JAX attn stack (scratchpad/probe_headshard_components.py) = 0.44ms head-sharded vs 4.27ms replicated =
+  9.6x, score tensor correctly P(None,'model',None,None). So the SPEEDUP IS REAL but needs explicit
+  with_sharding_constraint pinning q (post-view) + k/v (post-repeat_kv) + cached k/v to the head axis so XLA
+  stops gathering. Numerics: greedy-argmax 100% (it's currently the SAME replicated computation). Projection
+  to beat B=3752 holds IF the fwd actually drops. NOTE the ~84ms fwd is C-linear all-gather/repeat_kv
+  materialization, NOT score FLOPs (attn only ~4ms even replicated). Probes pushed (02199850).
+  ⇒ NEEDS_IMPL: add with_sharding_constraint inside _draft_forward_cached. Details: 19-impl-headshard.md.
+
 - [2026-06-27][redteam-attn] **17's "FLOP-bound dead end" is FALSE — the draft attn is REPLICATION/
   MEMORY-bound and ~60x FIXABLE ⇒ ACHIEVABLE, NEEDS_IMPL.** Physics: useful attn FLOPs 1.55e11 ⇒ floor
   0.17ms @918TFLOP/s; measured eager 48.7ms = **0.35% of MXU peak** (a FLOP-bound kernel runs 30-70%,
