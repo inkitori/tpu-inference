@@ -331,6 +331,23 @@ class DFlashTorchaxWrapper:
         # so JAX JIT can trace through them.
         self.params = jax_view(self.params)
 
+        # Head-shard the draft attention projections. shard_model_to_tpu()
+        # REPLICATES every draft weight (PartitionSpec()), so the per-step
+        # draft attention computes all 64 query heads on every chip (~48ms on
+        # v6e-8). The q/k/v/o projections are head-parallel: re-shard their
+        # head (output for q/k/v, contraction for o) dimension onto the
+        # ShardingAxisName.ATTN_HEAD ('model', size 8) axis so each chip owns
+        # 8 q-heads / 1 kv-head (~1.5ms). This is a pure layout change on the
+        # already-on-device jax.Arrays (a resharding device_put): the values
+        # are byte-identical, only their device placement changes. XLA then
+        # propagates the head-sharding through q@k^T / softmax / scores@v
+        # (per-head independent) and auto-inserts the o_proj all-reduce
+        # (bf16 reduction-order differences only, already accepted -- see the
+        # _draft_forward_cached docstring). nn.Linear weight is [out, in], so
+        # the head axis is axis 0 for q/k/v (output) and axis 1 for o
+        # (contraction); o_proj.bias and q_norm/k_norm stay replicated.
+        self._reshard_draft_attn_heads()
+
         # Share weights from the target model. The DFlash draft model owns NO
         # embedding / lm_head of its own; the custom modeling code consumes a
         # `noise_embedding` (built from the target INPUT embedding) and projects
@@ -405,6 +422,48 @@ class DFlashTorchaxWrapper:
             self.lm_head_weight_jax = self.embed_weight_jax
 
         logger.info("DFlash torchax wrapper loaded successfully.")
+
+    def _reshard_draft_attn_heads(self) -> None:
+        """Re-shard the draft attention q/k/v/o projections on the head axis.
+
+        ``shard_model_to_tpu`` replicates every draft weight; this post-pass
+        re-shards ONLY the per-layer self-attention projection weights/biases
+        so their head dimension lands on ShardingAxisName.ATTN_HEAD ('model').
+        Matches on the torch fully-qualified key suffix; biases may be absent
+        (skipped gracefully). Everything else (q_norm/k_norm, mlp, norms) is
+        left replicated by the catch-all. Same math, only the layout changes.
+        """
+        H = ShardingAxisName.ATTN_HEAD  # 'model' under the active 2D sharding
+
+        # key-suffix -> PartitionSpec (nn.Linear weight is [out, in]).
+        #   q/k/v weight: shard output(head) dim (axis 0).
+        #   q/k/v bias:   shard the single (head) dim.
+        #   o   weight:   shard input/contraction(head) dim (axis 1); output
+        #                 (D) replicated => XLA auto-inserts the all-reduce.
+        #   o   bias:     replicated.
+        suffix_specs = {
+            ".self_attn.q_proj.weight": PartitionSpec(H, None),
+            ".self_attn.q_proj.bias": PartitionSpec(H),
+            ".self_attn.k_proj.weight": PartitionSpec(H, None),
+            ".self_attn.k_proj.bias": PartitionSpec(H),
+            ".self_attn.v_proj.weight": PartitionSpec(H, None),
+            ".self_attn.v_proj.bias": PartitionSpec(H),
+            ".self_attn.o_proj.weight": PartitionSpec(None, H),
+            ".self_attn.o_proj.bias": PartitionSpec(),
+        }
+
+        resharded = 0
+        for key in list(self.params.keys()):
+            for suffix, spec in suffix_specs.items():
+                if key.endswith(suffix):
+                    self.params[key] = jax.device_put(
+                        self.params[key], NamedSharding(self.mesh, spec))
+                    resharded += 1
+                    break
+
+        logger.info(
+            "DFlash draft attention head-sharded: re-sharded %d projection "
+            "tensors onto axis %r.", resharded, H)
 
     def get_draft_forward_fn(self):
         """Return a JIT-compiled draft forward function.
@@ -638,13 +697,20 @@ class DFlashTorchaxWrapper:
         ``raw_new`` is (N, M, raw_hidden_dim); ``position_ids`` is (N, M) (the
         absolute context positions for RoPE). M may vary, so it is NOT static --
         the trace specializes per leading shape, exactly like the other fns.
-        Both outputs are (num_layers, N, M, KVH, head_dim), returned replicated.
+        Both outputs are (num_layers, N, M, KVH, head_dim), head-sharded on the
+        KVH axis (axis 3) to match the head-sharded K/V cache they are written
+        into (avoids a reshard on write).
         """
         model = self.model
 
-        # Both K and V are returned fully replicated (no model/tensor sharding
-        # on these standalone projections); they are small per-row tensors.
-        kv_sharding = NamedSharding(self.mesh, PartitionSpec())
+        # K/V outputs are (L, N, M, KVH, hd); shard the KVH axis (axis 3) on
+        # ShardingAxisName.KV_CACHE_HEAD so they are produced in the same layout
+        # as the head-sharded _k_cache/_v_cache that _batched_kv_write stores
+        # them into (no reshard on write).
+        kv_sharding = NamedSharding(
+            self.mesh,
+            PartitionSpec(None, None, None, ShardingAxisName.KV_CACHE_HEAD,
+                          None))
 
         @functools.partial(jax.jit, out_shardings=(kv_sharding, kv_sharding))
         def kv_project(

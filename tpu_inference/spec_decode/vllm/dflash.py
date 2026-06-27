@@ -27,9 +27,11 @@ from typing import Any, Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 from vllm.config import VllmConfig
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import device_array
 
@@ -191,14 +193,27 @@ class DFlashTorchaxProposer:
         # whether to drop _ctx_buf).
         if self._use_kv_cache:
             L = self.num_layers
-            self._k_cache = jnp.zeros(
-                (L, self.max_num_reqs, buf_len, self.num_kv_heads,
-                 self.head_dim),
-                dtype=jnp.bfloat16)
-            self._v_cache = jnp.zeros(
-                (L, self.max_num_reqs, buf_len, self.num_kv_heads,
-                 self.head_dim),
-                dtype=jnp.bfloat16)
+            # Head-shard the K/V cache on the KVH axis (axis 3) so the cached
+            # context K/V are stored / consumed head-parallel -- matching the
+            # head-sharded draft attention projection weights and the
+            # head-sharded kv_project output. The write/move paths index only
+            # axes 1 (slot) and 2 (buf_len) and broadcast over the KVH axis, so
+            # sharding axis 3 does not affect them; the windowed gather slices
+            # axis 2 only. Same data, only the layout changes.
+            kv_cache_sharding = NamedSharding(
+                self.mesh,
+                PartitionSpec(None, None, None,
+                              ShardingAxisName.KV_CACHE_HEAD, None))
+            self._k_cache = jax.device_put(
+                jnp.zeros(
+                    (L, self.max_num_reqs, buf_len, self.num_kv_heads,
+                     self.head_dim),
+                    dtype=jnp.bfloat16), kv_cache_sharding)
+            self._v_cache = jax.device_put(
+                jnp.zeros(
+                    (L, self.max_num_reqs, buf_len, self.num_kv_heads,
+                     self.head_dim),
+                    dtype=jnp.bfloat16), kv_cache_sharding)
             logger.info("DFlash KV cache enabled: k/v cache shape %s",
                         self._k_cache.shape)
             if self._draft_window > 0:

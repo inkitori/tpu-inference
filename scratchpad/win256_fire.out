@@ -1,0 +1,2 @@
+[1;36m[check-gcs-region][0m [1;32mOK[0m: bucket 'personal-mark-us-east5-b' (US-EAST5) is in the same region as this VM (us-east5).
+[tpu-env] HF_HOME=/tmp/gcs/bucket/vllm  OMP_NUM_THREADS=16  venv=/home/enyouki/vllm_env
