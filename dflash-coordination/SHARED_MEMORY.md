@@ -8,23 +8,25 @@
 >   true and lean.
 
 ## Current best-known status
-- [2026-06-27][bench-v2] **GATE PASS, but BENCH BLOCKED: a DETERMINISTIC CRASH at the out=4096/c=32
-  bench point.** Perfect-draft gate at c=32/SHORT outputs = 100% per-slot (mean 8.00, per-pos 1.000×7,
-  5 windows) ⇒ 6b6acd49 did NOT break verify. BUT serving DFlash at out=4096/c=32 CRASHES ~69s in
-  (seqs ~1500-3300 tok, kv 2.3% — NOT OOM): `ValueError: could not broadcast (3184,) into (176,)` at
-  **dflash.py:421** in prepare_inputs. ROOT CAUSE = a PRE-EXISTING batched bug EXPOSED (not caused) by
-  6b6acd49: `_ctx_len[i]` is keyed by SLOT, `num_new=seq_len-ctx_len_i` uses the FULL accepted length
-  (num_tokens_no_spec); when a finished slot is backfilled by InputBatch.condense with a still-long
-  request, the slot-change guard resets _ctx_len[i]=0 ⇒ num_new=whole-seq (3184) but raw_hidden's query
-  segment has only ~176 rows ⇒ overrun. OLD eager path SILENTLY CLAMPED (wrote wrong rows = silent
-  draft-context corruption, no crash); the new host index-plan turns it into a hard crash. ⇒ The 07
-  "358 tok/s / 10.6x" A-number was measured on a SILENTLY-CORRUPT run; treat it as unreliable. B
-  (target-only 3789 tok/s) is still honest. FIX (candidate b): drive copy width from the segment width
-  `num_new = qsl[i+1]-qsl[i]` (not seq_len-ctx_len), keep end=ctx_len+num_new. CAVEAT: that stops the
-  crash but a condensed-in request LOSES its pre-move _ctx_buf history ⇒ acceptance degrades for it
-  (NOT a losslessness break) — a fuller fix carries _ctx_buf across condense or keys state by req_id.
-  ⇒ **NEEDS_IMPL** (fix the slot/condense desync, then re-GATE at out≥512 to trigger condense, then
-  re-bench A vs B). Details: 09-bench-c32-v2.md.
+- [2026-06-27][impl-condense] **CONDENSE/SLOT DESYNC FIXED + VERIFIED ACROSS A REAL CONDENSE EVENT ⇒
+  NEEDS_BENCH.** The 09 out=4096/c=32 broadcast crash (dflash.py:421) is GONE. PROPER fix (b94fc366,
+  found already-committed from a prior session): mirror vLLM InputBatch.condense slot-moves onto the
+  proposer's per-slot state (gather _ctx_buf row + carry _ctx_len/_prev_seq_len/_last_req_id; only NEW
+  req_ids reset) + a defense-in-depth `num_new=min(num_new, seg_width=qsl[i+1]-qsl[i])` clamp. That
+  proper fix INTRODUCED an HBM regression (the full-buffer gather `_permute_ctx_rows` = ~4.58 GB
+  transient → RESOURCE_EXHAUSTED at util 0.75 under condense, dflash.py:452); FIXED by 86f150cf:
+  `_move_ctx_rows` = SPARSE in-place donated scatter `ctx_buf.at[dst_slots].set(ctx_buf[src_slots])`
+  gathering only K moved rows (bucketed {1,2,4,8,16,32}); common 1-2-move condense → ~248 MiB (was
+  ~3.96 GiB). Worst-case full permutation still correct (K=32, never drops a move). ON-TPU condense
+  workload (fire_condense.py 64, util 0.75, max-model-len 4224, c=32 = the GOAL config): **(A) NO
+  crash** (no broadcast, no OOM; 64/64; finish spread 80s ⇒ condense fired); **(B) perfect-draft 100%
+  per-slot ACROSS condense** (10 windows all mean 8.00 / per-pos 1.000×7 / Accepted==Drafted ⇒ verify
+  stays aligned through slot moves, lossless through condense); **(C) greedy answers token-identical
+  64/64** spec-on vs target-only (filler-only divergence = batch-position FP drift present in
+  target-only too); **(D) real DFlash accept under condense steady-state ~6.0-6.7** (per-pos busy
+  0.716→0.148 / light ~0.96→0.64). CPU bit-identical check (swap/cycle/padding) PASS, unit tests 5/5 +
+  5/5. ⇒ the 07 "358 tok/s / 10.6x" A-number stays UNRELIABLE (silently-corrupt run); re-bench A vs B
+  at out=4096/c=32 is now FINALLY trustworthy. Details: 10-impl-condense.md.
 - [2026-06-27][impl-perf] **LEVER #2 (write fix) LANDED — commit 6b6acd49.** Replaced the
   eager 32x lax.dynamic_update_slice loop in dflash.py prepare_inputs() with ONE jitted+donated
   masked-scatter `_batched_ctx_write` (in-place). ISOLATED microbench: per-step _ctx_buf WRITE
