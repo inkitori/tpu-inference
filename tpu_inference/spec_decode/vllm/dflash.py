@@ -172,15 +172,15 @@ class DFlashTorchaxProposer:
         next_token_ids = device_array(
             self.mesh, np.zeros((max_num_reqs, ), dtype=np.int32))
 
+        # The draft forward always receives the FULL persistent context buffer
+        # and slices the active (n, padded_ctx) sub-block inside the jit (static
+        # args), so warm with the real buffer (shape never varies); n and
+        # padded_ctx drive the static trace key, matching prepare_inputs().
         for n in batch_sizes:
             noise_input_ids = device_array(
                 self.mesh,
                 np.zeros((n, self.block_size), dtype=np.int32))
             for padded_ctx in padded_sizes:
-                ctx_padded = device_array(
-                    self.mesh,
-                    jnp.zeros((n, padded_ctx, self._raw_hidden_dim),
-                              dtype=jnp.bfloat16))
                 position_ids = device_array(
                     self.mesh,
                     jnp.zeros((n, padded_ctx + self.block_size),
@@ -196,10 +196,12 @@ class DFlashTorchaxProposer:
                 hidden = self._draft_forward_fn(
                     self._params,
                     noise_input_ids,
-                    ctx_padded,
+                    self._ctx_buf,
                     position_ids,
                     self._embed_weight,
                     attention_mask,
+                    n,
+                    padded_ctx,
                 )
                 _ = self._sample_block_draft_tokens(self._params, hidden,
                                                     self._lm_head_weight)
@@ -332,8 +334,12 @@ class DFlashTorchaxProposer:
         ctx_lens = self._ctx_len[:num_reqs].astype(np.int32)
         max_ctx = int(ctx_lens.max()) if num_reqs > 0 else 1
         padded_ctx = self._next_padded_size(max(max_ctx, 1))
-        # (N, padded_ctx, D)
-        ctx_padded = self._ctx_buf[:num_reqs, :padded_ctx]
+        # The active (N, padded_ctx, D) sub-block is NOT sliced here. We pass the
+        # FULL persistent buffer to the jitted draft forward and slice inside
+        # the jit (static num_reqs/padded_ctx) so XLA fuses the slice into the
+        # fc matmul. Slicing eagerly here would materialize a multi-GiB copy of
+        # the buffer every step (the c=32 OOM).
+        ctx_full = self._ctx_buf
 
         # Per-slot positions/mask. Layout per row: context positions
         # [0..ctx_len_i-1, 0, 0, ...] then noise positions
@@ -368,7 +374,10 @@ class DFlashTorchaxProposer:
         attention_mask = jnp.concatenate([ctx_mask, noise_mask],
                                          axis=1)  # (N, C+B)
 
-        target_hidden_states = (ctx_padded, position_ids, attention_mask)
+        # Carry the FULL context buffer plus the static (num_reqs, padded_ctx)
+        # so the draft forward slices the active sub-block inside its jit.
+        target_hidden_states = (ctx_full, position_ids, attention_mask,
+                                num_reqs, padded_ctx)
 
         seq_lens_arr = device_array(self.mesh, ctx_lens)  # (N,)
         # next_token_ids is padded to max_num_reqs; take the real rows.
@@ -412,15 +421,18 @@ class DFlashTorchaxProposer:
         target_hidden_states,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
         """Generate all draft tokens in one stateless torchax forward pass."""
-        ctx_padded, position_ids, attention_mask = target_hidden_states
+        ctx_full, position_ids, attention_mask, num_reqs, padded_ctx = (
+            target_hidden_states)
 
         hidden_states = self._draft_forward_fn(
             self._params,
             input_ids,
-            ctx_padded,
+            ctx_full,
             position_ids,
             self._embed_weight,
             attention_mask,
+            num_reqs,
+            padded_ctx,
         )
 
         # draft_token_ids: (N, num_speculative_tokens), one row per request.

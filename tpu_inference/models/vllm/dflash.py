@@ -230,8 +230,18 @@ class DFlashTorchaxWrapper:
         Signature::
 
             draft_forward(params, noise_input_ids, target_hidden,
-                          position_ids, embed_weight,
-                          attention_mask) -> hidden_states
+                          position_ids, embed_weight, attention_mask,
+                          num_reqs, padded_ctx) -> hidden_states
+
+        ``target_hidden`` is the FULL persistent context buffer
+        ``(max_num_reqs, buf_len, D')``; the active sub-block
+        ``[:num_reqs, :padded_ctx]`` is sliced INSIDE this jit so XLA fuses the
+        slice straight into the ``fc`` matmul that consumes it. Doing the slice
+        here (rather than eagerly in prepare_inputs) avoids materializing a
+        multi-GiB standalone copy of the context buffer on every decode step —
+        that transient, on top of the persistent buffer, was the c=32 OOM.
+        ``num_reqs`` and ``padded_ctx`` are static so the trace shape is fixed
+        (one trace per (N, C), exactly as before).
         """
         model = self.model
 
@@ -241,7 +251,9 @@ class DFlashTorchaxWrapper:
         hidden_sharding = NamedSharding(
             self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, None, None))
 
-        @functools.partial(jax.jit, out_shardings=hidden_sharding)
+        @functools.partial(jax.jit,
+                           out_shardings=hidden_sharding,
+                           static_argnums=(6, 7))
         def draft_forward(
             params: dict,
             noise_input_ids: jax.Array,
@@ -249,11 +261,17 @@ class DFlashTorchaxWrapper:
             position_ids: jax.Array,
             embed_weight: jax.Array,
             attention_mask: jax.Array,
+            num_reqs: int,
+            padded_ctx: int,
         ) -> jax.Array:
             with torchax.default_env():
-                # All inputs carry a leading request axis N (>= 1):
-                #   noise_input_ids (N, B), target_hidden (N, C, D'),
-                #   position_ids (N, C+B), attention_mask (N, C+B).
+                # noise_input_ids/position_ids/attention_mask already carry the
+                # active leading request axis N (= num_reqs). target_hidden is
+                # the FULL buffer (max_num_reqs, buf_len, D'); slice the active
+                # (N, C, D') sub-block here so the slice fuses into fc below.
+                #   noise_input_ids (N, B), position_ids (N, C+B),
+                #   attention_mask (N, C+B), sliced target_hidden (N, C, D').
+                target_hidden = target_hidden[:num_reqs, :padded_ctx]
                 p = torch_view(params)
                 noise_ids_t = torch_view(noise_input_ids)  # (N, B)
                 embed_w_t = torch_view(embed_weight)
