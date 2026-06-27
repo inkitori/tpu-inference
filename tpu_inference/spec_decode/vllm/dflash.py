@@ -20,6 +20,7 @@ proposer in ``spec_decode.jax.dflash``.
 """
 
 import functools
+import os
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -61,6 +62,17 @@ class DFlashTorchaxProposer:
         self.mask_token_id = dflash_config.get("mask_token_id", 0)
         self.hidden_size = hf_config.hidden_size
         self.num_layers = hf_config.num_hidden_layers
+        # Draft KV geometry (needed for the per-slot K/V cache shape). KV heads
+        # default to attention heads (no GQA) and head_dim defaults to
+        # hidden_size / num_attention_heads when the config omits it.
+        self.num_kv_heads = getattr(hf_config, "num_key_value_heads",
+                                    hf_config.num_attention_heads)
+        self.head_dim = getattr(hf_config, "head_dim",
+                                self.hidden_size // hf_config.num_attention_heads)
+        # Increment 2 flag: allocate + write the per-slot K/V cache. OFF by
+        # default so the live serve path is unchanged (cache stays None, no new
+        # device work). Increment 3 wires it into the attention forward.
+        self._use_kv_cache = os.environ.get("DFLASH_KV_CACHE", "0") == "1"
 
         target_layer_ids = dflash_config.get("target_layer_ids", None)
         num_target_layers = getattr(hf_config, "num_target_layers", None)
@@ -100,6 +112,10 @@ class DFlashTorchaxProposer:
                                                   dtype=np.int64)
         self._last_req_id: list[Optional[str]] = [None] * self.max_num_reqs
         self._ctx_buf: Optional[jax.Array] = None
+        # Per-slot K/V cache (increment 2). Allocated in load_model only when
+        # self._use_kv_cache; mirrors the _ctx_buf write/move idioms.
+        self._k_cache: Optional[jax.Array] = None
+        self._v_cache: Optional[jax.Array] = None
         self._wrapper = None
         self._draft_forward_fn = None
         self._compute_logits_fn = None
@@ -137,6 +153,25 @@ class DFlashTorchaxProposer:
         self._ctx_buf = jnp.zeros(
             (self.max_num_reqs, buf_len, self._raw_hidden_dim),
             dtype=jnp.bfloat16)
+
+        # Increment 2: per-slot, per-layer K/V cache. Shares buf_len (hence the
+        # same dead-row guarantee) with _ctx_buf so the kv write can reuse the
+        # exact same scatter plan. Flag-gated; left None on the default path so
+        # serving allocates no extra HBM. _ctx_buf stays allocated alongside it
+        # this increment so writes can be cross-checked (increment 3 decides
+        # whether to drop _ctx_buf).
+        if self._use_kv_cache:
+            L = self.num_layers
+            self._k_cache = jnp.zeros(
+                (L, self.max_num_reqs, buf_len, self.num_kv_heads,
+                 self.head_dim),
+                dtype=jnp.bfloat16)
+            self._v_cache = jnp.zeros(
+                (L, self.max_num_reqs, buf_len, self.num_kv_heads,
+                 self.head_dim),
+                dtype=jnp.bfloat16)
+            logger.info("DFlash KV cache enabled: k/v cache shape %s",
+                        self._k_cache.shape)
 
         logger.info(
             "DFlash torchax proposer loaded: context buffer shape %s",
@@ -254,6 +289,44 @@ class DFlashTorchaxProposer:
             zeros_k = device_array(self.mesh, np.zeros(k, dtype=np.int32))
             self._ctx_buf = self._move_ctx_rows(self._ctx_buf, zeros_k,
                                                 zeros_k)
+
+        # Increment 2: warm the K/V cache write + move (+ standalone kv project)
+        # for the same buckets as their ctx counterparts. Gated on the flag so
+        # the default serve path traces no extra shapes. All warm-ups are no-ops
+        # (all-invalid write, self-copy move) so the caches stay bit-unchanged.
+        if self._use_kv_cache:
+            L = self.num_layers
+            kvh = self.num_kv_heads
+            hd = self.head_dim
+            # kv write warm per token bucket (mirrors the ctx-write warm above):
+            # all-invalid plan routed to dead_row so the masked scatter is a
+            # no-op; k_dummy/v_dummy match the runtime (L, T, KVH, hd) shape.
+            for t in token_buckets:
+                slot_idx = device_array(self.mesh, np.zeros(t, dtype=np.int32))
+                dst_row = device_array(self.mesh,
+                                       np.full(t, dead_row, dtype=np.int32))
+                valid = device_array(self.mesh, np.zeros(t, dtype=bool))
+                k_dummy = jnp.zeros((L, t, kvh, hd), dtype=jnp.bfloat16)
+                v_dummy = jnp.zeros((L, t, kvh, hd), dtype=jnp.bfloat16)
+                self._k_cache, self._v_cache = self._batched_kv_write(
+                    self._k_cache, self._v_cache, k_dummy, v_dummy, slot_idx,
+                    dst_row, valid)
+                # Warm the standalone K/V projection per token bucket. kv_project
+                # is row-independent, so call it with N=1, M=t (raw_hidden is
+                # flat-ragged (T, raw) at runtime -> reshape to (1, t, raw)); the
+                # (1, t) leading-dim trace key covers the runtime call.
+                if self._kv_project_fn is not None:
+                    self._kv_project_fn(
+                        self._params,
+                        jnp.zeros((1, t, self._raw_hidden_dim),
+                                  dtype=jnp.bfloat16),
+                        jnp.zeros((1, t), dtype=jnp.int32))
+            # kv move warm per K bucket (mirrors the ctx-move warm above):
+            # self-copy pairs (dst==src==0), an idempotent no-op.
+            for k in self._move_bucket_sizes():
+                zeros_k = device_array(self.mesh, np.zeros(k, dtype=np.int32))
+                self._k_cache, self._v_cache = self._move_kv_rows(
+                    self._k_cache, self._v_cache, zeros_k, zeros_k)
 
         logger.info("DFlash torchax precompile complete.")
 
@@ -373,6 +446,62 @@ class DFlashTorchaxProposer:
         merged = jnp.where(valid_mask[:, None], src, cur)
         return ctx_buf.at[slot_idx, dst_row].set(merged)
 
+    @functools.partial(jax.jit, static_argnums=(0, ), donate_argnums=(1, 2))
+    def _batched_kv_write(
+        self,
+        k_cache: jax.Array,
+        v_cache: jax.Array,
+        k_new: jax.Array,
+        v_new: jax.Array,
+        slot_idx: jax.Array,
+        dst_row: jax.Array,
+        valid_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Batched, input-donated, in-place K/V cache write (mirror of ctx write).
+
+        The per-slot K/V cache analogue of ``_batched_ctx_write``: one masked
+        scatter indexed over the SOURCE token axis. Source row r (a per-layer
+        projected K/V state, flat-ragged over requests EXACTLY like raw_hidden)
+        is copied to ``{k,v}_cache[:, slot_idx[r], dst_row[r], :, :]`` iff
+        ``valid_mask[r]``. The scatter axis IS the (bucketed) token axis, so this
+        handles any per-request copy count -- including the large prefill append
+        -- without a fixed block-width cap.
+
+        Donating ``k_cache``/``v_cache`` lets XLA mutate them in place; the
+        function returns the updated caches and the caller immediately rebinds
+        them, so donation is safe.
+
+        Bit-preserving for untouched cells: invalid source rows (rows past a
+        request's n_copy, rows of inactive/no-write slots, and padding rows of
+        the bucketed k_new/v_new) write the destination's CURRENT value back
+        (read-modify-write). All invalid rows are routed by the caller to a
+        single dead padding row (the last buffer row, guaranteed by load_model()
+        to never be a valid target), so duplicate-index scatter ordering can
+        never clobber a real write. The plan arrays (slot_idx/dst_row/valid_mask)
+        are the SAME arrays ``_batched_ctx_write`` uses this step, so the K/V
+        cache and the ctx buffer stay row-for-row consistent.
+
+        Args:
+          k_cache:    (L, max_num_reqs, buf_len, KVH, hd) bf16 cache (donated).
+          v_cache:    (L, max_num_reqs, buf_len, KVH, hd) bf16 cache (donated).
+          k_new:      (L, T, KVH, hd) projected new K rows (T == one of the
+                      runner's token-padding buckets; flat-ragged over requests).
+          v_new:      (L, T, KVH, hd) projected new V rows.
+          slot_idx:   (T,) int32 destination slot per source row; 0 for invalid.
+          dst_row:    (T,) int32 destination row per source row; for valid rows
+                      == ctx_len[i] + offset, for invalid rows == the dead last
+                      buffer row (buf_len - 1).
+          valid_mask: (T,) bool; True iff this source row is copied.
+        """
+        k_new = k_new.astype(k_cache.dtype)  # (L, T, KVH, hd)
+        v_new = v_new.astype(v_cache.dtype)
+        cur_k = k_cache[:, slot_idx, dst_row]  # (L, T, KVH, hd)
+        cur_v = v_cache[:, slot_idx, dst_row]
+        m = valid_mask[None, :, None, None]  # broadcast over (L, T, KVH, hd)
+        k_cache = k_cache.at[:, slot_idx, dst_row].set(jnp.where(m, k_new, cur_k))
+        v_cache = v_cache.at[:, slot_idx, dst_row].set(jnp.where(m, v_new, cur_v))
+        return k_cache, v_cache
+
     @functools.partial(jax.jit, static_argnums=(0, ), donate_argnums=(1, ))
     def _move_ctx_rows(
         self,
@@ -420,6 +549,47 @@ class DFlashTorchaxProposer:
         """
         moved_rows = ctx_buf[src_slots]  # (K, buf_len, D) -- only K rows
         return ctx_buf.at[dst_slots].set(moved_rows)
+
+    @functools.partial(jax.jit, static_argnums=(0, ), donate_argnums=(1, 2))
+    def _move_kv_rows(
+        self,
+        k_cache: jax.Array,
+        v_cache: jax.Array,
+        dst_slots: jax.Array,
+        src_slots: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Mirror a vLLM slot move onto the K/V cache (sparse in-place scatter).
+
+        The per-slot K/V cache analogue of ``_move_ctx_rows``. The slot axis is
+        now axis 1 (axis 0 is the layer axis L), so the gather/scatter index the
+        slot dimension as ``[:, slots]``; the layer, row, head, and head_dim axes
+        ride along untouched.
+
+        Identical sparse-move semantics to ``_move_ctx_rows``: condense /
+        swap_states / _reorder moves are SPARSE (typically 1-2 of 32 slots move
+        per step), so we gather ONLY the K moved slots and scatter them in place,
+        donating the caches so XLA mutates them without a full second copy. JAX
+        functional semantics guarantee the RHS gather ``{k,v}_cache[:, src_slots]``
+        is computed from the OLD (pre-move) cache BEFORE the in-place store, so
+        swaps (i<->j) and cyclic moves read the correct pre-move occupants
+        (donation only reuses storage, it does not reorder the dataflow).
+
+        ``dst_slots``/``src_slots`` are the SAME K-bucketed plan arrays built for
+        ``_move_ctx_rows`` this step (padding pairs are self-copies of an unmoved
+        slot, never a real dst), so the K/V cache moves stay row-for-row
+        consistent with the ctx buffer move.
+
+        Args:
+          k_cache:   (L, max_num_reqs, buf_len, KVH, hd) bf16 cache (donated).
+          v_cache:   (L, max_num_reqs, buf_len, KVH, hd) bf16 cache (donated).
+          dst_slots: (K,) int32 destination slot per moved pair.
+          src_slots: (K,) int32 source slot per moved pair (read pre-move).
+        """
+        moved_k = k_cache[:, src_slots]  # (L, K, buf_len, KVH, hd)
+        moved_v = v_cache[:, src_slots]
+        k_cache = k_cache.at[:, dst_slots].set(moved_k)
+        v_cache = v_cache.at[:, dst_slots].set(moved_v)
+        return k_cache, v_cache
 
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _sample_block_draft_tokens(

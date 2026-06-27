@@ -1,0 +1,11 @@
+============================================================
+TAG=B_warmup_v3  concurrency=32  total=96  out=4096
+requests: ok=96 err=0
+wall_time_s: 109.36
+total_output_tokens: 393216
+SYSTEM_OUTPUT_TOK_PER_SEC: 3595.61
+per_req_latency_s mean=36.31 p50=34.71 p99=39.38 min=34.64 max=39.38
+ttft_s mean=1.679 max=5.149
+TPOT_s mean=0.00846  (=> per-stream tok/s 118.24)
+completion_tokens distinct values among ok: [4096]
+============================================================

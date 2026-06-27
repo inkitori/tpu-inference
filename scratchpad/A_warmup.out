@@ -1,0 +1,11 @@
+============================================================
+TAG=A_WARMUP  concurrency=32  out=4096
+requests: ok=32 err=0
+wall_time_s: 667.36
+total_output_tokens: 131072
+SYSTEM_OUTPUT_TOK_PER_SEC: 196.40
+per_req_latency_s mean=475.75 p50=504.04 p99=667.35 min=250.65 max=667.35
+ttft_s mean=8.920
+TPOT_s mean=0.49337  (=> per-stream tok/s 2.03)
+completion_tokens distinct values among ok: [4096]
+============================================================

@@ -1,0 +1,66 @@
+=== condense workload n=64: 33/64 succeeded ===
+finish times: min=19.3s med=19.8s max=21.0s (spread=1.8s)
+[ 0] OK  (  19.7s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that a So So The capital of FranceFrance " '
+[ 1] OK  (  19.9s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is, 11 ?? Actually 13 is .?? Wait '
+[ 2] OK  (  20.1s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a a.\\n\\n Au Au for is is Au Au. Au Au'
+[ 3] OK  (  20.3s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a for TheassistantanalysisWeWe planet in'
+[ 4] OK  (  21.0s) len=  256/256   'Name three primary colors:' -> ' red, blue, and." The appearsassistant " Wait The the to: pa'
+[ 5] ERR (23.4s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[ 6] ERR (23.4s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[ 7] ERR (23.4s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[ 8] OK  (  19.6s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that.\\n\\n But \\n \\nWe can to produceise... '
+[ 9] OK  (  19.8s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is the a11 ,, but  answer first  n'
+[10] OK  (  19.9s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a a The the for for. symbol symbol th'
+[11] OK  (  20.1s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a The\\n\\nassistantanalysisWeWe to correc'
+[12] OK  (  20.9s) len=  256/256   'Name three primary colors:' -> ' red, blue, and.".\\n\\n # \' is is\\n\\nblue "\\n   `\\n\\nThe we t'
+[13] ERR (23.2s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[14] ERR (23.2s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[15] ERR (23.2s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[16] OK  (  19.4s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that a So So The capital of FranceFrance " '
+[17] OK  (  19.6s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is, 11 ?? Actually 13 is  but?? Wa'
+[18] OK  (  19.8s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a is The the for for is symbol is the'
+[19] OK  (  20.0s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a\\n\\n\\n\\nassistantanalysisWeWe to correc'
+[20] OK  (  20.7s) len=  256/256   'Name three primary colors:' -> ' red, blue, and." The appears 2,.: 111 times  the 2  :    3 '
+[21] ERR (23.1s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[22] ERR (23.1s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[23] ERR (23.0s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[24] OK  (  19.3s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that a So So The capital of FranceFrance " '
+[25] OK  (  19.4s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is, 11 ?? Actually 13 is .?? Wait '
+[26] OK  (  19.6s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a a. The Au Au for is is Au Au. Au Au'
+[27] OK  (  19.8s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a for TheassistantanalysisWe user planet'
+[28] OK  (  20.6s) len=  256/256   'Name three primary colors:' -> ' red, blue, and.". blue blue, blue, blue. blue and.\\n\\n blue'
+[29] ERR (22.9s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[30] ERR (22.9s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[31] ERR (22.9s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[32] OK  (  19.3s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that.\\n\\n But \\n The answer wants "What of '
+[33] OK  (  19.5s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is the a11 ,? Wait 13 is  but but '
+[34] OK  (  19.7s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a a.\\n\\n Au for for to is. Au Au\\n\\n '
+[35] OK  (  19.9s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a for TheassistantanalysisWe user planet'
+[36] ERR (22.8s) 'Name three primary colors:' -> "<HTTPError 500: 'Internal Server Error'>"
+[37] ERR (22.7s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[38] ERR (22.7s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[39] ERR (22.7s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[40] OK  (  19.4s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that.\\n\\n But \\n \\nWe can to produceise... '
+[41] OK  (  19.7s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is, 11 ?? Actually 13 is .?? Wait '
+[42] OK  (  19.9s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a is.\\n\\n Au Au for to is..\\n\\n Au Au'
+[43] OK  (  20.1s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a for TheassistantanalysisWe user planet'
+[44] ERR (22.6s) 'Name three primary colors:' -> "<HTTPError 500: 'Internal Server Error'>"
+[45] ERR (22.6s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[46] ERR (22.6s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[47] ERR (22.5s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[48] OK  (  19.6s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that a So So So we: "No of capital capital '
+[49] OK  (  19.8s) len=   64/64    'List the first five prime numb' -> ' 2, 3, 5, 7, 11.\\n\\n (The is, 11 ?? Actually 13 is .?? Wait '
+[50] OK  (  20.0s) len=   96/96    'The chemical symbol for gold i' -> ' Au.\\n\\n symbol word a a TheassistantanalysisThe chemical ch'
+[51] OK  (  20.2s) len=  128/128   'The largest planet in our sola' -> ' Jupiter.\\n\\n the a a\\n\\n\\n\\nassistantanalysisWeWe to produc'
+[52] ERR (22.4s) 'Name three primary colors:' -> "<HTTPError 500: 'Internal Server Error'>"
+[53] ERR (22.4s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[54] ERR (22.4s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[55] ERR (22.4s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"
+[56] OK  (  19.9s) len=   32/32    'The capital of France is' -> ' Paris."\\n\\n the that a So So The capital of FranceFrance ".'
+[57] ERR (22.3s) 'List the first five prime numb' -> "<HTTPError 500: 'Internal Server Error'>"
+[58] ERR (22.3s) 'The chemical symbol for gold i' -> "<HTTPError 500: 'Internal Server Error'>"
+[59] ERR (22.3s) 'The largest planet in our sola' -> "<HTTPError 500: 'Internal Server Error'>"
+[60] ERR (22.3s) 'Name three primary colors:' -> "<HTTPError 500: 'Internal Server Error'>"
+[61] ERR (22.3s) 'Water is composed of hydrogen ' -> "<HTTPError 500: 'Internal Server Error'>"
+[62] ERR (22.2s) '2 + 2 =' -> "<HTTPError 500: 'Internal Server Error'>"
+[63] ERR (22.2s) 'The first president of the Uni' -> "<HTTPError 500: 'Internal Server Error'>"

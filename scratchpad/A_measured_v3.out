@@ -1,0 +1,11 @@
+============================================================
+TAG=A_measured_v3  concurrency=32  total=96  out=4096
+requests: ok=96 err=0
+wall_time_s: 300.21
+total_output_tokens: 393216
+SYSTEM_OUTPUT_TOK_PER_SEC: 1309.79
+per_req_latency_s mean=86.71 p50=82.27 p99=126.08 min=44.52 max=126.08
+ttft_s mean=0.444 max=0.755
+TPOT_s mean=0.11122  (=> per-stream tok/s 8.99)
+completion_tokens distinct values among ok: [4096]
+============================================================

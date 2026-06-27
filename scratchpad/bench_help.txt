@@ -1,0 +1,71 @@
+INFO 06-27 02:09:08 [__init__.py:59] TPU info: node_name=v6spotalt656 | tpu_type=v6e-8 | worker_id=0 | num_chips=8 | num_cores_per_chip=1
+WARNING 06-27 02:09:08 [tpu_platform.py:408] Pin memory is not supported on TPU.
+INFO 06-27 02:09:11 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:12 [importing.py:53] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 06-27 02:09:12 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 06-27 02:09:14 [attention_interface.py:55] Using default RPA kernel
+WARNING 06-27 02:09:14 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+WARNING 06-27 02:09:14 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 06-27 02:09:14 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 06-27 02:09:14 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:14 [tpu_platform.py:177] Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.
+INFO 06-27 02:09:14 [fused_moe_gmm.py:56] fused_moe_gmm SparseCore kernels: gather=v2 gather_reduce=v2
+INFO 06-27 02:09:14 [__init__.py:112] Registered model loader `<class 'tpu_inference.models.jax.utils.weight_utils.JaxDummyModelLoader'>` with load format `jax_dummy`
+INFO 06-27 02:09:14 [__init__.py:112] Registered model loader `<class 'tpu_inference.models.common.pathways_dummy_loader.PathwaysDummyModelLoader'>` with load format `pathways_dummy`
+INFO 06-27 02:09:15 [__init__.py:112] Registered model loader `<class 'tpu_inference.models.vllm.vllm_model_loader.IncrementalModelLoader'>` with load format `tpu_streaming_loader`
+WARNING 06-27 02:09:15 [__init__.py:101] Load format `runai_streamer` is already registered, and will be overwritten by the new loader class `<class 'tpu_inference.models.vllm.vllm_model_loader.RunaiIncrementalModelLoader'>`.
+INFO 06-27 02:09:15 [__init__.py:112] Registered model loader `<class 'tpu_inference.models.vllm.vllm_model_loader.RunaiIncrementalModelLoader'>` with load format `runai_streamer`
+usage: vllm bench serve [options]
+
+Benchmark the online serving throughput.
+
+Config Groups:
+  options                 
+  custom dataset options  
+  spec bench dataset options
+  sonnet dataset options  
+  sharegpt dataset options
+  timed-trace dataset options
+  blazedit dataset options
+  asr dataset options     
+  random dataset options  
+  random multimodal dataset options extended from random dataset
+  hf dataset options      
+  BFCL dataset options    Berkeley Function Calling Leaderboard dataset.
+  
+      https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard
+  
+      BFCL ships one JSON-lines file per category at the repo root (e.g.
+      ``BFCL_v3_simple.json``, ``BFCL_v3_live_simple.json``) rather than a
+      single HuggingFace split. Each record has ``{id, question, function}``
+      where ``function`` uses a non-OpenAI schema dialect (``"type": "dict"``).
+  
+      This dataset loader:
+        - downloads the selected per-category files via ``hf_hub_download``
+          and interleaves rows round-robin so sampling is balanced
+        - translates BFCL function schemas to OpenAI tool format
+        - sets :attr:`SampleRequest.chat_messages` directly and attaches
+          ``tools`` / ``tool_choice`` via :attr:`SampleRequest.request_overrides`,
+          producing production-alike tool calling traffic when used with an
+          ``openai-chat`` backend
+      
+  prefix repetition dataset options
+  speed bench dataset options
+      SPEED-Bench dataset: https://huggingface.co/datasets/nvidia/SPEED-Bench
+  
+      Download the dataset using:
+  
+      `curl -LsSf https://raw.githubusercontent.com/NVIDIA-NeMo/Skills/refs/heads/main/nemo_skills/dataset/speed-bench/prepare.py | python3 -`
+      
+  sampling parameters     
+
+For full list:            vllm bench serve --help=all
+For a section:            vllm bench serve --help=ModelConfig    (case-insensitive)
+For a flag:               vllm bench serve --help=max-model-len  (_ or - accepted)
+Documentation:            https://docs.vllm.ai

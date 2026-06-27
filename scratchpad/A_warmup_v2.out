@@ -1,0 +1,13 @@
+[1;36m[check-gcs-region][0m [1;32mOK[0m: bucket 'personal-mark-us-east5-b' (US-EAST5) is in the same region as this VM (us-east5).
+[tpu-env] HF_HOME=/tmp/gcs/bucket/vllm  OMP_NUM_THREADS=16  venv=/home/enyouki/vllm_env
+============================================================
+TAG=A_WARMUP_V2  concurrency=32  out=4096
+requests: ok=32 err=0
+wall_time_s: 69.14
+total_output_tokens: 24333
+SYSTEM_OUTPUT_TOK_PER_SEC: 351.93
+per_req_latency_s mean=69.13 p50=69.14 p99=69.14 min=69.07 max=69.14
+ttft_s mean=18.714
+TPOT_s mean=0.09376  (=> per-stream tok/s 10.67)
+completion_tokens distinct values among ok: [538, 539, 4096]
+============================================================

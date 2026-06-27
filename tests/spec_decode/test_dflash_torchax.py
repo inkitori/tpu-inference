@@ -36,6 +36,11 @@ class MockHFLikeConfig:
         self.hidden_size = 16
         self.num_hidden_layers = 2
         self.num_attention_heads = 4
+        # Draft KV geometry consumed by the proposer __init__ for the per-slot
+        # K/V cache shape (increment 2). num_key_value_heads exercises the GQA
+        # path; head_dim = hidden_size / num_attention_heads = 4.
+        self.num_key_value_heads = 2
+        self.head_dim = 4
         self.block_size = 3
         self.dflash_config = {
             "mask_token_id": 0,
@@ -416,3 +421,142 @@ def test_torchax_proposer_lifecycle_flow(mock_wrapper_cls, mesh):
     assert proposer._ctx_len[0] == 5
     assert proposer._prev_seq_len[0] == 5
     assert proposer._last_req_id[0] == "req_2"
+
+
+# ----- Increment 2: per-slot K/V cache (write + condense-move) -----
+# Pure-JAX, no real model load: construct a bare proposer with a single-device
+# mesh and set _k_cache/_v_cache directly. The kv write/move are bit-exact
+# (bf16) masked scatters, so the reference is plain numpy + np.array_equal.
+
+# K/V cache geometry for the small tests.
+_KV_L = 2  # layers
+_KV_SLOTS = 4  # max_num_reqs
+_KV_BUF = 8  # buf_len (row _KV_BUF - 1 is the dead row)
+_KV_KVH = 2  # kv heads
+_KV_HD = 4  # head dim
+
+
+def _make_kv_proposer():
+    """Bare proposer with a single-device mesh + a random bf16 K/V cache."""
+    proposer = object.__new__(DFlashTorchaxProposer)
+    proposer.mesh = _make_single_device_mesh()
+    proposer.num_layers = _KV_L
+    proposer.max_num_reqs = _KV_SLOTS
+    proposer.num_kv_heads = _KV_KVH
+    proposer.head_dim = _KV_HD
+    rng = np.random.default_rng(0)
+    shape = (_KV_L, _KV_SLOTS, _KV_BUF, _KV_KVH, _KV_HD)
+    k0 = rng.standard_normal(shape).astype(np.float32)
+    v0 = rng.standard_normal(shape).astype(np.float32)
+    proposer._k_cache = jnp.asarray(k0, dtype=jnp.bfloat16)
+    proposer._v_cache = jnp.asarray(v0, dtype=jnp.bfloat16)
+    return proposer
+
+
+def test_batched_kv_write_correctness():
+    proposer = _make_kv_proposer()
+    k_before = np.asarray(proposer._k_cache)  # bf16 view, exact
+    v_before = np.asarray(proposer._v_cache)
+    dead_row = _KV_BUF - 1
+
+    # Plan over a token axis T=5: a mix of valid copies + invalid (dead-row)
+    # rows. Valid rows target distinct (slot, row) cells; one valid pair shares
+    # a slot to exercise multi-row-per-slot.
+    #   r0: slot 0 row 2 (valid)
+    #   r1: invalid  -> dead row (slot 0)
+    #   r2: slot 2 row 5 (valid)
+    #   r3: slot 0 row 3 (valid, same slot as r0)
+    #   r4: invalid  -> dead row (slot 0)
+    slot_idx = np.array([0, 0, 2, 0, 0], dtype=np.int32)
+    dst_row = np.array([2, dead_row, 5, 3, dead_row], dtype=np.int32)
+    valid = np.array([True, False, True, True, False], dtype=bool)
+    T = slot_idx.shape[0]
+
+    rng = np.random.default_rng(1)
+    k_new = rng.standard_normal(
+        (_KV_L, T, _KV_KVH, _KV_HD)).astype(np.float32)
+    v_new = rng.standard_normal(
+        (_KV_L, T, _KV_KVH, _KV_HD)).astype(np.float32)
+    k_new_bf = jnp.asarray(k_new, dtype=jnp.bfloat16)
+    v_new_bf = jnp.asarray(v_new, dtype=jnp.bfloat16)
+    # Exact bf16 values the write will store (so the reference is bit-identical).
+    k_new_exact = np.asarray(k_new_bf)
+    v_new_exact = np.asarray(v_new_bf)
+
+    k_out, v_out = proposer._batched_kv_write(
+        proposer._k_cache, proposer._v_cache, k_new_bf, v_new_bf,
+        jnp.asarray(slot_idx), jnp.asarray(dst_row), jnp.asarray(valid))
+    k_out = np.asarray(k_out)
+    v_out = np.asarray(v_out)
+
+    # numpy reference: start from a copy, apply valid rows in order.
+    k_ref = k_before.copy()
+    v_ref = v_before.copy()
+    for r in range(T):
+        if valid[r]:
+            k_ref[:, slot_idx[r], dst_row[r]] = k_new_exact[:, r]
+            v_ref[:, slot_idx[r], dst_row[r]] = v_new_exact[:, r]
+    assert np.array_equal(k_out, k_ref)
+    assert np.array_equal(v_out, v_ref)
+
+    # Valid rows landed at [:, slot, row].
+    for r in range(T):
+        if valid[r]:
+            assert np.array_equal(k_out[:, slot_idx[r], dst_row[r]],
+                                  k_new_exact[:, r])
+            assert np.array_equal(v_out[:, slot_idx[r], dst_row[r]],
+                                  v_new_exact[:, r])
+    # Dead-row routing left the dead row bit-unchanged (invalid rows wrote the
+    # current value back; no valid row targets it).
+    assert np.array_equal(k_out[:, 0, dead_row], k_before[:, 0, dead_row])
+    assert np.array_equal(v_out[:, 0, dead_row], v_before[:, 0, dead_row])
+    # Every cell NOT a valid destination is bit-unchanged.
+    touched = {(int(slot_idx[r]), int(dst_row[r]))
+               for r in range(T) if valid[r]}
+    for s in range(_KV_SLOTS):
+        for row in range(_KV_BUF):
+            if (s, row) not in touched:
+                assert np.array_equal(k_out[:, s, row], k_before[:, s, row])
+                assert np.array_equal(v_out[:, s, row], v_before[:, s, row])
+
+
+@pytest.mark.parametrize(
+    "dst,src",
+    [
+        ([0, 1, 2, 3], [0, 1, 2, 3]),  # identity
+        ([1, 0, 2, 3], [3, 0, 2, 3]),  # single move (slot 1 <- slot 3)
+        ([0, 1, 2, 3], [1, 0, 2, 3]),  # swap 0 <-> 1
+        ([0, 1, 2, 3], [2, 0, 1, 3]),  # 3-cycle 0<-2<-1<-0
+        ([0, 1, 2, 3], [3, 2, 1, 0]),  # full reverse permutation
+    ],
+)
+def test_move_kv_rows_correctness(dst, src):
+    proposer = _make_kv_proposer()
+    k_before = np.asarray(proposer._k_cache)
+    v_before = np.asarray(proposer._v_cache)
+
+    dst_arr = np.asarray(dst, dtype=np.int32)
+    src_arr = np.asarray(src, dtype=np.int32)
+
+    k_out, v_out = proposer._move_kv_rows(
+        proposer._k_cache, proposer._v_cache,
+        jnp.asarray(dst_arr), jnp.asarray(src_arr))
+    k_out = np.asarray(k_out)
+    v_out = np.asarray(v_out)
+
+    # numpy reference: gather src (from pre-move cache) then scatter to dst.
+    k_ref = k_before.copy()
+    v_ref = v_before.copy()
+    k_ref[:, dst_arr] = k_before[:, src_arr]
+    v_ref[:, dst_arr] = v_before[:, src_arr]
+    assert np.array_equal(k_out, k_ref)
+    assert np.array_equal(v_out, v_ref)
+
+
+def test_kv_cache_shape_matches_geometry():
+    proposer = _make_kv_proposer()
+    expected = (_KV_L, _KV_SLOTS, _KV_BUF, _KV_KVH, _KV_HD)
+    assert proposer._k_cache.shape == expected
+    assert proposer._v_cache.shape == expected
+    assert proposer._k_cache.dtype == jnp.bfloat16
+    assert proposer._v_cache.dtype == jnp.bfloat16
