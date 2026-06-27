@@ -8,6 +8,26 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][impl-attnkernel] **EFFICIENT-KERNEL LEVER IS A DEAD END — the draft attn is FLOP-BOUND,
+  flash is ~1.7x SLOWER ⇒ BLOCKED_USER. ALL attention-cost levers now exhausted.** Tried to route the
+  draft's full-context attn through an efficient TPU kernel (the last lever). (1) The TARGET's kernel
+  `ragged_paged_attention_hd64` is DOUBLY BLOCKED: strictly PAGED (draft cache is contiguous per-slot) +
+  HARD-CAUSAL with no override (can't express the draft's BIDIRECTIONAL 8-query noise block). (2)
+  `flash_attention` (contiguous, the kernel the JAX-native DFlash path already uses) CAN reproduce the
+  exact math (causal=False + additive `ab` mask; max|eager−flash|=1.17e-2 bf16 ⇒ accept WOULD be
+  preserved) BUT is ~1.7x SLOWER at every C on the real 8-chip mesh: eager_8L vs flash_8L =
+  5.4/15.4(C512) … 48.8/84.0(C4608) = 0.35–0.58x. (3) ROOT CAUSE (decisive): the draft attn is
+  FLOP-BOUND on q@k^T (~30ms) + scores@V (~18ms) dense matmuls over GQA-expanded 64-head K/V — flash has
+  the SAME FLOPs; at q-len B=8 it runs N·Hq=2048 tiny one-shot tiles whose launch/VMEM overhead dominates,
+  and there's no big score matrix to fuse. Projected flash cached fwd ~96ms vs current ~59ms = WORSE.
+  Reconciles 12-impl: isolated eager_8L 48.8ms == the doc's ~52ms cached fwd ⇒ attention IS the whole
+  forward, now PROVEN FLOP-bound. ⇒ NO attention kernel reduces dense full-context FLOPs. Combined w/
+  windowing (REJECTED, accept→2.5) + num_spec (EXHAUSTED, plateau ~1300), the FLOPs only shrink by cutting
+  C/B/Hq — all tried/failed. **BLOCKED_USER: the c=32 + full-context + this-draft frame is exhausted;
+  beating B needs a cheaper draft MODEL (fewer heads/layers/distilled), content-sparse attn (research +
+  custom kernel), or revisiting the c=32 requirement — a USER/L1 decision, not an in-scope kernel swap.**
+  Nothing wired into the draft forward (rejected at the microbench gate); only a committed microbench
+  script (no source touched, flag-off byte-unchanged). Commit b0b7e042. Details: 17-impl-attnkernel.md.
 - [2026-06-27][impl-window] **LEVER A (windowing) IS A DEAD END — kills acceptance ⇒ BLOCKED_USER.
   LEVER B landed + sound (KEEP).** Lever A (windowed draft attn, env `DFLASH_DRAFT_WINDOW=W`, KV path,
   default 0=off): per-slot GATHER cached K/V to last W ctx positions before the score matmul. The
@@ -95,20 +115,10 @@
   alongside as cross-check now). ⇒ NEEDS_TEST (real serve-path perfect-draft c=32 + greedy-vs-target
   with flag ON) then NEEDS_BENCH with num_spec tuned DOWN to clear the marginal flip. Commits ebb2b44c,
   39e2f91f, e1fa4115, d7a4300b, b5d5c7b4. Details: 12-impl-kvcache.md.
-- [2026-06-27][bench-v3] **FIRST TRUSTWORTHY A-vs-B SPEED VERDICT: DFlash is ~2.90x SLOWER than
-  target-only at the GOAL bench point (in=1, out=4096, c=32, WARM cache, total=96 reqs so
-  backfill/condense fires). ⇒ NEEDS_IMPL.** A(DFlash)=1309.79 sys out tok/s, TPOT 0.111s, mean
-  latency 86.7s; B(target-only)=3792.80 sys out tok/s, TPOT 0.0084s, mean latency 34.6s. NO CRASH
-  (the 09 dflash.py:421 broadcast crash is GONE under real condense/backfill at out=4096/c=32 —
-  confirms 10-impl-condense's fix holds end-to-end). 96/96 ok both configs, all exactly 4096 tok;
-  same target (byte-identical greedy probe). DFlash accept HEALTHY ~5.0-6.2/step at full c=32 (tail
-  to 6.7), per-pos 0.85→0.40 ⇒ PERF gap, not accept. DFlash ALSO loses latency here (2.5x worse) —
-  the "spec wins latency" hypothesis does NOT hold at c=32 (target step already cheap+batched).
-  Write fix (6b6acd49) helped (corrupt-07 358 → 1310, 3.7x), but the ONLY remaining lever is
-  **LEVER #1: KV-cache the O(ctx) draft recompute** (draft recomputes fc+8 attn over the FULL
-  context every step, TPOT 13.2x). Need ~2.2x step speedup to flip A>B; KV cache removes the O(ctx)
-  term entirely. ⇒ the 07 "10.6x / 358 tok/s" A-number is now SUPERSEDED (it was silently corrupt);
-  THIS is the honest baseline. HBM: A 39.73 / B 24.07 GiB (not the gap). Details: 11-bench-c32-v3.md.
+- [2026-06-27][bench-v3] FIRST TRUSTWORTHY A-vs-B (in=1/out=4096/c=32, WARM): A(DFlash)=1310 tok/s
+  vs B(target)=3793 ⇒ ~2.90x slower. No crash, 96/96 ok both, accept HEALTHY ~5-6/step ⇒ PERF gap not
+  accept. DFlash also loses latency (2.5x). The honest baseline (07's "358/10.6x" was silently corrupt).
+  Details: 11-bench-c32-v3.md. (Superseded in number by bench-sweep below; same verdict.)
 - [2026-06-27][impl-condense] **CONDENSE/SLOT DESYNC FIXED + VERIFIED ACROSS A REAL CONDENSE EVENT ⇒
   NEEDS_BENCH.** The 09 out=4096/c=32 broadcast crash (dflash.py:421) is GONE. PROPER fix (b94fc366,
   found already-committed from a prior session): mirror vLLM InputBatch.condense slot-moves onto the
@@ -134,19 +144,10 @@
   ~234ms → **~2.2ms (~106x)** at decode on the real 8-chip mesh. **BIT-IDENTICAL** to the old
   loop (np.array_equal full buffer, all edge cases) — but it TOUCHED the proven write path ⇒
   per GOAL, NEEDS_TEST (re-run perfect-draft b=32 lossless before trusting). **HBM UNCHANGED**
-  at GOAL (max_model_len=4224 → buf_len stays 4608, 3.96 GiB; the dead-row bump only fires when
-  max_model_len is an exact multiple of 512). Unit tests 5/5. Per-step now ~17-101ms (was
-  ~250-334ms), DOMINATED by the O(ctx) fc/attn forward = **LEVER #1 (KV-cache the context),
-  next round** — breaks even only for C≲2k, 99ms at C=4608. Details: 08-impl-perf.md.
-  Chip task_d0ad4933 (the donated-write task) is DONE.
-- [2026-06-26][L1-seed] Branch `dflash` has substantial prior DFlash work. `STATE.md`
-  at repo root documents a claimed "working DFlash gpt-oss-20b serve recipe". Recent
-  commits fixed: 0% accept (project draft logits through target lm_head, not input
-  embedding); MXFP4→fp8_e4m3fn requant workaround for v6e MoE experts; phantom DFlash
-  draft KV groups on torchax; draft mask docstring.
-- [2026-06-26][L1-seed] UNKNOWN at start: is it CURRENTLY lossless? is it CURRENTLY
-  faster than target-only at the required bench point? Do NOT trust that it works —
-  ASSESS the real current state first.
+  at GOAL. Unit tests 5/5. Details: 08-impl-perf.md.
+- [2026-06-26][L1-seed] Branch `dflash` has substantial prior DFlash work (STATE.md recipe). Correctness
+  is DONE (see below); the open question was always SPEED at the bench point — now answered: BLOCKED (the
+  draft step is FLOP-bound dense attn that no in-scope lever can cheapen at c=32/full-context).
 
 ## Confirmed facts
 - [2026-06-26][test] CORRECTNESS DONE. Ladder#1 perfect-draft (DFLASH_PERFECT_DRAFT=1) →
@@ -240,4 +241,11 @@
   no structural blocker, HF model already handles arbitrary bsz.
 
 ## Dead ends — do NOT repeat
-- (none yet)
+- [2026-06-27][impl-window] WINDOWING the draft attn (W≤512): craters accept 6→2.5 (window-insensitive,
+  intrinsic). Loses at every overhead. The draft genuinely uses its long context.
+- [2026-06-27][impl-attnkernel] SWAPPING the draft attn to a flash/ragged/paged KERNEL: target's
+  ragged_paged_attention_hd64 is paged + hard-causal (can't fit the draft's contiguous bidirectional
+  8-query mask); flash_attention fits the math but is ~1.7x SLOWER (draft attn is FLOP-bound, q=8 tiny so
+  flash's tiny-tile overhead dominates + same FLOPs). No attention kernel cuts dense full-context FLOPs.
+- [2026-06-27][bench-sweep] num_spec as a throughput lever: plateaus ~1300 (ns≥7 degenerate to same draft;
+  ns<7 throws away accepted pos 5-7). Cutting B lowers accept ~proportionally to the matmul savings.
