@@ -69,21 +69,28 @@
   NO logprobs. Worth fixing eventually but not a generation/verifier bug.
 
 ## Known blockers / gotchas
-- [2026-06-27][impl] **c=32 BLOCKER RESOLVED.** Batched/multi-seq DFlash torchax decode
+- [2026-06-27][impl-hbm] **HBM BLOCKER RESOLVED — SERVES at c=32 / max-model-len 4224 /
+  util 0.75 (32/32 concurrent ~4000-tok greedy, coherent, no OOM).** This is enough for the
+  GOAL bench point (in=1, out=4096 needs seq cap 4097). Two BIT-IDENTICAL fixes (NO re-test):
+  (1) `395e90ce` right-size _ctx_buf: padding granularity pow2→multiple-of-512, buf_len at
+  len4224 8192→4608 ⇒ 7.03→3.96 GiB/chip; (2) `2f62f0f1` fuse the per-step read-slice
+  `_ctx_buf[:n,:c]` INSIDE the jitted draft forward (was an eager 3.96 GiB copy/step = the
+  1st OOM site). Both change only memory layout, not values. _raw_hidden_dim = **14400**
+  (5 target layers × 2880), NOT 13440. Unit tests now 5/5 (torchax) + 5/5 (jax-native).
+  Details: 06-impl-hbm.md. ⇒ NEXT = NEEDS_BENCH (c=32 speed bench, util 0.75 len 4224).
+- [2026-06-27][impl-hbm] **Headroom is TIGHT: util 0.75 fits, util 0.80 OOMs** at a NEW site
+  (dflash.py:324, the eager per-step `dynamic_update_slice` WRITE — also copies the full
+  3.96 GiB buffer since it's a non-donated functional update). The read-slice fix removed the
+  336 transient; this write transient is the next lever. Fix = jit+donate the write (in-place
+  update). Spawned as chip task_d0ad4933. Bench at util 0.75; do NOT push util/len higher
+  until that lands. chip-0 is the binding constraint (~0.4 GiB margin at 0.75).
+- [2026-06-27][impl] **c=32 ASSERT BLOCKER RESOLVED.** Batched/multi-seq DFlash torchax decode
   IMPLEMENTED + smoke-verified. The num_reqs<=1 assert is gone; server serves --max-num-seqs 32
   and 32/32 concurrent greedy requests return COHERENT output (Paris / George Washington / Au /
   speed of light / J.K. Rowling; dup prompts -> identical greedy). dp_size==1 + no-async asserts
   KEPT (independent). Commits 9410b793 + f9947f43. Details: 04-impl.md. ⇒ NEXT = NEEDS_TEST:
   re-run perfect-draft machinery test AT batch>1 to prove batched verify still lossless, THEN the
   c=32 speed bench (03-bench's original job).
-- [2026-06-27][impl] **HBM is the binding constraint at c=32, not the assert.** First c=32 smoke at
-  max-model-len 2048 / default util HIT RESOURCE_EXHAUSTED: the proposer's per-slot _ctx_buf
-  (max_num_reqs × buf_len × raw_hidden_dim(~13440) × 2B; =1.76G at len 2048) couldn't allocate
-  (970M free) because vLLM's mem profiler grabbed ~all HBM for KV cache (2.04M tokens) before the
-  full-batch _ctx_buf is exercised. FIX for smoke: max-model-len 1024 + --gpu-memory-utilization
-  0.75 (KV ~1.6M tokens, per-chip ~23-24/31.25 GiB, _ctx_buf ~0.88G fits). The GOAL speed bench at
-  in=1/out=4096 needs len>=5120 — next manager MUST lower util/len OR land the _ctx_buf scatter opt
-  (spawned as a follow-up task) to fit. c=1 A-vs-B throughput still NOT finalized. See 03/04.
 - [2026-06-26][research] v6e-only workarounds in place (not general): MXFP4→fp8_e4m3fn requant
   (layers/vllm/quantization/mxfp4.py); v1 ragged gather mandatory. EP mandatory (plain TP8 dies
   IndivisibleError). gcsfuse root-only → stage to local HF cache HF_HOME=/home/enyouki/local_hf.
