@@ -256,9 +256,12 @@ def test_torchax_proposer_lifecycle_flow(mock_wrapper_cls, mesh):
     assert proposer._wrapper is mock_wrapper
     assert proposer._params is mock_wrapper.params
     assert proposer._embed_weight is mock_wrapper.embed_weight_jax
-    # Max model len 128 -> buf_len 128 (block 16); per-slot 3-D buffer
-    # (max_num_reqs, buf_len, raw_hidden_dim). max_num_reqs is 1 for this mock.
-    assert proposer._ctx_buf.shape == (1, 128, 32)
+    # Max model len 128 -> _next_padded_size(128) == 128 (block 16), which
+    # lands exactly on max_model_len, so load_model() bumps buf_len by one pad
+    # block (-> 144) to guarantee a dead padding row above max_model_len that
+    # the batched ctx write routes all invalid scatter cells to. Per-slot 3-D
+    # buffer (max_num_reqs, buf_len, raw_hidden_dim); max_num_reqs is 1 here.
+    assert proposer._ctx_buf.shape == (1, 144, 32)
     assert proposer._ctx_len[0] == 0
     assert proposer._prev_seq_len[0] == 0
 

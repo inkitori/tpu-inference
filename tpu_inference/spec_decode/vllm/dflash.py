@@ -26,7 +26,6 @@ from typing import Any, Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import lax
 from vllm.config import VllmConfig
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
@@ -124,6 +123,13 @@ class DFlashTorchaxProposer:
         self._lm_head_weight = self._wrapper.lm_head_weight_jax
 
         buf_len = self._next_padded_size(self.max_model_len)
+        # Guarantee at least one dead padding row ABOVE max_model_len: the
+        # batched ctx write routes every invalid scatter cell to the last buffer
+        # row, which must never be a valid write target (valid dst rows are
+        # < max_model_len). If max_model_len lands exactly on the pad block,
+        # bump by one block so buf_len - 1 stays a dead row.
+        if buf_len <= self.max_model_len:
+            buf_len += self._ctx_pad_block
         self._ctx_buf = jnp.zeros(
             (self.max_num_reqs, buf_len, self._raw_hidden_dim),
             dtype=jnp.bfloat16)
@@ -209,6 +215,30 @@ class DFlashTorchaxProposer:
             _ = self._build_noise_block(seq_lens[:n], next_token_ids[:n],
                                         self.mask_token_id, self.block_size)
 
+        # Warm the batched context write for every raw_hidden token bucket it
+        # can see at runtime. _batched_ctx_write's only varying-shape input is
+        # raw_hidden (leading dim == one of the runner's token-padding buckets);
+        # the index/mask arrays share that leading dim. prepare_inputs() runs
+        # inside maybe_forbid_compile, so an unwarmed bucket would hard-fail
+        # under VLLM_XLA_CHECK_RECOMPILATION. Donation rebinds _ctx_buf each
+        # call; the warm-up plan is an all-invalid (no-op) scatter so the buffer
+        # contents are preserved.
+        token_buckets = getattr(self.runner, "num_tokens_paddings", None)
+        if token_buckets is None:
+            token_buckets = [self.max_num_tokens]
+        dead_row = self._ctx_buf.shape[1] - 1
+        logger.info("Precompiling DFlash batched ctx write for %d buckets...",
+                    len(token_buckets))
+        for t in token_buckets:
+            slot_idx = device_array(self.mesh, np.zeros(t, dtype=np.int32))
+            dst_row = device_array(self.mesh,
+                                   np.full(t, dead_row, dtype=np.int32))
+            valid = device_array(self.mesh, np.zeros(t, dtype=bool))
+            raw_dummy = jnp.zeros((t, self._raw_hidden_dim),
+                                  dtype=jnp.bfloat16)
+            self._ctx_buf = self._batched_ctx_write(self._ctx_buf, raw_dummy,
+                                                    slot_idx, dst_row, valid)
+
         logger.info("DFlash torchax precompile complete.")
 
     def _next_padded_size(self, n: int) -> int:
@@ -247,6 +277,58 @@ class DFlashTorchaxProposer:
         noise_positions = (jnp.arange(block_size, dtype=jnp.int32)[None, :] +
                            seq_lens.astype(jnp.int32)[:, None])
         return noise_input_ids, noise_positions
+
+    @functools.partial(jax.jit, static_argnums=(0, ), donate_argnums=(1, ))
+    def _batched_ctx_write(
+        self,
+        ctx_buf: jax.Array,
+        raw_hidden: jax.Array,
+        slot_idx: jax.Array,
+        dst_row: jax.Array,
+        valid_mask: jax.Array,
+    ) -> jax.Array:
+        """Single jitted, input-donated, batched in-place context write.
+
+        Replaces the per-request eager ``lax.dynamic_update_slice`` loop (each
+        eager call copied the whole multi-GiB ``_ctx_buf``). Donating
+        ``ctx_buf`` lets XLA mutate it in place; the function returns the
+        updated buffer and the caller immediately rebinds it, so donation is
+        safe (mirrors the proven write-only microbench).
+
+        Implemented as ONE masked scatter indexed over the SOURCE token axis of
+        raw_hidden. Source row r (a flat-ragged target hidden state) is copied
+        to ``ctx_buf[slot_idx[r], dst_row[r]]`` iff ``valid_mask[r]``. This
+        naturally handles any per-request copy count -- including the large
+        prefill step where a slot appends many rows -- without a fixed
+        block-width cap, because the scatter axis IS the (bucketed) token axis.
+
+        The only varying-shape input is ``raw_hidden`` (leading dim == one of
+        the runner's token-padding buckets); the per-row index/mask arrays share
+        that same leading dim. precompile() warms every bucket, so the recompile
+        guard never fires at decode time.
+
+        Bit-identical to the eager loop: invalid source rows (rows past a
+        request's n_copy, rows of inactive/no-write slots, and padding rows of
+        the bucketed raw_hidden) write the destination's CURRENT value back
+        (read-modify-write), so untouched rows are bit-preserved. All invalid
+        rows are routed by the caller to a single dead padding row (the last
+        buffer row, guaranteed by load_model() to never be a valid target), so
+        duplicate-index scatter ordering can never clobber a real write.
+
+        Args:
+          ctx_buf:    (max_num_reqs, buf_len, D) bf16 buffer (donated).
+          raw_hidden: (total_tokens, D) flat-ragged target hidden states.
+          slot_idx:   (total_tokens,) int32 destination slot per source row;
+                      0 for invalid rows.
+          dst_row:    (total_tokens,) int32 destination row per source row; for
+                      valid rows == ctx_len[i] + offset, for invalid rows == the
+                      dead last buffer row (buf_len - 1).
+          valid_mask: (total_tokens,) bool; True iff this source row is copied.
+        """
+        src = raw_hidden.astype(ctx_buf.dtype)  # (T, D)
+        cur = ctx_buf[slot_idx, dst_row]  # (T, D)
+        merged = jnp.where(valid_mask[:, None], src, cur)
+        return ctx_buf.at[slot_idx, dst_row].set(merged)
 
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _sample_block_draft_tokens(
@@ -299,9 +381,21 @@ class DFlashTorchaxProposer:
         raw_hidden = jnp.concatenate(aux_hidden_states, axis=-1)
 
         # Append each request's newly-accepted hidden states (the LEADING rows
-        # of its query segment) into that slot's context buffer. Determine the
-        # per-slot new-token counts on host so the on-device update shape stays
-        # static per slot.
+        # of its query segment) into that slot's context buffer. The per-slot
+        # bookkeeping (shrink-repair, ctx_len bump) stays on host exactly as
+        # before; only the DEVICE write is batched into a SINGLE jitted+donated
+        # masked scatter (_batched_ctx_write) so XLA mutates the multi-GiB
+        # buffer in place instead of copying it once per request.
+        #
+        # Build a per-source-row index plan over raw_hidden's flat token axis.
+        # Every row defaults to a NO-OP write (routed to the dead last buffer
+        # row, masked off); real copies overwrite their plan entries below.
+        total_tokens = raw_hidden.shape[0]
+        buf_len = self._ctx_buf.shape[1]
+        dead_row = buf_len - 1
+        slot_idx_host = np.zeros(total_tokens, dtype=np.int32)
+        dst_row_host = np.full(total_tokens, dead_row, dtype=np.int32)
+        valid_host = np.zeros(total_tokens, dtype=bool)
         for i in range(num_reqs):
             seq_len = int(seq_lens_host[i])
             # Recompute/repair on a (rare) shrink, mirroring the single-seq
@@ -315,16 +409,28 @@ class DFlashTorchaxProposer:
             if num_new <= 0:
                 self._ctx_len[i] = seq_len
                 continue
-            end = min(int(self._ctx_len[i]) + num_new, self.max_model_len)
-            n_copy = end - int(self._ctx_len[i])
+            ctx_len_i = int(self._ctx_len[i])
+            end = min(ctx_len_i + num_new, self.max_model_len)
+            n_copy = end - ctx_len_i
             seg_start = int(qsl_host[i])
-            new_raw = raw_hidden[seg_start:seg_start + n_copy].astype(
-                jnp.bfloat16)
-            # Update slot i, rows [_ctx_len[i] : _ctx_len[i]+n_copy).
-            self._ctx_buf = lax.dynamic_update_slice(
-                self._ctx_buf, new_raw[None, ...],
-                (i, int(self._ctx_len[i]), 0))
+            # Source rows [seg_start : seg_start+n_copy) -> slot i, dest rows
+            # [ctx_len_i : ctx_len_i+n_copy). (Bit-identical to the eager
+            # dynamic_update_slice that copied these same rows.)
+            rows = slice(seg_start, seg_start + n_copy)
+            slot_idx_host[rows] = i
+            dst_row_host[rows] = ctx_len_i + np.arange(n_copy, dtype=np.int32)
+            valid_host[rows] = True
             self._ctx_len[i] = end
+
+        # One device write for all requests; donate _ctx_buf so it is updated in
+        # place. Returned buffer immediately replaces the donated input.
+        self._ctx_buf = self._batched_ctx_write(
+            self._ctx_buf,
+            raw_hidden,
+            device_array(self.mesh, slot_idx_host),
+            device_array(self.mesh, dst_row_host),
+            device_array(self.mesh, valid_host),
+        )
 
         # All slots share one rectangular padded context width = the max
         # accepted length rounded up to _ctx_pad_block, so the downstream JIT
