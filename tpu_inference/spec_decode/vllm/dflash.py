@@ -103,6 +103,9 @@ class DFlashTorchaxProposer:
         self._wrapper = None
         self._draft_forward_fn = None
         self._compute_logits_fn = None
+        # Standalone K/V projection for new context rows (increment 2 KV cache).
+        # Fetched in load_model; nothing calls it yet (non-behavioral here).
+        self._kv_project_fn = None
         self._params: Optional[dict] = None
         self._embed_weight: Optional[jax.Array] = None
         # Target output projection (lm_head); distinct from _embed_weight when
@@ -118,6 +121,7 @@ class DFlashTorchaxProposer:
 
         self._draft_forward_fn = self._wrapper.get_draft_forward_fn()
         self._compute_logits_fn = self._wrapper.get_compute_logits_fn()
+        self._kv_project_fn = self._wrapper.get_kv_project_fn()
         self._params = self._wrapper.params
         self._embed_weight = self._wrapper.embed_weight_jax
         self._lm_head_weight = self._wrapper.lm_head_weight_jax

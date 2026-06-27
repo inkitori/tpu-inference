@@ -50,6 +50,9 @@ class _DFlashRunner(torch.nn.Module):
                                         kwargs["embed_weight"])
         elif "raw_hidden" in kwargs:
             return self._combine_hidden(kwargs["raw_hidden"])
+        elif "kv_project_raw" in kwargs:
+            return self._kv_project(kwargs["kv_project_raw"],
+                                    kwargs["kv_position_ids"])
         else:
             return self._draft_forward(
                 kwargs["noise_embedding"],
@@ -94,6 +97,76 @@ class _DFlashRunner(torch.nn.Module):
     def _combine_hidden(self, raw_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target hidden states through fc + norm."""
         return self.dflash.hidden_norm(self.dflash.fc(raw_hidden))
+
+    def _kv_project(
+        self,
+        raw_new: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-layer draft K (post-RoPE) and V (no norm, no RoPE) for a
+        set of context rows, in isolation.
+
+        This reproduces EXACTLY the K/V the draft attention computes for the
+        context rows during its forward (Qwen3DFlashAttention.forward), but over
+        ONLY the given rows rather than the full [ctx|noise] concat. Because:
+          * fc + hidden_norm are applied per-row,
+          * k_proj / v_proj are per-row linear maps,
+          * k_norm is RMSNorm over the head_dim, applied per (row, head),
+          * RoPE is applied per position,
+        projecting just these rows (with their absolute positions for RoPE) is
+        numerically identical to slicing them out of the in-forward K/V.
+
+        Args:
+            raw_new: (N, M, raw_hidden_dim) bf16 raw concatenated target hidden
+                     states for M context rows.
+            position_ids: (N, M) int absolute context position of each row
+                          (drives RoPE).
+        Returns:
+            (k_all, v_all): each (num_layers, N, M, KVH, head_dim). k_all is
+            post-RoPE (matching the forward's k just before attention); v_all is
+            the raw projected V (no norm, no RoPE), in the same per-row layout.
+        """
+        # Same as transformers.models.qwen3.modeling_qwen3.rotate_half, imported
+        # exactly as the remote DFlash modeling code does.
+        from transformers.models.qwen3.modeling_qwen3 import rotate_half
+
+        cfg = self.dflash.config
+        kvh = cfg.num_key_value_heads
+        hd = getattr(cfg, "head_dim",
+                     cfg.hidden_size // cfg.num_attention_heads)
+
+        bsz, m = raw_new.shape[:-1]
+
+        # Shared across layers: fc -> hidden_norm (matches forward line 177).
+        th = self.dflash.hidden_norm(self.dflash.fc(raw_new))  # (N, M, D)
+
+        # RoPE tables from the absolute context positions. rotary_emb uses `th`
+        # only for dtype/device; cos/sin are (N, M, hd).
+        cos, sin = self.dflash.rotary_emb(th, position_ids)
+        # apply_rotary_pos_emb does cos.unsqueeze(1) -> (N, 1, M, hd) so it
+        # broadcasts over the head axis of k in (N, KVH, M, hd).
+        c = cos.unsqueeze(1)
+        s = sin.unsqueeze(1)
+
+        k_layers = []
+        v_layers = []
+        for layer in self.dflash.layers:
+            sa = layer.self_attn
+            # k_proj/v_proj are per-row linears with bias (attention_bias=True).
+            k = sa.k_proj(th).view(bsz, m, kvh, hd)  # (N, M, KVH, hd)
+            v = sa.v_proj(th).view(bsz, m, kvh, hd)  # (N, M, KVH, hd)
+            # Remote order (lines 79-82): k_norm in (N, *, KVH, hd) layout, then
+            # transpose to (N, KVH, *, hd), then RoPE on k (all positions).
+            k = sa.k_norm(k).transpose(1, 2)  # (N, KVH, M, hd)
+            k = k * c + rotate_half(k) * s  # (N, KVH, M, hd), post-RoPE
+            k = k.transpose(1, 2)  # back to (N, M, KVH, hd)
+            # v: NO norm, NO RoPE; keep the per-row (N, M, KVH, hd) layout.
+            k_layers.append(k)
+            v_layers.append(v)
+
+        k_all = torch.stack(k_layers, dim=0)  # (L, N, M, KVH, hd)
+        v_all = torch.stack(v_layers, dim=0)  # (L, N, M, KVH, hd)
+        return k_all, v_all
 
     @staticmethod
     def _compute_logits(
@@ -334,6 +407,53 @@ class DFlashTorchaxWrapper:
                 return jax_view(out)
 
         return combine_fn
+
+    def get_kv_project_fn(self):
+        """Return a JIT-compiled standalone K/V projection function.
+
+        Signature::
+
+            kv_project(params, raw_new, position_ids) -> (k_all, v_all)
+
+        Computes, for ``M`` context rows, the per-layer draft K (post-RoPE) and
+        V (no norm, no RoPE) that the draft attention produces for those rows
+        during its forward -- but in isolation, over only those rows. See
+        ``_DFlashRunner._kv_project`` for why this is bit-identical to slicing
+        the rows out of the in-forward K/V.
+
+        ``raw_new`` is (N, M, raw_hidden_dim); ``position_ids`` is (N, M) (the
+        absolute context positions for RoPE). M may vary, so it is NOT static --
+        the trace specializes per leading shape, exactly like the other fns.
+        Both outputs are (num_layers, N, M, KVH, head_dim), returned replicated.
+        """
+        model = self.model
+
+        # Both K and V are returned fully replicated (no model/tensor sharding
+        # on these standalone projections); they are small per-row tensors.
+        kv_sharding = NamedSharding(self.mesh, PartitionSpec())
+
+        @functools.partial(jax.jit, out_shardings=(kv_sharding, kv_sharding))
+        def kv_project(
+            params: dict,
+            raw_new: jax.Array,
+            position_ids: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            with torchax.default_env():
+                p = torch_view(params)
+                raw_t = torch_view(raw_new)
+                pos_t = torch_view(position_ids)
+                out = torch.func.functional_call(
+                    model,
+                    p,
+                    kwargs={
+                        "kv_project_raw": raw_t,
+                        "kv_position_ids": pos_t,
+                    },
+                    tie_weights=False,
+                )
+                return jax_view(out[0]), jax_view(out[1])
+
+        return kv_project
 
     def get_compute_logits_fn(self):
         """Return a JIT-compiled compute_logits function.
