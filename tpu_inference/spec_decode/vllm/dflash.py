@@ -239,6 +239,15 @@ class DFlashTorchaxProposer:
             self._ctx_buf = self._batched_ctx_write(self._ctx_buf, raw_dummy,
                                                     slot_idx, dst_row, valid)
 
+        # Warm the slot-permutation gather (mirrors condense/swap moves). It has
+        # exactly one static shape -- gather_src is always (max_num_reqs,) -- so
+        # one identity warm-up covers every runtime move. prepare_inputs() runs
+        # inside maybe_forbid_compile, so an unwarmed move step would hard-fail
+        # under VLLM_XLA_CHECK_RECOMPILATION the first time a condense fires.
+        identity_src = device_array(
+            self.mesh, np.arange(self.max_num_reqs, dtype=np.int32))
+        self._ctx_buf = self._permute_ctx_rows(self._ctx_buf, identity_src)
+
         logger.info("DFlash torchax precompile complete.")
 
     def _next_padded_size(self, n: int) -> int:
@@ -330,6 +339,34 @@ class DFlashTorchaxProposer:
         merged = jnp.where(valid_mask[:, None], src, cur)
         return ctx_buf.at[slot_idx, dst_row].set(merged)
 
+    @functools.partial(jax.jit, static_argnums=(0, ), donate_argnums=(1, ))
+    def _permute_ctx_rows(
+        self,
+        ctx_buf: jax.Array,
+        gather_src: jax.Array,
+    ) -> jax.Array:
+        """Reorder ctx_buf's leading (slot) axis by a full permutation.
+
+        Mirrors a vLLM ``InputBatch.condense`` / ``swap_states`` slot move onto
+        the proposer's per-slot context buffer: after compaction/reorder, the
+        request that now occupies physical slot ``i`` previously lived in slot
+        ``gather_src[i]`` (or ``i`` itself if it did not move / is brand new).
+        A single leading-axis gather rebuilds the buffer in the new layout.
+
+        Donating ``ctx_buf`` lets XLA reuse the storage; the gather materializes
+        the reordered rows into the result before the donated input is reclaimed,
+        so swaps and cyclic moves (src/dst overlap) are safe -- no aliasing.
+
+        Shape never varies: ``gather_src`` is always (max_num_reqs,), so this has
+        exactly one static trace (warmed once in precompile()).
+
+        Args:
+          ctx_buf:    (max_num_reqs, buf_len, D) bf16 buffer (donated).
+          gather_src: (max_num_reqs,) int32 source slot for each destination
+                      slot; the identity for unmoved/new slots.
+        """
+        return ctx_buf[gather_src]
+
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _sample_block_draft_tokens(
         self,
@@ -359,16 +396,61 @@ class DFlashTorchaxProposer:
         # ignored). The scheduler may batch up to max_num_reqs requests.
         num_reqs = self.runner.input_batch.num_reqs
 
-        # Per-slot proposer state must reset when a slot's request changes;
-        # otherwise the previous request's hidden states would be treated as
-        # the new request's prefix.
+        # Per-slot proposer state must FOLLOW its request when vLLM compacts the
+        # batch. InputBatch.condense (and swap_states / _reorder_batch) run
+        # BEFORE the drafter each step, moving a still-running request from one
+        # physical slot to another (e.g. a finished low slot is backfilled by a
+        # long-running high slot). The per-slot state (_ctx_buf row, _ctx_len,
+        # _prev_seq_len) is keyed by physical slot, so a move desyncs it: the
+        # destination slot's req_id changes while its state still describes the
+        # old occupant. The OLD guard merely RESET _ctx_len[i]=0 on any req_id
+        # mismatch -- discarding the moved-in request's accumulated context and,
+        # worse, recomputing num_new against the full (large) accepted length on
+        # the next step (out-of-range write / crash). Instead, MIRROR the move:
+        # for each new slot i, find the OLD slot j that held the same req_id and
+        # gather that slot's full state (buffer row + host scalars) into i. Only
+        # genuinely-new req_ids (not present last step) are reset. This is purely
+        # layout-based, so it transparently handles condense moves, swaps, and
+        # chained/cyclic moves in one shot.
         req_ids = self.runner.input_batch.req_ids
-        for i in range(num_reqs):
+        old_slot_of: dict = {}
+        for j in range(self.max_num_reqs):
+            rid = self._last_req_id[j]
+            if rid is not None:
+                old_slot_of[rid] = j
+
+        # gather_src[i] = old slot whose request now occupies slot i (identity
+        # for unmoved/new slots). Drives a single device gather over _ctx_buf.
+        gather_src = np.arange(self.max_num_reqs, dtype=np.int32)
+        moved = False
+        new_ctx_len = self._ctx_len.copy()
+        new_prev_seq_len = self._prev_seq_len.copy()
+        new_last_req_id: list[Optional[str]] = [None] * self.max_num_reqs
+        for i in range(self.max_num_reqs):
             cur = req_ids[i] if i < len(req_ids) else None
-            if cur != self._last_req_id[i]:
-                self._ctx_len[i] = 0
-                self._prev_seq_len[i] = 0
-                self._last_req_id[i] = cur
+            new_last_req_id[i] = cur
+            if cur is None:
+                continue
+            src = old_slot_of.get(cur)
+            if src is None:
+                # Brand-new request in this slot: reset its host state. Its
+                # buffer row is left as-is (gather identity); ctx_len 0 means
+                # every stale row is attention-masked, so contents are inert.
+                new_ctx_len[i] = 0
+                new_prev_seq_len[i] = 0
+            elif src != i:
+                # Request moved src -> i: carry its full state along.
+                gather_src[i] = src
+                new_ctx_len[i] = self._ctx_len[src]
+                new_prev_seq_len[i] = self._prev_seq_len[src]
+                moved = True
+            # src == i: unmoved, keep existing state (identity gather).
+        self._ctx_len = new_ctx_len
+        self._prev_seq_len = new_prev_seq_len
+        self._last_req_id = new_last_req_id
+        if moved:
+            self._ctx_buf = self._permute_ctx_rows(
+                self._ctx_buf, device_array(self.mesh, gather_src))
 
         # accepted context length per request this step (host int array).
         seq_lens_host = np.asarray(jax.device_get(attn_metadata.seq_lens))
@@ -409,10 +491,28 @@ class DFlashTorchaxProposer:
             if num_new <= 0:
                 self._ctx_len[i] = seq_len
                 continue
+            # Hard backstop against overrunning raw_hidden's query segment for
+            # this request: raw_hidden only holds THIS step's query rows
+            # [qsl[i] : qsl[i+1]) for slot i. With the condense-move fix above,
+            # _ctx_len[i] follows the request so num_new == seg_width in steady
+            # state; clamping num_new to seg_width here makes that an invariant
+            # rather than an assumption (any residual desync degrades acceptance
+            # for that request but can never crash or write cross-request rows).
+            # _ctx_len advances by exactly n_copy (== num_new after the clamp),
+            # so bookkeeping stays consistent with what was written.
+            seg_start = int(qsl_host[i])
+            # Segment end = next request's start; for the last request (or a
+            # degenerate query_start_loc that omits the trailing offset) it is
+            # the end of raw_hidden. query_start_loc is the CSR offset form
+            # (sized max_num_reqs + dp_size at runtime) so qsl_host[i+1] is
+            # normally in-bounds; the fallback keeps this robust either way.
+            seg_end = (int(qsl_host[i + 1])
+                       if i + 1 < len(qsl_host) else total_tokens)
+            seg_width = seg_end - seg_start
+            num_new = min(num_new, seg_width)
             ctx_len_i = int(self._ctx_len[i])
             end = min(ctx_len_i + num_new, self.max_model_len)
             n_copy = end - ctx_len_i
-            seg_start = int(qsl_host[i])
             # Source rows [seg_start : seg_start+n_copy) -> slot i, dest rows
             # [ctx_len_i : ctx_len_i+n_copy). (Bit-identical to the eager
             # dynamic_update_slice that copied these same rows.)
