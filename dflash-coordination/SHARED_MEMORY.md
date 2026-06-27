@@ -8,6 +8,20 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][bench-v3] **FIRST TRUSTWORTHY A-vs-B SPEED VERDICT: DFlash is ~2.90x SLOWER than
+  target-only at the GOAL bench point (in=1, out=4096, c=32, WARM cache, total=96 reqs so
+  backfill/condense fires). ⇒ NEEDS_IMPL.** A(DFlash)=1309.79 sys out tok/s, TPOT 0.111s, mean
+  latency 86.7s; B(target-only)=3792.80 sys out tok/s, TPOT 0.0084s, mean latency 34.6s. NO CRASH
+  (the 09 dflash.py:421 broadcast crash is GONE under real condense/backfill at out=4096/c=32 —
+  confirms 10-impl-condense's fix holds end-to-end). 96/96 ok both configs, all exactly 4096 tok;
+  same target (byte-identical greedy probe). DFlash accept HEALTHY ~5.0-6.2/step at full c=32 (tail
+  to 6.7), per-pos 0.85→0.40 ⇒ PERF gap, not accept. DFlash ALSO loses latency here (2.5x worse) —
+  the "spec wins latency" hypothesis does NOT hold at c=32 (target step already cheap+batched).
+  Write fix (6b6acd49) helped (corrupt-07 358 → 1310, 3.7x), but the ONLY remaining lever is
+  **LEVER #1: KV-cache the O(ctx) draft recompute** (draft recomputes fc+8 attn over the FULL
+  context every step, TPOT 13.2x). Need ~2.2x step speedup to flip A>B; KV cache removes the O(ctx)
+  term entirely. ⇒ the 07 "10.6x / 358 tok/s" A-number is now SUPERSEDED (it was silently corrupt);
+  THIS is the honest baseline. HBM: A 39.73 / B 24.07 GiB (not the gap). Details: 11-bench-c32-v3.md.
 - [2026-06-27][impl-condense] **CONDENSE/SLOT DESYNC FIXED + VERIFIED ACROSS A REAL CONDENSE EVENT ⇒
   NEEDS_BENCH.** The 09 out=4096/c=32 broadcast crash (dflash.py:421) is GONE. PROPER fix (b94fc366,
   found already-committed from a prior session): mirror vLLM InputBatch.condense slot-moves onto the
@@ -38,16 +52,9 @@
   ~250-334ms), DOMINATED by the O(ctx) fc/attn forward = **LEVER #1 (KV-cache the context),
   next round** — breaks even only for C≲2k, 99ms at C=4608. Details: 08-impl-perf.md.
   Chip task_d0ad4933 (the donated-write task) is DONE.
-- [2026-06-27][bench-c32] **SPEED VERDICT: DFlash is ~10.6x SLOWER than target-only at the
-  GOAL bench point (in=1, out=4096, c=32, WARM cache).** A(DFlash)=358.65 sys out tok/s,
-  TPOT 0.317s; B(target-only)=3788.53 sys out tok/s, TPOT 0.0084s. Per-step is ~37x slower.
-  Acceptance is HEALTHY (mean ~5.5/step at full c=32, per-pos 0.85→0.52) ⇒ this is a PERF
-  bug, not accept/correctness. ⇒ Phase-1 SPEED requirement FAILS as-is → NEEDS_IMPL (perf).
-  Bottlenecks (07-bench-c32.md): (1) dflash.py:~324 eager non-donated _ctx_buf
-  dynamic_update_slice inside a 32x per-req loop (full ~4GiB copy/step); (2) STATELESS draft
-  recomputes fc+8 attn over the FULL context every step (O(ctx), grows with out len, no KV
-  cache); (3) per-step device_get host syncs. Both servers gave byte-identical greedy probe
-  output (same target). HBM is NOT the gap (A 39.7 / B 24.1 GiB total).
+- [2026-06-27][bench-c32] (SUPERSEDED by bench-v3 above — the "10.6x / 358 tok/s" A was a
+  silently-corrupt run; B=3788.53 tok/s / TPOT 0.0084 was the honest target-only and matches
+  bench-v3's B. Bottleneck map preserved in 07-bench-c32.md if needed.)
 - [2026-06-26][L1-seed] Branch `dflash` has substantial prior DFlash work. `STATE.md`
   at repo root documents a claimed "working DFlash gpt-oss-20b serve recipe". Recent
   commits fixed: 0% accept (project draft logits through target lm_head, not input
