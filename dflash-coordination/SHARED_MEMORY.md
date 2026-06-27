@@ -8,6 +8,22 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][bench-sweep] **num_spec LEVER EXHAUSTED — KV-cache DFlash PLATEAUS ~1300 sys out tok/s,
+  still ~2.89x SLOWER than target-only at the GOAL bench point ⇒ NEEDS_IMPL.** Decisive A(KV_CACHE=1,
+  util 0.6)-vs-B(target-only, util 0.75) sweep at in=1/out=4096/c=32, WARM, total=96, 96/96 ok both,
+  ZERO preemption/recompute/OOM on any run (KV blocks fit easily at 0.6: max-conc 341x). Sweep
+  num_spec → sys out tok/s: **5→1226.57, 7→1297.14, 10→1303.34** (PLATEAU for ns≥7, DROPS below 7;
+  opt=**7**). B re-measured SAME-SESSION = **3752.20 tok/s** (TPOT 0.00852, lat 34.93s) — matches prior
+  3793 within 1%, gap is real. Best A (ns7) = 1297 tok/s / TPOT 0.105 / lat 82.96s ⇒ 2.89x slower
+  throughput AND 2.37x worse latency (spec-wins-latency hypothesis still FALSE at c=32). MECHANISM
+  (decisive): at ns=10 the draft's per-position accept for positions 8/9/10 is EXACTLY 0.000 — draft
+  EFFECTIVE depth caps at ~7 (block_size B=8), so ns≥7 all degenerate to the same draft = same ~1300;
+  ns<7 throws away genuinely-accepted pos 5-7. So "lower num_spec → higher throughput" theory is FALSE:
+  cutting B lowers the O(C·B) attn-score matmul but lowers acceptance ~proportionally. 12-impl's
+  microbench confirmed: KV cache killed the O(C) PROJECTION but the **O(C·B) ATTENTION-SCORE matmul**
+  STAYS + now dominates (52/59ms @C=4608). ⇒ num_spec is DEAD as a lever; remaining lever is HARDER:
+  reduce the O(ctx) draft attention-SCORE matmul itself (sparse/windowed draft attn or cheaper kernel),
+  NOT a config knob. Details: 14-bench-sweep.md.
 - [2026-06-27][test-kvcache] **FLAG-ON (DFLASH_KV_CACHE=1) SERVE PATH VERIFIED LOSSLESS ⇒ NEEDS_BENCH.**
   GOAL config (c=32, len4224, EP, v1, no-async, torchax draft, num_spec 7). (1) PERFECT-DRAFT THROUGH
   CONDENSE 100% per-slot: 21 metrics windows ALL mean 8.00 / per-pos 1.000×7 / Accepted==Drafted across a
