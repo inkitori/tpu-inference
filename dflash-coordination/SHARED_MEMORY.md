@@ -8,22 +8,22 @@
 >   true and lean.
 
 ## Current best-known status
-- [2026-06-27][impl-headshard] **HEAD-SHARD LANDED IN CODE (88862fdb) but WEIGHT-SHARDING ALONE DID NOT
-  TAKE EFFECT on the torchax path — XLA all-gathers the heads back to replicated ⇒ ZERO speedup (cached
-  fwd 85→84ms). FIX IN PROGRESS: add with_sharding_constraint (EDIT 4).** Landed: reshard q/k/v_proj.weight
-  →P(ATTN_HEAD,None), o_proj.weight→P(None,ATTN_HEAD) in DFlashTorchaxWrapper.load; KVH-shard the K/V cache
-  + kv_project out (models/vllm/dflash.py + spec_decode/vllm/dflash.py). Unit tests 17/17. ROOT CAUSE
-  (decisive HLO dump, scratchpad/probe_hlo.py): the torchax `.view(n,b,nh,hd)` + repeat_kv's
-  `.expand().reshape()` cross the sharded head axis ⇒ XLA inserts 72 all-gathers + 24 all-reduces (incl
-  all-gather bf16[32,64,64,4104] = the SCORES tensor gathered back to all 64 heads, + the KV cache gathered
-  back to full KVH), runs the score matmul REPLICATED. PROOF the math IS ~10x when sharding holds: isolated
-  JAX attn stack (scratchpad/probe_headshard_components.py) = 0.44ms head-sharded vs 4.27ms replicated =
-  9.6x, score tensor correctly P(None,'model',None,None). So the SPEEDUP IS REAL but needs explicit
-  with_sharding_constraint pinning q (post-view) + k/v (post-repeat_kv) + cached k/v to the head axis so XLA
-  stops gathering. Numerics: greedy-argmax 100% (it's currently the SAME replicated computation). Projection
-  to beat B=3752 holds IF the fwd actually drops. NOTE the ~84ms fwd is C-linear all-gather/repeat_kv
-  materialization, NOT score FLOPs (attn only ~4ms even replicated). Probes pushed (02199850).
-  ⇒ NEEDS_IMPL: add with_sharding_constraint inside _draft_forward_cached. Details: 19-impl-headshard.md.
+- [2026-06-27][impl-headshard] **HEAD-SHARD LANDED via jax.shard_map — cached draft fwd 83.8→9.7ms (8.6x),
+  BIT-EXACT (max|diff| 0.0, greedy-argmax 100%), all-gathers 72→0, full context KEPT (accept stays ~6) ⇒
+  the draft attn is NO LONGER the bottleneck; binding constraint is now Lever B (~40ms FIXED overhead).**
+  Fix (commit 36ecb75c): replaced eager_attention_forward in _draft_forward_cached with `_sharded_attention`
+  = jax.shard_map over the 'model' axis (each chip does nh/8=8 q-heads + kvh/8=1 kv-head: GQA expand, q@k^T·
+  scaling+mask, f32 softmax→bf16, scores@v, sharded-o_proj contraction, psum). o_proj bias added by caller
+  once. K/V cache + kv_project out KVH-axis sharded (condense-safe: writes/moves index slot/row not KVH).
+  ROOT CAUSE the weight-sharding (88862fdb) + with_sharding_constraint (_pin, reverted cc735253) FAILED:
+  GSPMD all-gathers q at `q_proj(hs).view(N,B,nh,hd)` (splits the model-sharded nh*hd axis → gathers) and at
+  repeat_kv's reshape (the SCORES); a constraint only re-slices the already-gathered tensor (even +3 gathers).
+  shard_map gives each chip no freedom to gather. PROJECTION vs B=3752 (full-ctx, step=FIXED+verify9.08+
+  draft16.78; accept6): FIXED40(today) 0.78x, FIXED25 **1.01x**, FIXED15 **1.25x**, FIXED8 **1.51x**;
+  accept5: FIXED15 1.04x. ⇒ head-shard alone (FIXED~40) still LOSES; **need Lever B to cut FIXED≤15-25ms —
+  but now WITHOUT windowing (full ctx kept, accept ~6), which is the full-context win 16-impl asked for.**
+  NEEDS_TEST: real serve perfect-draft-through-condense + greedy-vs-target lossless re-verify (attn formul.
+  changed), THEN Lever B + serve bench. Probes pushed. Details: 19-impl-headshard.md.
 
 - [2026-06-27][redteam-attn] **17's "FLOP-bound dead end" is FALSE — the draft attn is REPLICATION/
   MEMORY-bound and ~60x FIXABLE ⇒ ACHIEVABLE, NEEDS_IMPL.** Physics: useful attn FLOPs 1.55e11 ⇒ floor
@@ -45,25 +45,12 @@
   models/vllm/dflash.py (shard Hq on MLP_TENSOR; exact per-head), (2) GQA-native+bf16 scores [keep softmax
   f32 — pure-bf16 softmax SIGSEGVs the v6e conv-emitter; use lax.dot_general], (3) Lever B overhead cut.**
   Microbenches committed (0333f8fa, 32264ef4); source untouched. Details: 18-redteam-attn.md.
-- [2026-06-27][impl-window] **LEVER A (windowing) IS A DEAD END — kills acceptance ⇒ BLOCKED_USER.
-  LEVER B landed + sound (KEEP).** Lever A (windowed draft attn, env `DFLASH_DRAFT_WINDOW=W`, KV path,
-  default 0=off): per-slot GATHER cached K/V to last W ctx positions before the score matmul. The
-  isolated microbench was great — windowed cached fwd FLAT ~14.2ms@W=256 / 17.5@W=512 (vs full-ctx
-  cached 26→86ms) = ~6x cut. **BUT the real-draft serve ACCEPTANCE check is DECISIVE: mean accept
-  collapses 6.0–6.7 → ~2.5 at BOTH W=256 AND W=512 (window-insensitive ⇒ INTRINSIC, not a knob).**
-  At accept 2.5 the projection LOSES at every overhead: W=256 → 0.74x B @FIXED8, 0.60x @FIXED15.
-  The DFlash draft genuinely USES its long context; truncating it makes a much worse predictor and the
-  lost tokens dwarf the per-step savings. ⇒ **Lever A REJECTED on evidence — 15-feasibility's two-lever
-  plan is INVALID** (its accept-drop note assumed accept stayed ≳4; real drop is to 2.5). DEAD END: do
-  NOT window the DFlash draft attn. Windowed serve DID come up clean at c=32 (path runtime-OK). LEVER B
-  (numerics-NEUTRAL, KEEP): _ctx_buf is written but NEVER read on the KV path — DROP its alloc (frees
-  ~3.96 GiB → util 0.75 fits, kills 13-test HBM blocker), per-step _batched_ctx_write, condense
-  _move_ctx_rows + warms; BATCH the 2 device_gets into 1. Does NOT touch proposals (full-ctx accept
-  stays ~6). Flag-off path byte-unchanged. Unit tests 17/17. ⇒ **BLOCKED_USER / NEEDS_IMPL: the path to
-  beat B needs a CHEAPER FULL-CONTEXT draft attn (e.g. flash/RPA Pallas kernel for the draft q@k^T
-  instead of eager HF), NOT windowing** — full-ctx num_spec sweep already PLATEAUS ~1300 (Lever B alone
-  won't beat B). Note: at c=32 the target is weight-bound+batched (B=3752); spec-decode's natural win
-  is LOW concurrency. Code in-tree flag-OFF (harmless). Commits c620d4cd, 28f9a432, de781d72.
+- [2026-06-27][impl-window] **LEVER A (windowing) DEAD (kills accept 6→2.5, window-insensitive). LEVER B
+  landed + sound (KEEP). Its open question "need a cheaper FULL-CONTEXT draft attn, not windowing" is now
+  ANSWERED by impl-headshard (shard_map).** Lever B (numerics-NEUTRAL, KEEP): on the KV path _ctx_buf is
+  written but never read — DROP its alloc (frees ~3.96 GiB → util 0.75 fits), drop per-step
+  _batched_ctx_write + condense _move_ctx_rows + warms; BATCH the 2 device_gets into 1. Does NOT touch
+  proposals (accept ~6). Flag-off byte-unchanged. Unit tests 17/17. Commits c620d4cd, 28f9a432, de781d72.
   Details: 16-impl-window.md.
 - [2026-06-27][feasibility] **FEASIBLE at c=32 — target VERIFY is NOT the ceiling — but needs TWO
   levers, not one ⇒ NEEDS_IMPL.** Decisive isolated 8-chip microbench (target gpt-oss-20b, batch 32):
@@ -106,14 +93,10 @@
   byte-identical, ZERO step-1/2 / factual-answer divergences, all divergences deep post-answer + SWAP-
   SYMMETRIC (same branch appears on target-only too) = batch-position bf16 near-tie present in target-only
   too (same confound 10-impl-condense accepted). (3) ACCEPTED LENGTH cache-ON ~6.3-6.9 steady-state = AT/
-  ABOVE the ~5-6 without the cache ⇒ cache did NOT degrade acceptance. **HBM GOTCHA (not a correctness
-  bug, but BLOCKS the bench at util 0.75):** flag-ON allocates BOTH the old _ctx_buf (3.96 GiB) AND the new
-  K/V cache (2.25 GiB) — 12-impl-kvcache keeps _ctx_buf "for cross-check" and flagged dropping it as not-
-  done — so the jit__batched_ctx_write transient (3.97 GiB) OOMs at util 0.75 at FIRST decode. Workaround:
-  serve flag-ON at util ≤ 0.6 (these correctness runs did; losslessness is util-independent). FIX for bench:
-  DROP _ctx_buf on the flag-on path (net -1.7 GiB per impl's own math) → then 0.75 fits. ⇒ NEEDS_BENCH: A
-  (KV_CACHE=1) vs B(target-only) at out=4096/c=32 (drop _ctx_buf OR util≤0.6) + sweep num_spec DOWN from 7
-  to clear the ~7% marginal flip. Details: 13-test-kvcache.md.
+  ABOVE the ~5-6 without the cache ⇒ cache did NOT degrade acceptance. (HBM gotcha — both _ctx_buf + K/V
+  cache allocated — RESOLVED by Lever B dropping _ctx_buf on the flag-on path.) NOTE: this lossless verify
+  predates the head-shard attn-formulation change ⇒ a re-verify on the sharded path is needed (NEEDS_TEST).
+  Details: 13-test-kvcache.md.
 - [2026-06-27][impl-kvcache] **LEVER #1 (KV-cache the O(ctx) draft recompute) LANDED + microbench-proven
   + token-equivalent ⇒ closes ~the whole 2.90x gap but MARGINAL (lands ~7% short of flipping A>B alone;
   num_spec-down is the next lever).** Flag-gated `DFLASH_KV_CACHE=1` (default OFF, live path UNCHANGED).
@@ -132,9 +115,7 @@
   alongside as cross-check now). ⇒ NEEDS_TEST (real serve-path perfect-draft c=32 + greedy-vs-target
   with flag ON) then NEEDS_BENCH with num_spec tuned DOWN to clear the marginal flip. Commits ebb2b44c,
   39e2f91f, e1fa4115, d7a4300b, b5d5c7b4. Details: 12-impl-kvcache.md.
-- [2026-06-27][bench-v3] First trustworthy A-vs-B (in=1/out=4096/c=32, WARM): A=1310 vs B=3793 ⇒ ~2.90x
-  slower, accept HEALTHY ~5-6 ⇒ PERF gap not accept (07's "358/10.6x" was corrupt). Superseded by
-  bench-sweep (B=3752 authoritative). Details: 11-bench-c32-v3.md.
+- [2026-06-27][bench-v3] Superseded by bench-sweep (B=3752 authoritative). Details: 11-bench-c32-v3.md.
 - [2026-06-27][impl-condense] **CONDENSE/SLOT DESYNC FIXED + VERIFIED ACROSS A REAL CONDENSE EVENT ⇒
   NEEDS_BENCH.** The 09 out=4096/c=32 broadcast crash (dflash.py:421) is GONE. PROPER fix (b94fc366,
   found already-committed from a prior session): mirror vLLM InputBatch.condense slot-moves onto the
@@ -154,13 +135,8 @@
   0.716→0.148 / light ~0.96→0.64). CPU bit-identical check (swap/cycle/padding) PASS, unit tests 5/5 +
   5/5. ⇒ the 07 "358 tok/s / 10.6x" A-number stays UNRELIABLE (silently-corrupt run); re-bench A vs B
   at out=4096/c=32 is now FINALLY trustworthy. Details: 10-impl-condense.md.
-- [2026-06-27][impl-perf] **LEVER #2 (write fix) LANDED — commit 6b6acd49.** Replaced the
-  eager 32x lax.dynamic_update_slice loop in dflash.py prepare_inputs() with ONE jitted+donated
-  masked-scatter `_batched_ctx_write` (in-place). ISOLATED microbench: per-step _ctx_buf WRITE
-  ~234ms → **~2.2ms (~106x)** at decode on the real 8-chip mesh. **BIT-IDENTICAL** to the old
-  loop (np.array_equal full buffer, all edge cases) — but it TOUCHED the proven write path ⇒
-  per GOAL, NEEDS_TEST (re-run perfect-draft b=32 lossless before trusting). **HBM UNCHANGED**
-  at GOAL. Unit tests 5/5. Details: 08-impl-perf.md.
+- [2026-06-27][impl-perf] LEVER #2 (write fix) LANDED — 6b6acd49: per-step _ctx_buf write 234→2.2ms
+  (~106x), bit-identical (jitted+donated masked-scatter _batched_ctx_write). Details: 08-impl-perf.md.
 - [2026-06-26][L1-seed] Branch `dflash` has substantial prior DFlash work (STATE.md recipe). Correctness
   is DONE (see below); the open question was always SPEED at the bench point — now answered: BLOCKED (the
   draft step is FLOP-bound dense attn that no in-scope lever can cheapen at c=32/full-context).
@@ -263,5 +239,10 @@
   KERNEL is dead (flash slower at this q=8 shape; target RPA is paged+hard-causal). BUT 17's broader
   "FLOP-bound, BLOCKED_USER" conclusion was WRONG — see redteam-attn above: the attn is REPLICATION-bound,
   head-sharding it (NOT a kernel swap) is ~60x. Do NOT pursue flash; DO head-shard + GQA-native the eager path.
+- [2026-06-27][impl-headshard] HEAD-SHARDING the draft attn via WEIGHT-SHARDING ALONE or
+  with_sharding_constraint (_pin) is DEAD on the torchax path — GSPMD all-gathers q back to 64 heads at the
+  `q_proj(hs).view(N,B,nh,hd)` reshape (splits the model-sharded nh*hd axis) and at repeat_kv's reshape; a
+  constraint just re-slices the already-gathered tensor (can even add gathers). USE jax.shard_map over the
+  'model' axis (the landed fix, _sharded_attention) — it gives each chip no freedom to gather. 8.6x, bit-exact.
 - [2026-06-27][bench-sweep] num_spec as a throughput lever: plateaus ~1300 (ns≥7 degenerate to same draft;
   ns<7 throws away accepted pos 5-7). Cutting B lowers accept ~proportionally to the matmul savings.
