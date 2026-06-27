@@ -235,8 +235,11 @@ class DFlashTorchaxWrapper:
         """
         model = self.model
 
+        # Output is 3-D (N, block_size, D). MLP_DATA (= mesh 'data') is size 1
+        # at DP=1 so the leading request axis is replicated (no divisibility
+        # constraint on N); block + hidden stay replicated.
         hidden_sharding = NamedSharding(
-            self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, None))
+            self.mesh, PartitionSpec(ShardingAxisName.MLP_DATA, None, None))
 
         @functools.partial(jax.jit, out_shardings=hidden_sharding)
         def draft_forward(
@@ -248,21 +251,25 @@ class DFlashTorchaxWrapper:
             attention_mask: jax.Array,
         ) -> jax.Array:
             with torchax.default_env():
+                # All inputs carry a leading request axis N (>= 1):
+                #   noise_input_ids (N, B), target_hidden (N, C, D'),
+                #   position_ids (N, C+B), attention_mask (N, C+B).
                 p = torch_view(params)
-                noise_ids_t = torch_view(noise_input_ids).unsqueeze(
-                    0)  # (1, B)
+                noise_ids_t = torch_view(noise_input_ids)  # (N, B)
                 embed_w_t = torch_view(embed_weight)
                 noise_emb = torch.nn.functional.embedding(
-                    noise_ids_t, embed_w_t)  # (1, B, D)
+                    noise_ids_t, embed_w_t)  # (N, B, D)
 
-                target_h = torch_view(target_hidden).unsqueeze(0)  # (1, C, D')
-                pos = torch_view(position_ids).unsqueeze(0)  # (1, C+B)
+                target_h = torch_view(target_hidden)  # (N, C, D')
+                pos = torch_view(position_ids)  # (N, C+B)
                 # attention_mask is an additive float bias (bf16) of shape
-                # (C+B,). Reshape to (1, 1, 1, C+B) so it broadcasts over the
-                # KEY (last) axis of attn_weights (1, H, B, C+B) in the HF
-                # eager_attention_forward add -- masks keys, never queries.
-                mask = torch_view(attention_mask).reshape(1, 1, 1,
-                                                          -1)  # (1,1,1,C+B)
+                # (N, C+B). Reshape to (N, 1, 1, C+B) so it broadcasts over the
+                # head + query axes of attn_weights (N, H, B, C+B) in the HF
+                # eager_attention_forward add -- masks keys per request, never
+                # queries.
+                mask_t = torch_view(attention_mask)  # (N, C+B)
+                mask = mask_t.reshape(mask_t.shape[0], 1, 1,
+                                      mask_t.shape[1])  # (N,1,1,C+B)
 
                 output = torch.func.functional_call(
                     model,
@@ -275,8 +282,8 @@ class DFlashTorchaxWrapper:
                     },
                     tie_weights=False,
                 )
-                # output: (1, block_size, D) → squeeze batch dim
-                return jax_view(output.squeeze(0))
+                # output: (N, block_size, D)
+                return jax_view(output)
 
         return draft_forward
 
@@ -322,9 +329,12 @@ class DFlashTorchaxWrapper:
         """
         model = self.model
 
+        # Batched: hidden in (N, num_spec, D) -> logits (N, num_spec, vocab).
+        # Leading request axis on MLP_DATA (size 1 -> replicated at DP=1);
+        # vocab stays tensor-parallel on MLP_TENSOR exactly as before.
         logits_sharding = NamedSharding(
             self.mesh,
-            PartitionSpec(ShardingAxisName.MLP_DATA,
+            PartitionSpec(ShardingAxisName.MLP_DATA, None,
                           ShardingAxisName.MLP_TENSOR))
 
         @functools.partial(jax.jit, out_shardings=logits_sharding)

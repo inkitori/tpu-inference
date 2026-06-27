@@ -101,15 +101,15 @@ class SpeculativeDecodingManager:
                 self.runner.input_batch.token_ids_cpu)
         elif self.runner.speculative_config.method == "dflash":
             # Must precede use_eagle(); vLLM's use_eagle() matches "dflash".
-            # DFlash drafts on host and supports only single-seq, sync, non-DP;
-            # reject the configs whose draft-length layout it does not handle.
+            # DFlash drafts on host. Batched (multi-request) decode IS now
+            # supported via per-slot context buffers in the proposer; sync +
+            # non-DP are still required (the host-side draft-length layout does
+            # not handle the async device-array or per-rank DP layouts).
             assert input_ids is not None
             assert not async_scheduling, \
                 "DFlash does not support async scheduling"
             assert self.runner.dp_size == 1, \
                 "DFlash does not support attention data parallelism"
-            assert self.runner.input_batch.num_reqs <= 1, \
-                "DFlash does not support batched (multi-request) decoding"
             valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
                 self.runner, spec_decode_metadata, sampled_output,
                 logits_indices_selector, discard_sampled_tokens_req_indices,
