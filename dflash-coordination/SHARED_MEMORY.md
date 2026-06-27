@@ -8,6 +8,22 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][test-kvcache] **FLAG-ON (DFLASH_KV_CACHE=1) SERVE PATH VERIFIED LOSSLESS ⇒ NEEDS_BENCH.**
+  GOAL config (c=32, len4224, EP, v1, no-async, torchax draft, num_spec 7). (1) PERFECT-DRAFT THROUGH
+  CONDENSE 100% per-slot: 21 metrics windows ALL mean 8.00 / per-pos 1.000×7 / Accepted==Drafted across a
+  hard condense event (fire_condense 64, finish spread 254s) ⇒ the per-slot K/V cache + its condense-move
+  keep verify aligned through backfill. (2) GREEDY real-draft cache-ON vs target-only: LOSSLESS — 24/64
+  byte-identical, ZERO step-1/2 / factual-answer divergences, all divergences deep post-answer + SWAP-
+  SYMMETRIC (same branch appears on target-only too) = batch-position bf16 near-tie present in target-only
+  too (same confound 10-impl-condense accepted). (3) ACCEPTED LENGTH cache-ON ~6.3-6.9 steady-state = AT/
+  ABOVE the ~5-6 without the cache ⇒ cache did NOT degrade acceptance. **HBM GOTCHA (not a correctness
+  bug, but BLOCKS the bench at util 0.75):** flag-ON allocates BOTH the old _ctx_buf (3.96 GiB) AND the new
+  K/V cache (2.25 GiB) — 12-impl-kvcache keeps _ctx_buf "for cross-check" and flagged dropping it as not-
+  done — so the jit__batched_ctx_write transient (3.97 GiB) OOMs at util 0.75 at FIRST decode. Workaround:
+  serve flag-ON at util ≤ 0.6 (these correctness runs did; losslessness is util-independent). FIX for bench:
+  DROP _ctx_buf on the flag-on path (net -1.7 GiB per impl's own math) → then 0.75 fits. ⇒ NEEDS_BENCH: A
+  (KV_CACHE=1) vs B(target-only) at out=4096/c=32 (drop _ctx_buf OR util≤0.6) + sweep num_spec DOWN from 7
+  to clear the ~7% marginal flip. Details: 13-test-kvcache.md.
 - [2026-06-27][impl-kvcache] **LEVER #1 (KV-cache the O(ctx) draft recompute) LANDED + microbench-proven
   + token-equivalent ⇒ closes ~the whole 2.90x gap but MARGINAL (lands ~7% short of flipping A>B alone;
   num_spec-down is the next lever).** Flag-gated `DFLASH_KV_CACHE=1` (default OFF, live path UNCHANGED).
