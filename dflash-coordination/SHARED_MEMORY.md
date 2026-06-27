@@ -8,26 +8,26 @@
 >   true and lean.
 
 ## Current best-known status
-- [2026-06-27][impl-attnkernel] **EFFICIENT-KERNEL LEVER IS A DEAD END — the draft attn is FLOP-BOUND,
-  flash is ~1.7x SLOWER ⇒ BLOCKED_USER. ALL attention-cost levers now exhausted.** Tried to route the
-  draft's full-context attn through an efficient TPU kernel (the last lever). (1) The TARGET's kernel
-  `ragged_paged_attention_hd64` is DOUBLY BLOCKED: strictly PAGED (draft cache is contiguous per-slot) +
-  HARD-CAUSAL with no override (can't express the draft's BIDIRECTIONAL 8-query noise block). (2)
-  `flash_attention` (contiguous, the kernel the JAX-native DFlash path already uses) CAN reproduce the
-  exact math (causal=False + additive `ab` mask; max|eager−flash|=1.17e-2 bf16 ⇒ accept WOULD be
-  preserved) BUT is ~1.7x SLOWER at every C on the real 8-chip mesh: eager_8L vs flash_8L =
-  5.4/15.4(C512) … 48.8/84.0(C4608) = 0.35–0.58x. (3) ROOT CAUSE (decisive): the draft attn is
-  FLOP-BOUND on q@k^T (~30ms) + scores@V (~18ms) dense matmuls over GQA-expanded 64-head K/V — flash has
-  the SAME FLOPs; at q-len B=8 it runs N·Hq=2048 tiny one-shot tiles whose launch/VMEM overhead dominates,
-  and there's no big score matrix to fuse. Projected flash cached fwd ~96ms vs current ~59ms = WORSE.
-  Reconciles 12-impl: isolated eager_8L 48.8ms == the doc's ~52ms cached fwd ⇒ attention IS the whole
-  forward, now PROVEN FLOP-bound. ⇒ NO attention kernel reduces dense full-context FLOPs. Combined w/
-  windowing (REJECTED, accept→2.5) + num_spec (EXHAUSTED, plateau ~1300), the FLOPs only shrink by cutting
-  C/B/Hq — all tried/failed. **BLOCKED_USER: the c=32 + full-context + this-draft frame is exhausted;
-  beating B needs a cheaper draft MODEL (fewer heads/layers/distilled), content-sparse attn (research +
-  custom kernel), or revisiting the c=32 requirement — a USER/L1 decision, not an in-scope kernel swap.**
-  Nothing wired into the draft forward (rejected at the microbench gate); only a committed microbench
-  script (no source touched, flag-off byte-unchanged). Commit b0b7e042. Details: 17-impl-attnkernel.md.
+- [2026-06-27][redteam-attn] **17's "FLOP-bound dead end" is FALSE — the draft attn is REPLICATION/
+  MEMORY-bound and ~60x FIXABLE ⇒ ACHIEVABLE, NEEDS_IMPL.** Physics: useful attn FLOPs 1.55e11 ⇒ floor
+  0.17ms @918TFLOP/s; measured eager 48.7ms = **0.35% of MXU peak** (a FLOP-bound kernel runs 30-70%,
+  never 0.35%). DECOMPOSE (real 8-chip): repeat_kv alone = 9.5ms @ 2285 GB/s = **139% of single-chip HBM
+  peak** (pure-memory smoking gun: the 8x GQA-expanded K/V is written then RE-READ by both matmuls);
+  f32-score materialization = +8ms (secondary). FIX (measured, real mesh, correct to bf16 max|diff|
+  1.9e-3): the draft attn runs REPLICATED (`PartitionSpec()`) so all 8 chips redundantly do all 64 heads
+  — **HEAD-SHARD the 64 q-heads 8/chip on the `model` axis (SAME eager math) = 48.78→1.49ms (33x)**; +
+  GQA-native K/V reads (KVH=8) + bf16 scores → **0.82ms (~60x)** @C=4608. 17 was wrong because its bench
+  compared two REPLICATED formulations (eager + flash) and never sharded the embarrassingly-parallel head
+  axis. Flash is NOT needed (replicated flash w/ sane tiling = 153ms WORSE than 17's 84; head-sharded
+  flash 17.7ms still loses to eager head-sharded — tiny q-block B=8). Head-sharding KEEPS FULL CONTEXT ⇒
+  accept stays ~6 (unlike windowing). PROJECTION (attn 52→~1ms; step=FIXED+verify9.08+draft~10): FIXED40
+  (today) 0.86x, **FIXED25 1.16x, FIXED15 1.50x, FIXED8 1.88x B=3752** (accept→5 sensitivity still clears
+  B once overhead cut). ⇒ this REVALIDATES 15's two-lever plan with a 60x (not 8x-windowing) draft lever;
+  the ONLY remaining gap is Lever B (cut the ~40ms FIXED host overhead, already scoped). NO new draft
+  model, NO sparse-attn research, NO dropping c=32. **NEEDS_IMPL: (1) head-shard the draft attn in
+  models/vllm/dflash.py (shard Hq on MLP_TENSOR; exact per-head), (2) GQA-native+bf16 scores [keep softmax
+  f32 — pure-bf16 softmax SIGSEGVs the v6e conv-emitter; use lax.dot_general], (3) Lever B overhead cut.**
+  Microbenches committed (0333f8fa, 32264ef4); source untouched. Details: 18-redteam-attn.md.
 - [2026-06-27][impl-window] **LEVER A (windowing) IS A DEAD END — kills acceptance ⇒ BLOCKED_USER.
   LEVER B landed + sound (KEEP).** Lever A (windowed draft attn, env `DFLASH_DRAFT_WINDOW=W`, KV path,
   default 0=off): per-slot GATHER cached K/V to last W ctx positions before the score matmul. The
@@ -115,10 +115,9 @@
   alongside as cross-check now). ⇒ NEEDS_TEST (real serve-path perfect-draft c=32 + greedy-vs-target
   with flag ON) then NEEDS_BENCH with num_spec tuned DOWN to clear the marginal flip. Commits ebb2b44c,
   39e2f91f, e1fa4115, d7a4300b, b5d5c7b4. Details: 12-impl-kvcache.md.
-- [2026-06-27][bench-v3] FIRST TRUSTWORTHY A-vs-B (in=1/out=4096/c=32, WARM): A(DFlash)=1310 tok/s
-  vs B(target)=3793 ⇒ ~2.90x slower. No crash, 96/96 ok both, accept HEALTHY ~5-6/step ⇒ PERF gap not
-  accept. DFlash also loses latency (2.5x). The honest baseline (07's "358/10.6x" was silently corrupt).
-  Details: 11-bench-c32-v3.md. (Superseded in number by bench-sweep below; same verdict.)
+- [2026-06-27][bench-v3] First trustworthy A-vs-B (in=1/out=4096/c=32, WARM): A=1310 vs B=3793 ⇒ ~2.90x
+  slower, accept HEALTHY ~5-6 ⇒ PERF gap not accept (07's "358/10.6x" was corrupt). Superseded by
+  bench-sweep (B=3752 authoritative). Details: 11-bench-c32-v3.md.
 - [2026-06-27][impl-condense] **CONDENSE/SLOT DESYNC FIXED + VERIFIED ACROSS A REAL CONDENSE EVENT ⇒
   NEEDS_BENCH.** The 09 out=4096/c=32 broadcast crash (dflash.py:421) is GONE. PROPER fix (b94fc366,
   found already-committed from a prior session): mirror vLLM InputBatch.condense slot-moves onto the
@@ -243,9 +242,9 @@
 ## Dead ends — do NOT repeat
 - [2026-06-27][impl-window] WINDOWING the draft attn (W≤512): craters accept 6→2.5 (window-insensitive,
   intrinsic). Loses at every overhead. The draft genuinely uses its long context.
-- [2026-06-27][impl-attnkernel] SWAPPING the draft attn to a flash/ragged/paged KERNEL: target's
-  ragged_paged_attention_hd64 is paged + hard-causal (can't fit the draft's contiguous bidirectional
-  8-query mask); flash_attention fits the math but is ~1.7x SLOWER (draft attn is FLOP-bound, q=8 tiny so
-  flash's tiny-tile overhead dominates + same FLOPs). No attention kernel cuts dense full-context FLOPs.
+- [2026-06-27][impl-attnkernel→redteam-attn CORRECTED] SWAPPING the draft attn to a flash/ragged/paged
+  KERNEL is dead (flash slower at this q=8 shape; target RPA is paged+hard-causal). BUT 17's broader
+  "FLOP-bound, BLOCKED_USER" conclusion was WRONG — see redteam-attn above: the attn is REPLICATION-bound,
+  head-sharding it (NOT a kernel swap) is ~60x. Do NOT pursue flash; DO head-shard + GQA-native the eager path.
 - [2026-06-27][bench-sweep] num_spec as a throughput lever: plateaus ~1300 (ns≥7 degenerate to same draft;
   ns<7 throws away accepted pos 5-7). Cutting B lowers accept ~proportionally to the matmul savings.
