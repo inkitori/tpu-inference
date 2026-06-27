@@ -310,7 +310,7 @@ def test_torchax_proposer_lifecycle_flow(mock_wrapper_cls, mesh):
     # Check outputs of Iteration 1. target_hidden_states now carries the FULL
     # persistent ctx buffer plus the static (num_reqs, padded_ctx); the active
     # sub-block is sliced inside the jitted draft forward.
-    (ctx_full_1, position_ids_1, attention_mask_1, num_reqs_1,
+    (ctx_full_1, position_ids_1, attention_mask_1, win_start_1, num_reqs_1,
      padded_ctx_1) = target_hidden_1
     # Padding size for 10 is 16; buffer keeps its full (max_num_reqs, buf_len, D)
     assert padded_ctx_1 == 16
@@ -383,7 +383,7 @@ def test_torchax_proposer_lifecycle_flow(mock_wrapper_cls, mesh):
             next_token_ids_2,
         )
 
-    (ctx_full_2, position_ids_2, attention_mask_2, num_reqs_2,
+    (ctx_full_2, position_ids_2, attention_mask_2, win_start_2, num_reqs_2,
      padded_ctx_2) = target_hidden_2
 
     # Proposer updates: seq_len is 11. Since 11 > ctx_len (10), no cropping of prefix.
