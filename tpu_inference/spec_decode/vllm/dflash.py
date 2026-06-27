@@ -150,8 +150,11 @@ class DFlashTorchaxProposer:
         # Warm every batch size the scheduler may produce so the batched
         # draft forward / sampler do not cold-compile at decode time. Both the
         # leading request axis N and the padded context width C are static in
-        # the JIT signature, so we sweep N x C.
-        batch_sizes = sorted({1, max_num_reqs})
+        # the JIT signature, so we sweep N x C. The active batch size
+        # fluctuates over the full [1, max_num_reqs] range during serving, and
+        # propose() runs inside maybe_forbid_compile -- any unwarmed N would
+        # hard-fail under VLLM_XLA_CHECK_RECOMPILATION (else stall mid-decode).
+        batch_sizes = list(range(1, max_num_reqs + 1))
         seq_lens = device_array(self.mesh,
                                 np.zeros((max_num_reqs, ), dtype=np.int32))
         next_token_ids = device_array(
