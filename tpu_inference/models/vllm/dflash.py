@@ -37,6 +37,85 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _sharded_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    mask: jax.Array,
+    o_weight: jax.Array,
+    scaling: float,
+    mesh: Mesh,
+) -> jax.Array:
+    """Head-parallel draft attention via ``jax.shard_map`` over the model axis.
+
+    Head-sharding the q/k/v/o projection WEIGHTS alone does NOT speed up the
+    torchax cached forward: XLA/GSPMD all-gathers q back to all 64 heads at the
+    ``q_proj(hs).view(N,B,nh,hd)`` reshape (it splits the model-sharded
+    ``nh*hd`` projection-output axis and chooses to gather), and ``repeat_kv``
+    merges the sharded KVH axis with ``n_rep`` in a reshape -- both force the
+    score matmul / softmax to run REPLICATED over all 64 heads. An 8-chip HLO
+    dump showed the killer all-gather ``bf16[N,64,B,C+B]`` (the SCORES tensor)
+    with ``op_name=aten::view/reshape``; cached fwd stayed ~84ms == replicated.
+    ``with_sharding_constraint`` pins do NOT prevent it -- the constraint is
+    satisfied by re-slicing the already-gathered replicated tensor.
+
+    ``shard_map`` is the fix: it forces each chip to compute ONLY its local
+    ``nh/8`` q-heads (and ``kvh/8`` kv-heads) with no freedom to all-gather --
+    an isolated 8-chip probe measured 0 all-gathers (vs 9) and a faster step.
+    Each shard does the GQA expand, ``q@k^T * scaling + mask``, f32 softmax,
+    ``scores@v``, and its slice of the ``o_proj`` matmul (o_weight is sharded on
+    the contraction axis ``P(None, 'model')``); the per-shard o_proj outputs are
+    summed with ``psum``. Numerically identical to ``eager_attention_forward``:
+    same scaling, additive mask, f32 softmax then back to bf16, same GQA expand.
+    The o_proj BIAS is added by the caller AFTER this (adding it per-shard would
+    multiply it by the shard count).
+
+    Args:
+        q: (N, nh, B, hd) post-RoPE query, model-sharded on the nh axis.
+        k, v: (N, kvh, C+B, hd) post-RoPE key / value, model-sharded on kvh.
+        mask: (N, 1, 1, C+B) additive bf16 bias (replicated).
+        o_weight: (D, nh*hd) o_proj weight, sharded P(None, 'model').
+        scaling: ``sa.scaling`` (head_dim ** -0.5).
+        mesh: the device mesh (model axis == ShardingAxisName.ATTN_HEAD).
+    Returns:
+        (N, B, D) o_proj output (no bias), replicated.
+    """
+    H = ShardingAxisName.ATTN_HEAD  # 'model'
+    n, nh, b, hd = q.shape
+    s = k.shape[2]
+
+    def _local(q_l, k_l, v_l, mask_l, ow_l):
+        # per-shard: q_l (N, nh/8, B, hd), k_l/v_l (N, kvh/8, S, hd),
+        # ow_l (D, nh*hd/8).
+        lnh = q_l.shape[1]
+        lkvh = k_l.shape[1]
+        rep = lnh // lkvh
+        ks = jax.numpy.broadcast_to(k_l[:, :, None],
+                                    (n, lkvh, rep, s, hd)).reshape(
+                                        n, lnh, s, hd)
+        vs = jax.numpy.broadcast_to(v_l[:, :, None],
+                                    (n, lkvh, rep, s, hd)).reshape(
+                                        n, lnh, s, hd)
+        aw = jax.numpy.matmul(q_l, jax.numpy.swapaxes(ks, 2, 3)) * scaling
+        aw = aw + mask_l  # (N, lnh, B, S)
+        aw = jax.nn.softmax(aw.astype(jax.numpy.float32),
+                            axis=-1).astype(q_l.dtype)
+        out = jax.numpy.matmul(aw, vs)  # (N, lnh, B, hd)
+        out = jax.numpy.swapaxes(out, 1, 2).reshape(n, b, lnh * hd)
+        out = jax.numpy.matmul(out, ow_l.T)  # (N, B, D) -- partial
+        return jax.lax.psum(out, axis_name=H)
+
+    P = PartitionSpec
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(P(None, H, None, None), P(None, H, None, None),
+                  P(None, H, None, None), P(), P(None, H)),
+        out_specs=P(),
+        check_vma=False,
+    )(q, k, v, mask, o_weight)
+
+
 class _DFlashRunner(torch.nn.Module):
     """Wrapper that adapts the HF DFlash model for ``functional_call``."""
 
@@ -211,8 +290,7 @@ class _DFlashRunner(torch.nn.Module):
         Returns:
             hidden_states: (N, B, D) draft output after the final norm.
         """
-        from transformers.models.qwen3.modeling_qwen3 import (
-            eager_attention_forward, rotate_half)
+        from transformers.models.qwen3.modeling_qwen3 import rotate_half
 
         cfg = self.dflash.config
         kvh = cfg.num_key_value_heads
@@ -254,20 +332,18 @@ class _DFlashRunner(torch.nn.Module):
             k = torch.cat([k_ctx, k_noise], dim=2)  # (N, KVH, C+B, hd)
             v = torch.cat([v_ctx, v_noise], dim=2)  # (N, KVH, C+B, hd)
 
-            # GQA expansion (KVH -> Hq) happens INSIDE eager_attention_forward;
-            # pass KVH-head k/v. Mask (N,1,1,C+B) broadcasts over (N,Hq,B,C+B).
-            attn_output, _ = eager_attention_forward(
-                sa,
-                q,
-                k,
-                v,
-                attention_mask,
-                scaling=sa.scaling,
-                dropout=0.0,
-                sliding_window=sa.sliding_window,
-            )
-            attn_output = attn_output.reshape(n, b, -1)
-            attn_output = sa.o_proj(attn_output)
+            # Head-parallel attention + o_proj via shard_map (see
+            # _sharded_attention). The plain eager_attention_forward path
+            # all-gathers the heads back to replicated under torchax; shard_map
+            # keeps each chip on its own nh/8 heads. Same math as eager: GQA
+            # expand, q@k^T * scaling + mask, f32 softmax, scores@v, o_proj.
+            o_weight = jax_view(sa.o_proj.weight)  # (D, nh*hd) P(None,'model')
+            attn_out_j = _sharded_attention(
+                jax_view(q), jax_view(k), jax_view(v),
+                jax_view(attention_mask), o_weight, sa.scaling, self._mesh)
+            attn_output = torch_view(attn_out_j)  # (N, B, D), no bias
+            if sa.o_proj.bias is not None:
+                attn_output = attn_output + sa.o_proj.bias  # replicated bias
             hidden_states = residual + attn_output
 
             residual = hidden_states
@@ -326,6 +402,8 @@ class DFlashTorchaxWrapper:
             hf_model.eval()
 
         self.model = _DFlashRunner(hf_model)
+        # The shard_map'd draft attention (_sharded_attention) needs the mesh.
+        self.model._mesh = self.mesh
         self.params = shard_model_to_tpu(self.model, self.mesh)
         # shard_model_to_tpu returns torchax tensors; convert to JAX view
         # so JAX JIT can trace through them.
