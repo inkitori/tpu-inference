@@ -46,6 +46,28 @@ correct prefix each (2,3,5,7,11; Rayleigh scattering; 4; red/blue; Charles Babba
 mean 8.00 | per-pos 1.000×7 | 100.0% | Accepted==Drafted. Totals: Accepted 672 / Drafted 672.
 ⇒ No ragged query_start_loc / per-slot context-buffer slicing regression.
 
-## Test 3 — greedy losslessness @ batch>1 (PENDING)
-Plan: spec-on (DFlash) vs target-only, a few concurrent greedy requests, compare token identity /
-agreement before first divergence; any divergence must be a genuine bf16 top-2 near-tie.
+## Test 3 — greedy losslessness @ batch>1
+Method: real DFlash (perfect-draft OFF) vs target-only, BOTH at concurrent batch=8, matched shape.
+Real DFlash accept curve at batch=8 was HEALTHY (mean 3.12-3.75, per-pos 0.79→0.04 monotone) ⇒
+drafter genuinely working at batch>1 (not degenerate).
+
+### (a) Full-completion compare (max_tokens=64, concurrent batch=8): 4/8 token-IDENTICAL.
+specon_out.json vs target_out.json. IDENTICAL for full 64 tokens: prompts capital-of-France (275ch),
+gold-symbol (242ch), sqrt-144 (285ch), first-president (298ch). The other 4 diverged DEEP
+(char 18/71/57/133 — dozens of tokens in, AFTER the correct factual answer), in conversational
+filler regions ("The" vs "Sure", "Apologies" vs "I apologize"). NONE at step 1-2 (GOAL: deep
+divergence on near-tie = FP-fine; step 1-2 = bug).
+
+### (b) Near-tie probe of the 4 divergences — CONFOUNDED for 2 of them.
+Re-feeding the agreed prefix as a fresh single-shot prompt to target-only: cases (sky-color/Water
+H2O) clean near-ties (gap 0.375 / 0.125 nats — textbook bf16). BUT for the prime-numbers and
+largest-planet cases, the target's single-shot argmax matched NEITHER path's next token — this is
+EXACTLY the re-prefill / request-shape numerics confound 02-test.md flagged: single-shot re-feed has
+different numerics than the incremental decode that produced the split. So the probe is NOT a valid
+oracle for those 2; its "NOT-A-TIE" on largest-planet is unreliable (measured a different forward).
+
+### (c) DECISIVE matched-shape step-1 oracle (the 02-test.md clean method, at batch>1): <PENDING>
+Fire identical concurrent batch=8 max_tokens=1 at BOTH servers from identical step-1 contexts ⇒
+both see identical request shape ⇒ any spec-on argmax != target-only argmax beyond a logged near-tie
+is a verifier bug. Target-only step-1 captured (target_step1.json): all 8 sensible argmax (Paris/Au/
+Jupiter/George/oxygen/red), gaps 0.06-5.1 nats. Awaiting spec-on step-1 (specon_step1.json) compare.
