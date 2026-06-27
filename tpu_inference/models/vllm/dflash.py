@@ -494,17 +494,22 @@ class DFlashTorchaxWrapper:
 
             draft_forward_cached(params, noise_input_ids, k_cache, v_cache,
                                  position_ids, embed_weight, attention_mask,
-                                 num_reqs, padded_ctx) -> hidden_states
+                                 win_start, num_reqs, padded_ctx)
+                -> hidden_states
 
         The DFLASH_KV_CACHE=1 analogue of ``get_draft_forward_fn``. Instead of
         the raw context buffer it consumes the FULL per-slot K/V caches
-        ``(L, max_num_reqs, buf_len, KVH, hd)`` and slices the active
-        ``[:, :num_reqs, :padded_ctx]`` sub-block INSIDE this jit (so XLA fuses
-        the slice and we never materialize a standalone copy of the caches).
-        ``num_reqs``/``padded_ctx`` are static so the trace shape is fixed (one
-        trace per (N, C), matching ``draft_forward``). Per-step compute is O(B):
-        only the B noise rows are projected; the context K/V come straight from
-        the caches. Output sharding matches ``draft_forward``.
+        ``(L, max_num_reqs, buf_len, KVH, hd)`` and GATHERS the active
+        ``(L, num_reqs, padded_ctx, KVH, hd)`` window INSIDE this jit (so XLA
+        fuses the gather and we never materialize a standalone copy of the
+        caches). ``win_start`` (N,) gives the per-slot start row of the window:
+        all-zeros == the plain ``[0:padded_ctx)`` prefix (Lever A off); else
+        ``max(0, ctx_len_i - W)`` selects the LAST ``W == padded_ctx`` context
+        positions (Lever A on), shrinking the O(C*B) attention-score matmul to
+        O(W*B). ``num_reqs``/``padded_ctx`` are static so the trace shape is
+        fixed (one trace per (N, C), matching ``draft_forward``). Per-step
+        compute is O(B): only the B noise rows are projected; the context K/V
+        come straight from the caches. Output sharding matches ``draft_forward``.
         """
         model = self.model
 
@@ -513,7 +518,7 @@ class DFlashTorchaxWrapper:
 
         @functools.partial(jax.jit,
                            out_shardings=hidden_sharding,
-                           static_argnums=(7, 8))
+                           static_argnums=(8, 9))
         def draft_forward_cached(
             params: dict,
             noise_input_ids: jax.Array,
@@ -522,14 +527,38 @@ class DFlashTorchaxWrapper:
             position_ids: jax.Array,
             embed_weight: jax.Array,
             attention_mask: jax.Array,
+            win_start: jax.Array,
             num_reqs: int,
             padded_ctx: int,
         ) -> jax.Array:
             with torchax.default_env():
-                # Slice the active (L, N, C, KVH, hd) sub-block out of the full
-                # caches here so the slice fuses into the consuming attention.
-                k_cache = k_cache[:, :num_reqs, :padded_ctx]
-                v_cache = v_cache[:, :num_reqs, :padded_ctx]
+                # Gather the active (L, N, C, KVH, hd) sub-block out of the full
+                # caches. C == padded_ctx (static). For each request slot i the
+                # window covers absolute cache rows
+                # [win_start[i] : win_start[i] + padded_ctx). When win_start is
+                # all-zeros (windowing off) this is exactly the [0:padded_ctx)
+                # prefix slice, so the non-windowed path is unchanged. When
+                # windowing is on, win_start[i] = max(0, ctx_len_i - W) so the
+                # window is the LAST W context positions -- the O(C*B) attention-
+                # score matmul shrinks to O(W*B). The gather fuses into the
+                # consuming attention; the cached K already carries its absolute-
+                # position RoPE (baked at write time), so a contiguous row gather
+                # preserves RoPE alignment with no re-RoPE.
+                k_cache = k_cache[:, :num_reqs]  # (L, N, buf_len, KVH, hd)
+                v_cache = v_cache[:, :num_reqs]
+                ws = win_start[:num_reqs]  # (N,)
+
+                def _win_slot(cache_ln, start):
+                    # cache_ln: (L, buf_len, KVH, hd); take rows [start:start+C)
+                    # along the buf_len axis (axis 1).
+                    return jax.lax.dynamic_slice_in_dim(
+                        cache_ln, start, padded_ctx, axis=1)
+
+                # vmap over the request axis (axis 1 of the (L, N, ...) cache).
+                k_cache = jax.vmap(_win_slot, in_axes=(1, 0),
+                                   out_axes=1)(k_cache, ws)
+                v_cache = jax.vmap(_win_slot, in_axes=(1, 0),
+                                   out_axes=1)(v_cache, ws)
                 p = torch_view(params)
                 noise_ids_t = torch_view(noise_input_ids)  # (N, B)
                 embed_w_t = torch_view(embed_weight)

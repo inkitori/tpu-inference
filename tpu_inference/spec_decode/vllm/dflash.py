@@ -73,6 +73,17 @@ class DFlashTorchaxProposer:
         # default so the live serve path is unchanged (cache stays None, no new
         # device work). Increment 3 wires it into the attention forward.
         self._use_kv_cache = os.environ.get("DFLASH_KV_CACHE", "0") == "1"
+        # Lever A: windowed draft attention. When > 0 (and the KV cache is on),
+        # the cache-consuming draft forward attends over only the LAST
+        # _draft_window context positions per slot instead of the full context.
+        # The cached K/V rows are physically GATHERED to the window before the
+        # attention-score matmul, so the O(C*B) score matmul shrinks to O(W*B).
+        # This is LOSSLESS for the target (it still verifies every token) but
+        # CHANGES the draft proposals (less context -> possibly lower
+        # acceptance). Default 0 = full context (no behavior change). Only
+        # active on the DFLASH_KV_CACHE=1 path. Rounded up to a multiple of the
+        # ctx pad block so the windowed forward traces a single static width.
+        self._draft_window = int(os.environ.get("DFLASH_DRAFT_WINDOW", "0"))
 
         target_layer_ids = dflash_config.get("target_layer_ids", None)
         num_target_layers = getattr(hf_config, "num_target_layers", None)
@@ -112,6 +123,10 @@ class DFlashTorchaxProposer:
                                                   dtype=np.int64)
         self._last_req_id: list[Optional[str]] = [None] * self.max_num_reqs
         self._ctx_buf: Optional[jax.Array] = None
+        # Persistent context/cache buffer width (set in load_model). Stored
+        # separately so the KV-cache path (which drops _ctx_buf) can still size
+        # the dead-row scatter plan without dereferencing the (None) buffer.
+        self._buf_len: int = 0
         # Per-slot K/V cache (increment 2). Allocated in load_model only when
         # self._use_kv_cache; mirrors the _ctx_buf write/move idioms.
         self._k_cache: Optional[jax.Array] = None
@@ -155,9 +170,18 @@ class DFlashTorchaxProposer:
         # bump by one block so buf_len - 1 stays a dead row.
         if buf_len <= self.max_model_len:
             buf_len += self._ctx_pad_block
-        self._ctx_buf = jnp.zeros(
-            (self.max_num_reqs, buf_len, self._raw_hidden_dim),
-            dtype=jnp.bfloat16)
+        # Store buf_len so the flag-on path (which drops _ctx_buf) can still size
+        # the dead-row plan without dereferencing the (now-None) buffer.
+        self._buf_len = buf_len
+        # Lever B: on the KV-cache path _ctx_buf is WRITTEN every step but never
+        # READ (kv_project pulls the new rows straight from raw_hidden; the
+        # cached forward reads only the K/V caches). So skip its multi-GiB
+        # allocation entirely on the flag-on path -- frees ~3.96 GiB (restores
+        # util 0.75 headroom). The flag-off path is unchanged.
+        if not self._use_kv_cache:
+            self._ctx_buf = jnp.zeros(
+                (self.max_num_reqs, buf_len, self._raw_hidden_dim),
+                dtype=jnp.bfloat16)
 
         # Increment 2: per-slot, per-layer K/V cache. Shares buf_len (hence the
         # same dead-row guarantee) with _ctx_buf so the kv write can reuse the
@@ -177,10 +201,16 @@ class DFlashTorchaxProposer:
                 dtype=jnp.bfloat16)
             logger.info("DFlash KV cache enabled: k/v cache shape %s",
                         self._k_cache.shape)
+            if self._draft_window > 0:
+                # Round the window up to the pad block so the windowed cached
+                # forward traces exactly one static ctx width (= the rounded W).
+                self._draft_window = self._next_padded_size(self._draft_window)
+                logger.info("DFlash draft attention WINDOWED to last %d ctx "
+                            "positions (Lever A)", self._draft_window)
 
         logger.info(
             "DFlash torchax proposer loaded: context buffer shape %s",
-            self._ctx_buf.shape,
+            self._ctx_buf.shape if self._ctx_buf is not None else None,
         )
 
     def precompile(self) -> None:
@@ -222,39 +252,43 @@ class DFlashTorchaxProposer:
         next_token_ids = device_array(
             self.mesh, np.zeros((max_num_reqs, ), dtype=np.int32))
 
-        # The draft forward always receives the FULL persistent context buffer
-        # and slices the active (n, padded_ctx) sub-block inside the jit (static
-        # args), so warm with the real buffer (shape never varies); n and
-        # padded_ctx drive the static trace key, matching prepare_inputs().
+        # The (non-cached) draft forward always receives the FULL persistent
+        # context buffer and slices the active (n, padded_ctx) sub-block inside
+        # the jit (static args), so warm with the real buffer (shape never
+        # varies); n and padded_ctx drive the static trace key, matching
+        # prepare_inputs(). On the KV-cache path _ctx_buf is None and this
+        # forward is never invoked (propose() uses the cached forward), so skip
+        # this whole warm there -- the cached forward is warmed separately below.
         for n in batch_sizes:
-            noise_input_ids = device_array(
-                self.mesh,
-                np.zeros((n, self.block_size), dtype=np.int32))
-            for padded_ctx in padded_sizes:
-                position_ids = device_array(
+            if not self._use_kv_cache:
+                noise_input_ids = device_array(
                     self.mesh,
-                    jnp.zeros((n, padded_ctx + self.block_size),
-                              dtype=jnp.int32))
-                # Additive float bias; all-zeros = "no padding masked" is a
-                # valid warm-up case. Dtype/shape MUST match prepare_inputs()
-                # so the JIT signature is shared (bf16, shape (N, C+B)).
-                attention_mask = device_array(
-                    self.mesh,
-                    jnp.zeros((n, padded_ctx + self.block_size),
-                              dtype=jnp.bfloat16))
+                    np.zeros((n, self.block_size), dtype=np.int32))
+                for padded_ctx in padded_sizes:
+                    position_ids = device_array(
+                        self.mesh,
+                        jnp.zeros((n, padded_ctx + self.block_size),
+                                  dtype=jnp.int32))
+                    # Additive float bias; all-zeros = "no padding masked" is a
+                    # valid warm-up case. Dtype/shape MUST match prepare_inputs()
+                    # so the JIT signature is shared (bf16, shape (N, C+B)).
+                    attention_mask = device_array(
+                        self.mesh,
+                        jnp.zeros((n, padded_ctx + self.block_size),
+                                  dtype=jnp.bfloat16))
 
-                hidden = self._draft_forward_fn(
-                    self._params,
-                    noise_input_ids,
-                    self._ctx_buf,
-                    position_ids,
-                    self._embed_weight,
-                    attention_mask,
-                    n,
-                    padded_ctx,
-                )
-                _ = self._sample_block_draft_tokens(self._params, hidden,
-                                                    self._lm_head_weight)
+                    hidden = self._draft_forward_fn(
+                        self._params,
+                        noise_input_ids,
+                        self._ctx_buf,
+                        position_ids,
+                        self._embed_weight,
+                        attention_mask,
+                        n,
+                        padded_ctx,
+                    )
+                    _ = self._sample_block_draft_tokens(self._params, hidden,
+                                                        self._lm_head_weight)
 
             _ = self._build_noise_block(seq_lens[:n], next_token_ids[:n],
                                         self.mask_token_id, self.block_size)
@@ -270,30 +304,37 @@ class DFlashTorchaxProposer:
         token_buckets = getattr(self.runner, "num_tokens_paddings", None)
         if token_buckets is None:
             token_buckets = [self.max_num_tokens]
-        dead_row = self._ctx_buf.shape[1] - 1
-        logger.info("Precompiling DFlash batched ctx write for %d buckets...",
-                    len(token_buckets))
-        for t in token_buckets:
-            slot_idx = device_array(self.mesh, np.zeros(t, dtype=np.int32))
-            dst_row = device_array(self.mesh,
-                                   np.full(t, dead_row, dtype=np.int32))
-            valid = device_array(self.mesh, np.zeros(t, dtype=bool))
-            raw_dummy = jnp.zeros((t, self._raw_hidden_dim),
-                                  dtype=jnp.bfloat16)
-            self._ctx_buf = self._batched_ctx_write(self._ctx_buf, raw_dummy,
-                                                    slot_idx, dst_row, valid)
+        # buf_len-1 is the dead padding row every invalid scatter cell routes to.
+        # Read it from self._buf_len (the flag-on path drops _ctx_buf to None).
+        dead_row = self._buf_len - 1
+        # The _ctx_buf write/move warms touch _ctx_buf, which is None on the
+        # KV-cache path (those ops are skipped at runtime there). Skip the warms
+        # too. The K/V cache write/move are warmed in the flag-on block below.
+        if not self._use_kv_cache:
+            logger.info(
+                "Precompiling DFlash batched ctx write for %d buckets...",
+                len(token_buckets))
+            for t in token_buckets:
+                slot_idx = device_array(self.mesh, np.zeros(t, dtype=np.int32))
+                dst_row = device_array(self.mesh,
+                                       np.full(t, dead_row, dtype=np.int32))
+                valid = device_array(self.mesh, np.zeros(t, dtype=bool))
+                raw_dummy = jnp.zeros((t, self._raw_hidden_dim),
+                                      dtype=jnp.bfloat16)
+                self._ctx_buf = self._batched_ctx_write(
+                    self._ctx_buf, raw_dummy, slot_idx, dst_row, valid)
 
-        # Warm the sparse slot-move scatter (mirrors condense/swap moves) for
-        # EVERY K bucket prepare_inputs() can emit. Each bucket is one static
-        # (dst_slots, src_slots) shape (K,). prepare_inputs() runs inside
-        # maybe_forbid_compile, so any unwarmed K would hard-fail under
-        # VLLM_XLA_CHECK_RECOMPILATION the first time a condense of that size
-        # fires. Warm with self-copy pairs (dst==src==slot 0): an idempotent
-        # no-op that leaves _ctx_buf bit-unchanged.
-        for k in self._move_bucket_sizes():
-            zeros_k = device_array(self.mesh, np.zeros(k, dtype=np.int32))
-            self._ctx_buf = self._move_ctx_rows(self._ctx_buf, zeros_k,
-                                                zeros_k)
+            # Warm the sparse slot-move scatter (mirrors condense/swap moves)
+            # for EVERY K bucket prepare_inputs() can emit. Each bucket is one
+            # static (dst_slots, src_slots) shape (K,). prepare_inputs() runs
+            # inside maybe_forbid_compile, so any unwarmed K would hard-fail
+            # under VLLM_XLA_CHECK_RECOMPILATION the first time a condense of
+            # that size fires. Warm with self-copy pairs (dst==src==slot 0): an
+            # idempotent no-op that leaves _ctx_buf bit-unchanged.
+            for k in self._move_bucket_sizes():
+                zeros_k = device_array(self.mesh, np.zeros(k, dtype=np.int32))
+                self._ctx_buf = self._move_ctx_rows(self._ctx_buf, zeros_k,
+                                                    zeros_k)
 
         # Increment 2: warm the K/V cache write + move (+ standalone kv project)
         # for the same buckets as their ctx counterparts. Gated on the flag so
@@ -333,16 +374,24 @@ class DFlashTorchaxProposer:
                 self._k_cache, self._v_cache = self._move_kv_rows(
                     self._k_cache, self._v_cache, zeros_k, zeros_k)
 
-            # Warm the cache-consuming draft forward across the SAME (N, C)
-            # sweep as the full draft forward above; propose() runs inside
+            # Warm the cache-consuming draft forward. propose() runs inside
             # maybe_forbid_compile, so any unwarmed (N, padded_ctx) would
             # hard-fail under VLLM_XLA_CHECK_RECOMPILATION. Pass the full caches
-            # (sliced inside the jit) plus the real position/mask shapes.
+            # (windowed/sliced inside the jit) plus the real position/mask
+            # shapes and the per-slot window-start array.
+            #   - Lever A OFF (window 0): sweep all padded_ctx widths, win_start
+            #     is all-zeros (prefix slice == today's behavior).
+            #   - Lever A ON (window W>0): prepare_inputs ALWAYS emits a single
+            #     static ctx width == W, so warm exactly that one width.
+            cached_ctx_sizes = ([self._draft_window]
+                                if self._draft_window > 0 else padded_sizes)
             for n in batch_sizes:
                 noise_input_ids = device_array(
                     self.mesh,
                     np.zeros((n, self.block_size), dtype=np.int32))
-                for padded_ctx in padded_sizes:
+                win_start = device_array(self.mesh,
+                                         np.zeros((n, ), dtype=np.int32))
+                for padded_ctx in cached_ctx_sizes:
                     position_ids = device_array(
                         self.mesh,
                         jnp.zeros((n, padded_ctx + self.block_size),
@@ -359,6 +408,7 @@ class DFlashTorchaxProposer:
                         position_ids,
                         self._embed_weight,
                         attention_mask,
+                        win_start,
                         n,
                         padded_ctx,
                     )
@@ -734,19 +784,24 @@ class DFlashTorchaxProposer:
             src_arr = np.asarray(moved_src, dtype=np.int32)
             dst_dev = device_array(self.mesh, dst_arr)
             src_dev = device_array(self.mesh, src_arr)
-            self._ctx_buf = self._move_ctx_rows(self._ctx_buf, dst_dev,
-                                                src_dev)
-            # Mirror the SAME slot move onto the K/V cache so it stays row-for-
-            # row consistent with _ctx_buf (DFLASH_KV_CACHE=1 only).
             if self._use_kv_cache:
+                # Lever B: the K/V cache supersedes _ctx_buf; mirror the slot
+                # move onto the caches only (_ctx_buf is None on this path).
                 self._k_cache, self._v_cache = self._move_kv_rows(
                     self._k_cache, self._v_cache, dst_dev, src_dev)
+            else:
+                self._ctx_buf = self._move_ctx_rows(self._ctx_buf, dst_dev,
+                                                    src_dev)
 
-        # accepted context length per request this step (host int array).
-        seq_lens_host = np.asarray(jax.device_get(attn_metadata.seq_lens))
-        # query_start_loc maps the flat ragged token axis of aux_hidden_states
-        # back to per-request segments: req i occupies [qsl[i] : qsl[i+1]).
-        qsl_host = np.asarray(jax.device_get(attn_metadata.query_start_loc))
+        # Lever B: pull BOTH device->host syncs in ONE device_get round-trip
+        # (jax.device_get takes a pytree) instead of two serialized stalls.
+        #   seq_lens: accepted context length per request this step.
+        #   query_start_loc: maps the flat ragged token axis of aux_hidden_states
+        #     back to per-request segments: req i occupies [qsl[i] : qsl[i+1]).
+        seq_lens_host, qsl_host = jax.device_get(
+            (attn_metadata.seq_lens, attn_metadata.query_start_loc))
+        seq_lens_host = np.asarray(seq_lens_host)
+        qsl_host = np.asarray(qsl_host)
 
         # raw_hidden: flat-ragged [total_tokens, raw_hidden_dim], ordered by
         # request via query_start_loc. NOT a batch axis.
@@ -763,7 +818,7 @@ class DFlashTorchaxProposer:
         # Every row defaults to a NO-OP write (routed to the dead last buffer
         # row, masked off); real copies overwrite their plan entries below.
         total_tokens = raw_hidden.shape[0]
-        buf_len = self._ctx_buf.shape[1]
+        buf_len = self._buf_len
         dead_row = buf_len - 1
         slot_idx_host = np.zeros(total_tokens, dtype=np.int32)
         dst_row_host = np.full(total_tokens, dead_row, dtype=np.int32)
@@ -814,16 +869,22 @@ class DFlashTorchaxProposer:
 
         # One device write for all requests; donate _ctx_buf so it is updated in
         # place. Returned buffer immediately replaces the donated input.
+        # Lever B: on the KV-cache path _ctx_buf is None and never read (the
+        # cached forward consumes only the K/V caches; kv_project pulls new rows
+        # straight from raw_hidden below), so SKIP this redundant multi-GiB
+        # masked read-modify-write entirely. The scatter plan (slot/dst/valid)
+        # is still built and reused by the K/V cache write.
         slot_idx_dev = device_array(self.mesh, slot_idx_host)
         dst_row_dev = device_array(self.mesh, dst_row_host)
         valid_dev = device_array(self.mesh, valid_host)
-        self._ctx_buf = self._batched_ctx_write(
-            self._ctx_buf,
-            raw_hidden,
-            slot_idx_dev,
-            dst_row_dev,
-            valid_dev,
-        )
+        if not self._use_kv_cache:
+            self._ctx_buf = self._batched_ctx_write(
+                self._ctx_buf,
+                raw_hidden,
+                slot_idx_dev,
+                dst_row_dev,
+                valid_dev,
+            )
 
         # DFLASH_KV_CACHE=1: project K/V for ONLY the newly-accepted context
         # rows and scatter them into the per-slot K/V caches, reusing the EXACT
@@ -854,29 +915,55 @@ class DFlashTorchaxProposer:
                 valid_dev,
             )
 
-        # All slots share one rectangular padded context width = the max
-        # accepted length rounded up to _ctx_pad_block, so the downstream JIT
-        # cache only sees ~max_model_len/_ctx_pad_block shapes regardless of
-        # batch size. This width never exceeds buf_len (both round up with the
-        # same block, and max_ctx <= max_model_len), so the slice is in-bounds.
+        # All slots share one rectangular padded context width.
+        # Lever A (windowing OFF): width = max accepted length rounded up to
+        # _ctx_pad_block, so the downstream JIT cache only sees
+        # ~max_model_len/_ctx_pad_block shapes regardless of batch size. This
+        # width never exceeds buf_len, so the slice is in-bounds.
+        # Lever A (windowing ON, _draft_window W>0): width = the FIXED W. Each
+        # slot's window covers the LAST W context positions, i.e. absolute rows
+        # [win_start_i : win_start_i + W) where win_start_i = max(0, ctx_len_i-W).
+        # The cached forward GATHERS those W rows per slot (so the O(C*B) score
+        # matmul shrinks to O(W*B)); the cache itself stays full buf_len width
+        # (writes/moves/condense unchanged). When ctx_len_i < W the window
+        # degenerates to the [0:W) prefix (win_start_i==0) -- identical to today.
         ctx_lens = self._ctx_len[:num_reqs].astype(np.int32)
         max_ctx = int(ctx_lens.max()) if num_reqs > 0 else 1
-        padded_ctx = self._next_padded_size(max(max_ctx, 1))
-        # The active (N, padded_ctx, D) sub-block is NOT sliced here. We pass the
-        # FULL persistent buffer to the jitted draft forward and slice inside
-        # the jit (static num_reqs/padded_ctx) so XLA fuses the slice into the
-        # fc matmul. Slicing eagerly here would materialize a multi-GiB copy of
-        # the buffer every step (the c=32 OOM).
+        windowed = self._use_kv_cache and self._draft_window > 0
+        if windowed:
+            W = self._draft_window
+            padded_ctx = W
+            # Per-slot absolute start of the W-wide window (host int32, (N,)).
+            win_start_host = np.maximum(0, ctx_lens - W).astype(np.int32)
+            # Valid rows within the window = min(ctx_len, W).
+            win_valid_len = np.minimum(ctx_lens, W).astype(np.int32)
+        else:
+            padded_ctx = self._next_padded_size(max(max_ctx, 1))
+            win_start_host = np.zeros(num_reqs, dtype=np.int32)
+            win_valid_len = ctx_lens
+        # The active sub-block is NOT sliced here. We pass the FULL caches (or
+        # buffer) to the jitted forward and slice/gather inside the jit (static
+        # num_reqs/padded_ctx) so XLA fuses it. Slicing eagerly here would
+        # materialize a multi-GiB copy every step (the c=32 OOM).
         ctx_full = self._ctx_buf
+        win_start = device_array(self.mesh, win_start_host)  # (N,)
 
-        # Per-slot positions/mask. Layout per row: context positions
-        # [0..ctx_len_i-1, 0, 0, ...] then noise positions
-        # [ctx_len_i .. ctx_len_i+block_size-1]. Padding ctx rows get position 0
-        # and a large-negative additive bias so they contribute nothing.
+        # Per-slot positions/mask over the (padded) ctx axis (width = padded_ctx,
+        # which is W when windowed). Row layout: context positions then noise
+        # positions [ctx_len_i .. ctx_len_i+block_size-1]. Padding/out-of-window
+        # ctx rows get a large-negative additive bias so they contribute
+        # nothing. NOTE: in the CACHED forward the ctx slice of position_ids is
+        # unused (the gathered ctx K already has its absolute-position RoPE baked
+        # in at write time; only the noise positions drive RoPE in-forward), but
+        # we build absolute window positions anyway for the non-windowed path and
+        # for shape consistency (width padded_ctx + B).
         ctx_lens_j = jnp.asarray(ctx_lens)  # (N,)
+        win_valid_j = jnp.asarray(win_valid_len)  # (N,)
+        win_start_j = jnp.asarray(win_start_host)  # (N,)
         ar_ctx = jnp.arange(padded_ctx, dtype=jnp.int32)[None, :]  # (1, C)
-        ctx_valid = ar_ctx < ctx_lens_j[:, None]  # (N, C)
-        ctx_positions = jnp.where(ctx_valid, ar_ctx,
+        ctx_valid = ar_ctx < win_valid_j[:, None]  # (N, C) valid window rows
+        # Absolute position of window column j for slot i = win_start_i + j.
+        ctx_positions = jnp.where(ctx_valid, ar_ctx + win_start_j[:, None],
                                   jnp.zeros_like(ar_ctx))  # (N, C)
         noise_positions = (jnp.arange(self.block_size, dtype=jnp.int32)[None, :]
                            + ctx_lens_j[:, None])  # (N, B)
@@ -904,8 +991,10 @@ class DFlashTorchaxProposer:
 
         # Carry the FULL context buffer plus the static (num_reqs, padded_ctx)
         # so the draft forward slices the active sub-block inside its jit.
+        # win_start (N,) is the per-slot window-start row for the cached forward
+        # (all-zeros when windowing is off -> plain [0:padded_ctx) prefix slice).
         target_hidden_states = (ctx_full, position_ids, attention_mask,
-                                num_reqs, padded_ctx)
+                                win_start, num_reqs, padded_ctx)
 
         seq_lens_arr = device_array(self.mesh, ctx_lens)  # (N,)
         # next_token_ids is padded to max_num_reqs; take the real rows.
@@ -949,15 +1038,16 @@ class DFlashTorchaxProposer:
         target_hidden_states,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
         """Generate all draft tokens in one stateless torchax forward pass."""
-        ctx_full, position_ids, attention_mask, num_reqs, padded_ctx = (
-            target_hidden_states)
+        ctx_full, position_ids, attention_mask, win_start, num_reqs, \
+            padded_ctx = target_hidden_states
 
         if self._use_kv_cache:
             # Cache-consuming path: attend over [cached ctx K/V | noise K/V].
             # Per-step compute is O(B): the context K/V already live in the
             # caches (projected/written in prepare_inputs), so only the B noise
-            # rows are recomputed. The caches are passed full and sliced to the
-            # active (num_reqs, padded_ctx) sub-block inside the jit.
+            # rows are recomputed. The caches are passed full and the active
+            # (num_reqs, padded_ctx) window is gathered inside the jit, starting
+            # at per-slot win_start (Lever A; all-zeros == plain prefix slice).
             hidden_states = self._draft_forward_cached_fn(
                 self._params,
                 input_ids,
@@ -966,6 +1056,7 @@ class DFlashTorchaxProposer:
                 position_ids,
                 self._embed_weight,
                 attention_mask,
+                win_start,
                 num_reqs,
                 padded_ctx,
             )
