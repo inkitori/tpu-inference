@@ -70,4 +70,15 @@ oracle for those 2; its "NOT-A-TIE" on largest-planet is unreliable (measured a 
 Fire identical concurrent batch=8 max_tokens=1 at BOTH servers from identical step-1 contexts ⇒
 both see identical request shape ⇒ any spec-on argmax != target-only argmax beyond a logged near-tie
 is a verifier bug. Target-only step-1 captured (target_step1.json): all 8 sensible argmax (Paris/Au/
-Jupiter/George/oxygen/red), gaps 0.06-5.1 nats. Awaiting spec-on step-1 (specon_step1.json) compare.
+Jupiter/George/oxygen/red), gaps 0.06-5.1 nats.
+
+GOTCHA FOUND (worse than 02-test's note): requesting LOGPROBS on the SPEC-ON server triggers
+`OverflowError: out of range integral type conversion` in async_llm.py:704 output_handler
+(logprobs.py:97 convert_ids_list_to_tokens -> tokenizer.decode of an out-of-range id in the
+top-k logprobs stream) — and because it's in the async output_handler background task, it CRASHES
+THE ENGINE (connection refused after). The out-of-range id is in the LOGPROBS top-k tensor
+(padding/sentinel), NOT in the emitted sequence — sampled tokens are fine (full completions are
+coherent+correct). ⇒ For any spec-on probing use max_tokens=1 with NO logprobs (plain text). This
+is a logprobs-serialization bug, not a generation/verifier bug, but it's a real crash to avoid.
+
+Redo of step-1 oracle with NO logprobs (plain max_tokens=1 text), matched batch=8: <PENDING>.
