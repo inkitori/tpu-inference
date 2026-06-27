@@ -8,6 +8,24 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][impl-kvcache] **LEVER #1 (KV-cache the O(ctx) draft recompute) LANDED + microbench-proven
+  + token-equivalent ⇒ closes ~the whole 2.90x gap but MARGINAL (lands ~7% short of flipping A>B alone;
+  num_spec-down is the next lever).** Flag-gated `DFLASH_KV_CACHE=1` (default OFF, live path UNCHANGED).
+  Design B2: project K/V for ONLY newly-accepted rows (`_kv_project`, O(B)) + cache per-slot
+  (_k_cache/_v_cache (L=8,32,buf~4608,KVH=8,hd=64) bf16) + a cache-consuming forward
+  (`_draft_forward_cached`) that attends over [cached ctx K/V | fresh noise K/V] so fc+k/v-proj over
+  the full context never recompute. Cache write `_batched_kv_write` + condense-move `_move_kv_rows`
+  MIRROR the proven _batched_ctx_write/_move_ctx_rows idioms + plan arrays (so condense backfill is
+  handled identically). **REAL 8-chip mesh N=32 microbench**: FULL draft step 88→98ms @C=4096-4608
+  drops to **54→59ms CACHED = 1.6-1.9x** (the cache kills the O(C) projection; the O(C) attention-SCORE
+  matmul stays + now dominates, 52 of 59ms @C=4608, so cached fwd is NOT flat in C). FLIP: cached_step/6
+  = 8.99ms/accepted-tok @C=4096 vs target 8.40 ⇒ ~7% over break-even (lower-C steps already win). Token-
+  equivalent: synthetic multi-step tie-free argmax IDENTICAL all steps (hidden ~1-2 bf16 ULP/8 layers =
+  bf16 floor). 17 unit tests green; flag-off path verified unchanged. HBM: full cache replicated = 2.25
+  GiB < the 3.96 GiB _ctx_buf it can REPLACE (net -1.7 GiB once _ctx_buf dropped; still written
+  alongside as cross-check now). ⇒ NEEDS_TEST (real serve-path perfect-draft c=32 + greedy-vs-target
+  with flag ON) then NEEDS_BENCH with num_spec tuned DOWN to clear the marginal flip. Commits ebb2b44c,
+  39e2f91f, e1fa4115, d7a4300b, b5d5c7b4. Details: 12-impl-kvcache.md.
 - [2026-06-27][bench-v3] **FIRST TRUSTWORTHY A-vs-B SPEED VERDICT: DFlash is ~2.90x SLOWER than
   target-only at the GOAL bench point (in=1, out=4096, c=32, WARM cache, total=96 reqs so
   backfill/condense fires). ⇒ NEEDS_IMPL.** A(DFlash)=1309.79 sys out tok/s, TPOT 0.111s, mean

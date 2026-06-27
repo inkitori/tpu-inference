@@ -64,10 +64,48 @@ end-to-end greedy tokens stay identical (argmax robust to 1-ULP K through softma
 ## STATUS
 - [x] design (B2, HBM corrected to a net win)
 - [x] increment 1 (kv_project jit + bit-check PASS bf16-exact same-graph) — commit ebb2b44c
-- [ ] increment 2 (cache write/move)
-- [ ] increment 3 (cached attention + equivalence)
-- [ ] isolated per-step microbench (flat in ctx) + flip projection
-- [ ] correctness sanity (perfect-draft c=32 + greedy vs target-only)
+- [x] increment 2 (cache write/move + precompile + 17 unit tests, flag DFLASH_KV_CACHE) — 39e2f91f
+- [x] increment 3 (cached forward + token-equivalence PASS) — e1fa4115, d7a4300b
+- [x] isolated per-step microbench REAL 8-CHIP MESH N=32 — b5d5c7b4 (verdict below)
+- [ ] correctness sanity ON REAL SERVE PATH (perfect-draft c=32 + greedy vs target-only, flag on)
+- [ ] num_speculative_tokens DOWN to clear the marginal flip (NEXT round, not mine)
+- [ ] drop _ctx_buf on flag-on path (HBM win, follow-up; cache proven so cross-check no longer needed)
+
+## DECISIVE MICROBENCH (REAL 8-chip v6e mesh TP8, N=32, median of 30 warm calls) — commit b5d5c7b4
+| C    | FULL (ms) | CACHED total (ms) | CACHED fwd-only (ms) | F/Ctotal |
+|-----:|----------:|------------------:|---------------------:|---------:|
+| 512  | 14.75     | 14.98             | 8.83                 | 0.98x    |
+| 1024 | 21.49     | 20.05             | 13.56                | 1.07x    |
+| 2048 | 40.89     | 32.49             | 26.01                | 1.26x    |
+| 4096 | 87.76     | 53.92             | 47.04                | 1.63x    |
+| 4608 | 98.49     | 58.80             | 52.04                | 1.68x    |
+Component @C=4608: kv_project(B=8) 0.56ms + write 6.52ms + fwd_cached 52.04ms = 58.80ms.
+The cache removes the O(C) PROJECTION recompute (fc 14400->2880 + per-layer k/v/q-proj+norm
+over full C) = the 1.6-1.9x win at high C. The O(C) ATTENTION-SCORE matmul (q over C+B keys)
+STAYS and now dominates (52 of 59ms @C=4608) -> cached fwd is NOT flat in C.
+
+## FLIP PROJECTION: MARGINAL (closes ~the whole 2.90x gap, lands ~7% short)
+Break-even: DFlash step must get under ~target_TPOT x accept = 0.0084 x 6 = 0.050s. At C=4096
+(representative of most steps in a 4096-tok gen) cached_step/6 = 8.99 ms/accepted-token vs
+target 8.40 ms/token -> ~7% OVER. At C=4608: 9.80 vs 8.40. Lower-C steps already win (C=2048 ->
+5.41ms < 8.40). Average sits right ON the line. => the cache cut FULL ~1.7x at high C but not
+the ~2x needed to clear. NEXT cheap lever (NEXT round, flagged not done): num_speculative_tokens
+DOWN from 7 -> smaller noise block B -> cheaper O(C*B) score matmul AND cheaper target verify.
+Given only ~7% over, a modest num_spec cut plausibly flips A>B.
+
+## INCREMENT 3 FINDINGS (important — partial win, NOT a full flat-in-C)
+Cache-consuming forward token-EQUIVALENT (tie-free argmax identical all steps; hidden diffs
+~1-2 bf16 ULP accumulated over 8 layers = bf16 floor, not a logic bug). BUT isolated
+single-device N=8 timing: cached only 1.3-1.6x faster, NOT flat in C. WHY: the cache removes
+the O(C) PROJECTION recompute (fc 14400->2880 + 8x k/v_proj/k_norm/RoPE over full C) but the
+ATTENTION SCORE matmul (q over C+B keys) is inherently O(C) and STAYS. So step is
+proj_cached(O(B)) + attn_scores(O(C)).
+- C=512: 4.69->3.62ms; C=1024: 6.66->4.11ms; C=2048: 10.03->7.98ms; C=4096: 19.87->12.55ms.
+- CAVEAT: single-device N=8 is NOT the real signal. On the 8-CHIP mesh at N=32, 08-impl-perf
+  measured fc+8attn = 88-99ms @ C=4096-4608 where the PROJECTION dominated (the big matmuls).
+  Need the real-mesh N=32 number to know the true step speedup + flip projection.
+- _ctx_buf STILL written alongside the cache on flag-on (kept for cross-check). Drop it next.
 
 ## COMMITS
 - ebb2b44c spec-decode: DFlash kv_project (project new ctx rows' K/V) + bit-identical check
+- 39e2f91f spec-decode: DFlash per-slot K/V cache write + condense-move (flag-gated, unit-tested)
