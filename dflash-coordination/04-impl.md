@@ -52,9 +52,26 @@ The cap is GLUE-CODE, not a model limit. HF DFlash forward is fully batch-generi
   num_reqs source consistency, draft_token_ids (num_reqs, num_spec) alignment,
   noise-block/position consistency, out_shardings ranks, no leftover scalar reads.
 
+## SMOKE RESULT — PASS (c=32, coherent)
+- 32/32 concurrent greedy requests succeeded. Coherent output: "capital of
+  France is Paris", "first president...George Washington", "gold is Au",
+  "speed of light ~299,792,458 m/s", "author of Harry Potter is J.K. Rowling".
+  Duplicate prompts produced identical greedy continuations (deterministic).
+- The num_reqs<=1 assert is GONE; batched verification produces correct text
+  across a full batch of 32 with variable content. No logic bug.
+- Working config: max-model-len 1024, max-num-seqs 32, --gpu-memory-utilization
+  0.75, EP, RAGGED_GATHER v1, --no-async, DRAFT_MODEL_IMPL_TYPE=torchax,
+  num_speculative_tokens 7, HF_HOME=/home/enyouki/local_hf.
+- HBM: KV cache ~1.6M tokens; per-chip ~23-24 / 31.25 GiB. _ctx_buf at len 1024
+  ~0.88G fits. At default util / len 2048 it did NOT fit (1.76G _ctx_buf alloc
+  failed with 970M free) — so for the c=32 SPEED bench at len 5120 the next
+  manager MUST drop util and/or len, OR land the _ctx_buf scatter optimization.
+- Wall time 230s reflects COLD XLA compiles (first run, SKIP_JAX_PRECOMPILE=1) —
+  NOT a DFlash speed measurement. Speed bench is the next manager's job (warm).
+
 ## Status
-- [x] implement  [x] adversarial review + fix  [ ] smoke serve @ max-num-seqs 32
-- [ ] coherent output  [x] commit+push (code)
+- [x] implement  [x] adversarial review + fix  [x] smoke serve @ max-num-seqs 32
+- [x] coherent output  [x] commit+push (code + coord)
 
 ## Smoke result so far
 - Server LAUNCHES + serves at --max-num-seqs 32 (assert gone). Startup clean.

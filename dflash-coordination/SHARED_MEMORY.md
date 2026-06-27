@@ -49,26 +49,39 @@
   proposer; "#1869"=a03d42e4 wired runner; "#1870"=fix cluster (5f4047cd lm_head proj = 0%-accept fix).
 
 ## Known blockers / gotchas
-- [2026-06-27][bench] **GOAL bench point (concurrency 32) NOT RUNNABLE — hard blocker.** DFlash
-  torchax decode is single-seq ONLY: `assert self.runner.input_batch.num_reqs <= 1`,
-  "DFlash does not support batched (multi-request) decoding", in
-  speculative_decoding_manager.py:111 (also asserts dp_size==1, no async). Fires the instant the
-  scheduler batches >=2 reqs into a decode step ⇒ `--max-num-seqs 32` CRASHES (AssertionError),
-  not silently clamped. Intentional: wiring commit a03d42e4 is titled "wire DFlash into the
-  torchax pipeline (concurrency 1)". ⇒ NEEDS_IMPL: add batched/multi-seq DFlash decode
-  (relax that assert + make propose_dflash_draft_token_ids / host_extract_sampled_tokens /
-  spec_decode/vllm/dflash.py handle a real batch) BEFORE the c=32 speed bench is possible.
-- [2026-06-27][bench] Config A (DFlash) serves fine at max-num-seqs 1 / max-model-len 5120 (fits
-  in=1+out=4096). HBM ~28.7-28.9 GiB / 31.25 per chip ⇒ only ~2.3 GiB headroom — KV for 32
-  concurrent 5120-len seqs is a SECOND risk once the assert is lifted. c=1 A-vs-B throughput was
-  NOT finalized (blocker took priority). Details: 03-bench.md.
+- [2026-06-27][impl] **c=32 BLOCKER RESOLVED.** Batched/multi-seq DFlash torchax decode
+  IMPLEMENTED + smoke-verified. The num_reqs<=1 assert is gone; server serves --max-num-seqs 32
+  and 32/32 concurrent greedy requests return COHERENT output (Paris / George Washington / Au /
+  speed of light / J.K. Rowling; dup prompts -> identical greedy). dp_size==1 + no-async asserts
+  KEPT (independent). Commits 9410b793 + f9947f43. Details: 04-impl.md. ⇒ NEXT = NEEDS_TEST:
+  re-run perfect-draft machinery test AT batch>1 to prove batched verify still lossless, THEN the
+  c=32 speed bench (03-bench's original job).
+- [2026-06-27][impl] **HBM is the binding constraint at c=32, not the assert.** First c=32 smoke at
+  max-model-len 2048 / default util HIT RESOURCE_EXHAUSTED: the proposer's per-slot _ctx_buf
+  (max_num_reqs × buf_len × raw_hidden_dim(~13440) × 2B; =1.76G at len 2048) couldn't allocate
+  (970M free) because vLLM's mem profiler grabbed ~all HBM for KV cache (2.04M tokens) before the
+  full-batch _ctx_buf is exercised. FIX for smoke: max-model-len 1024 + --gpu-memory-utilization
+  0.75 (KV ~1.6M tokens, per-chip ~23-24/31.25 GiB, _ctx_buf ~0.88G fits). The GOAL speed bench at
+  in=1/out=4096 needs len>=5120 — next manager MUST lower util/len OR land the _ctx_buf scatter opt
+  (spawned as a follow-up task) to fit. c=1 A-vs-B throughput still NOT finalized. See 03/04.
 - [2026-06-26][research] v6e-only workarounds in place (not general): MXFP4→fp8_e4m3fn requant
   (layers/vllm/quantization/mxfp4.py); v1 ragged gather mandatory. EP mandatory (plain TP8 dies
   IndivisibleError). gcsfuse root-only → stage to local HF cache HF_HOME=/home/enyouki/local_hf.
   Draft HF remote code needs `datasets` installed in venv.
 
 ## Decisions (with rationale)
-- (none yet)
+- [2026-06-27][impl] Batched DFlash = PER-SLOT context buffers. proposer state in
+  spec_decode/vllm/dflash.py is now per-slot: _ctx_buf (max_num_reqs, buf_len, raw_hidden_dim),
+  _ctx_len/_prev_seq_len np arrays, _last_req_id list. prepare_inputs loops over real requests,
+  slices each req's accepted hidden from the FLAT-RAGGED aux_hidden_states via query_start_loc
+  (raw_hidden[qsl[i] : qsl[i]+num_new_i], leading rows = accepted), appends to that slot's row,
+  pads all N ctx to one rectangular max_padded_ctx with per-row (N,C+B) additive mask + (N,C+B)
+  positions + (N,B) noise ids. Model forward (models/vllm/dflash.py) drops the hardcoded
+  unsqueeze(0)/squeeze(0), carries N, mask reshape (N,1,1,C+B); out_shardings extended to 3-D
+  (MLP_DATA size 1 @ DP=1 -> leading axis replicated; vocab stays TP on MLP_TENSOR=8). The shared
+  rejection sampler + manager bookkeeping were ALREADY batch-aware. HF DFlash forward is fully
+  batch-generic (no change). Rationale: mirrors eagle3's flat-ragged query_start_loc convention;
+  no structural blocker, HF model already handles arbitrary bsz.
 
 ## Dead ends — do NOT repeat
 - (none yet)
