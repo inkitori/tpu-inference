@@ -8,6 +8,23 @@
 >   true and lean.
 
 ## Current best-known status
+- [2026-06-27][feasibility] **FEASIBLE at c=32 — target VERIFY is NOT the ceiling — but needs TWO
+  levers, not one ⇒ NEEDS_IMPL.** Decisive isolated 8-chip microbench (target gpt-oss-20b, batch 32):
+  T_decode32=5.8ms, T_verify(k=7)=9.1ms @C4096 ⇒ **R=1.58 << accept_len ~5.8** ⇒ one verify forward
+  costs 1.58 decode-forwards but yields ~5.8 tokens (target forward is weight-bound at c=32, +8x query
+  tokens = +58% time only). So a cheap-enough draft WINS BIG (intrinsic ceiling = free-draft+0-overhead
+  = ~5x B). LEVER A: WINDOW/SLICE the draft attn-score matmul to W≈256 (slice cached K/V to last W
+  BEFORE the matmul — masking-only won't save flops; mask is already additive so code-easy) → draft fwd
+  47→~6ms @C4096 (fit: fwd=3.1+10.4·C/1000, 88% is the O(C·B) score matmul). **BUT WINDOWING ALONE
+  LOSES (~2750 tok/s, 0.73x B)** because the serve step has **~40ms/step FIXED host overhead** (recon:
+  real step ~105ms vs isolated device sum ~63ms) from `--no-async`, redundant `_ctx_buf` write (drop
+  it), 6+ un-overlapped jit dispatches, 4 blocking device_gets, 32-iter host loops — NONE shrink with a
+  cheaper draft. A FREE draft with today's 40ms overhead STILL loses ⇒ LEVER B: cut the fixed overhead
+  (drop _ctx_buf write, fuse/overlap dispatch+device_gets; async = Phase 2) is MANDATORY + the bigger
+  lever now. **WINDOW W≈256 + overhead→8-25ms ⇒ projection clears B=3752 by ~1.0-1.6x** (parity at
+  FIXED25, 1.27x at FIXED15). num_spec stays 7. NOT a config knob, NOT a user goal change. (Note: 14-
+  bench TPOT 0.105s is a worker-pool tail artifact, NOT the step time; step≈105ms is real.)
+  Details: 15-feasibility.md.
 - [2026-06-27][bench-sweep] **num_spec LEVER EXHAUSTED — KV-cache DFlash PLATEAUS ~1300 sys out tok/s,
   still ~2.89x SLOWER than target-only at the GOAL bench point ⇒ NEEDS_IMPL.** Decisive A(KV_CACHE=1,
   util 0.6)-vs-B(target-only, util 0.75) sweep at in=1/out=4096/c=32, WARM, total=96, 96/96 ok both,
