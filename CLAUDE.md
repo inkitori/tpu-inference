@@ -21,7 +21,7 @@ You also have uv installed here, so use that to create venvs and install package
 Optional env vars (set inline or export first):
 
 - `TPU_VENV` — venv path (default `$HOME/vllm_env`)
-- `HF_HOME` — HF cache dir (default `/tmp/gcs/bucket/vllm`)
+- `HF_HOME` — HF cache dir (default `/tmp/gcs/bucket`, the gcsfuse mount root; the bucket is mounted `--only-dir vllm`, so the mount root *is* the HF cache root — do not append `/vllm`)
 - `HF_HUB_OFFLINE` — skip network checks (default `1`)
 - `OMP_NUM_THREADS` — thread clamp during checkpoint load (default `16`; keep clamped — avoids 180-thread oversubscription on MoE copy)
 - `MODEL_IMPL_TYPE` — vLLM/JAX impl (default `vllm`)
@@ -39,7 +39,3 @@ Note, this sets SKIP_JAX_PRECOMPILE=1 which behaves like --enforce-eager for ben
 ```
 
 Kills processes holding TPU device nodes (`/dev/vfio/*` on v6e/v5, `/dev/accel*` on v4), removes stale libtpu lockfile + shm segments, verifies with `tpu-info`. Safe anytime — ignores Cloud-TPU host agents, gcsfuse cache, and the current shell. If vLLM runs in Docker, `docker stop` the container first (the script kills the host process but the container may restart it).
-
-## Skills
-
-- **`tpu-model-workflow`** (`.claude/skills/tpu-model-workflow/`) — the workflow + testing/benchmarking discipline for adding model / quant / spec-decode support and doing perf work. Invoke it whenever starting that kind of task.
