@@ -572,6 +572,8 @@ class PhasedBasedProfiler:
         self.decode_kv_len_threshold: int = int(
             os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD",
                       PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD))
+        self.min_batch_size: int = int(
+            os.getenv("PHASED_PROFILER_MIN_BATCH_SIZE", 0))
         self.profile_dir: str = profile_dir
         # NOTE: we purposely don't have AMBIGUOUS here
         self.inference_phase_seen: dict = {
@@ -610,6 +612,9 @@ class PhasedBasedProfiler:
         if self.decode_kv_len_threshold >= 0:
             logger.info("Will skip decode-only steps until min KV len >= %d.",
                         self.decode_kv_len_threshold)
+        if self.min_batch_size > 0:
+            logger.info("Will skip steps until batch reaches >= %d requests.",
+                        self.min_batch_size)
 
     def _write_batch_composition_stats_to_file_helper(
             self, batch_composition_stats: dict) -> None:
@@ -666,6 +671,16 @@ class PhasedBasedProfiler:
                         "Skipping decode-only step as min KV len %d < threshold %d.",
                         min_kv_len, self.decode_kv_len_threshold)
                     break
+
+            # Skip capture until the batch reaches the target size.
+            if self.min_batch_size > 0 and \
+                    batch_composition_stats.get("num_reqs", 0) < self.min_batch_size:
+                logger.debug(
+                    "Skipping %s step as num_reqs %d < min batch size %d.",
+                    phase.name.lower(),
+                    batch_composition_stats.get("num_reqs", 0),
+                    self.min_batch_size)
+                break
 
             self.inference_phase_seen[phase] = True
             self.profiling_n_steps_left = self.num_steps_to_profile_for
