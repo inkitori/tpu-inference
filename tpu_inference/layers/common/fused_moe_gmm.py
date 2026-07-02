@@ -23,7 +23,8 @@ from jax.sharding import PartitionSpec as P
 import tpu_inference.envs as envs
 from tpu_inference.kernels.collectives import \
     hierarchical_reduce_scatter as hier_rs
-from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.megablox.gmm_v2 import (calculate_tiling, gmm_v2,
+                                                   small_m_tiling)
 from tpu_inference.kernels.sparse_core.dense_gather_reduce import \
     dense_gather_reduce
 from tpu_inference.kernels.sparse_core.ragged_gather import \
@@ -207,6 +208,11 @@ def gmm_wrapper(lhs,
     # rhs_groupbias=None, so this conditional leaves their maybe_quantize_lhs=True
     # BYTE-IDENTICAL and they keep the quantized-lhs fast path.
     maybe_quantize_lhs = rhs_groupbias is None
+    # The MLX affine (W4A16) path spreads decode rows thinly over many groups;
+    # small_m_tiling caps tile_m at 16 for m<=256 (bit-exact, ~8-10% faster at
+    # decode, no-op at prefill). Other paths keep the default tiling so they
+    # stay byte-identical.
+    tile_info = small_m_tiling if rhs_groupbias is not None else calculate_tiling
     gmm_res = gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -221,6 +227,7 @@ def gmm_wrapper(lhs,
         fuse_act=fuse_act,
         maybe_quantize_lhs=maybe_quantize_lhs,
         preferred_element_type=preferred_element_type,
+        tile_info=tile_info,
     )
     return gmm_res
 

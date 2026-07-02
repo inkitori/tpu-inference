@@ -34,7 +34,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 
-from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2, small_m_tiling
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_moe_weights, shard_moe_weights)
 from tpu_inference.layers.common.quant_methods import MLX
@@ -167,7 +167,8 @@ def _mlx_int4_matmul(x, codes, scale, groupbias, group_sizes, mesh, in_axis,
                    rhs_groupbias=gb,
                    maybe_quantize_lhs=False,
                    preferred_element_type=jnp.bfloat16,
-                   vmem_limit_bytes=vmem_limit_bytes)
+                   vmem_limit_bytes=vmem_limit_bytes,
+                   tile_info=small_m_tiling)
         if in_axis is not None:  # RowParallel: reduce contraction-dim shards.
             y = jax.lax.psum(y, axis_name=in_axis)
         return y
@@ -250,17 +251,19 @@ class VllmMLXLinearMethod(QuantizeMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Unpack ONCE into the gmm_v2 int4 layout (codes [1, in, out] +
         # scale/groupbias [1, in//gs, 1, out]); the 4-bit weight never becomes
-        # bf16. weight_sharding is the [out, in] spec: out_axis shards dim 0
-        # (ColumnParallel: qkv/gate_up), in_axis shards dim 1 (RowParallel:
-        # o/down). The transformed specs put out_axis on the trailing out dim
-        # and in_axis on the in/block dim, matching tensor_parallel_gmm's w1/w2.
+        # bf16. weight_sharding is the [in, out] spec of the TRANSPOSED (jax)
+        # weight, exactly as VllmUnquantizedLinearMethod applies it: wsh[0]
+        # shards the contraction dim (RowParallel: o/down -> psum in apply),
+        # wsh[1] shards the output dim (ColumnParallel: qkv/gate_up -> no
+        # reduction). The transformed specs put out_axis on the trailing out
+        # dim and in_axis on the in/block dim, matching tensor_parallel_gmm.
         mesh = self.linear_config.mesh
         wsh = self.linear_config.weight_sharding
         output_sizes = self.linear_config.output_sizes
         n_shards = self.linear_config.n_shards
         bits = self.quant_config.bits
-        out_axis = wsh[0]
-        in_axis = wsh[1] if len(wsh) > 1 else None
+        in_axis = wsh[0]
+        out_axis = wsh[1] if len(wsh) > 1 else None
         self._mesh = mesh
         self._in_axis = in_axis
         self._out_axis = out_axis

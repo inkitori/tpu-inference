@@ -115,8 +115,8 @@ def test_create_weights_shapes_and_dtypes():
     out = 96
     mesh = test_utils.get_spmd_mesh(1)
     cfg = _make_linear_config(mesh, [out], num_proj=1, n_shards=1,
-                              weight_sharding=P(ShardingAxisName.ATTN_HEAD,
-                                                None))
+                              weight_sharding=P(None,
+                                                ShardingAxisName.ATTN_HEAD))
     method = VllmMLXLinearMethod(VllmMLXConfig(group_size=GROUP_SIZE,
                                                bits=BITS), cfg)
     layer = torch.nn.Module()
@@ -157,9 +157,10 @@ def test_apply_matches_golden(output_sizes, num_proj, n_shards, label):
     out = sum(output_sizes)
     mesh = test_utils.get_spmd_mesh(1)
     # n_shards>1 mimics a TP layout on a single device, so use a replicated
-    # weight_sharding (P(None, None)); n_shards=1 uses the column-parallel spec.
+    # weight_sharding (P(None, None)); n_shards=1 uses the column-parallel spec
+    # (the [in, out] convention: wsh[1] shards the output dim).
     weight_sharding = (P(None, None) if n_shards > 1 else P(
-        ShardingAxisName.ATTN_HEAD, None))
+        None, ShardingAxisName.ATTN_HEAD))
     cfg = _make_linear_config(mesh, output_sizes, num_proj, n_shards,
                               weight_sharding)
     method = VllmMLXLinearMethod(VllmMLXConfig(group_size=GROUP_SIZE,
@@ -192,7 +193,8 @@ def test_apply_matches_golden(output_sizes, num_proj, n_shards, label):
 @pytest.mark.parametrize("tp, in_features", [(2, 128), (8, 4096)])
 def test_rowparallel_input_dim_sharding_dequant_consistency(tp, in_features):
     """Step-3 (Task 8): RowParallelLinear shards the INPUT dim via
-    ``weight_sharding = P(None, ATTN_HEAD)``. For MLX that input dim is BOTH
+    ``weight_sharding = P(ATTN_HEAD, None)`` (the [in, out] spec of the
+    transposed jax weight). For MLX that input dim is BOTH
     packed (``weight`` [out, in//8], one uint32 word = 8 nibbles) and grouped
     (``scales``/``biases`` [out, in//64], one affine scale/bias per 64 inputs).
     Splitting axis 1 of the packed weight by ``tp`` and axis 1 of the grouped

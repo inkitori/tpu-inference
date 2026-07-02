@@ -368,7 +368,8 @@ class TpuPlatform(Platform):
 
         enable_continue_decode = vllm_config.additional_config.get(
             "enable_continue_decode", False)
-        is_pooling_model = vllm_config.model_config.runner_type == "pooling"
+        is_pooling_model = (vllm_config.model_config is not None and
+                            vllm_config.model_config.runner_type == "pooling")
         async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         # Late initialization to avoid circular import.
