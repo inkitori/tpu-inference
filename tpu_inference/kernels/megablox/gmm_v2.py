@@ -523,15 +523,26 @@ def inner_kernel(
                 w = tiled_rhs[:, start_n:end_n].astype(acc_ref.dtype)
                 if cfgs.rhs_cfgs.has_scale:
                     # Gather each block's scale row (clamped tail) -> [num_blocks,
-                    # col], then expand across the rhs_qbs k's per block ->
-                    # [tile_k, col]. Built from static slices (not a captured
-                    # array constant, which Pallas disallows).
+                    # col]. When tile_k does not over-align (num_blocks ==
+                    # n_read, the common case) this is a single squeeze; only
+                    # the over-aligned tail needs the per-block clamped concat
+                    # (built from static slices; Pallas disallows captured
+                    # array constants).
                     rhs_scale = tiled_rhs_ref.get_scale()
-                    sc_blocks = jnp.concatenate(
-                        [rhs_scale[b, :, start_n:end_n] for b in block_read_ids],
-                        axis=0)
-                    sc_exp = jnp.repeat(sc_blocks, rhs_qbs, axis=0)
-                    w = w * sc_exp.astype(acc_ref.dtype)
+                    if num_blocks == n_read:
+                        sc_blocks = rhs_scale[:, 0, start_n:end_n]
+                    else:
+                        sc_blocks = jnp.concatenate([
+                            rhs_scale[b, :, start_n:end_n]
+                            for b in block_read_ids
+                        ], axis=0)
+                    # Broadcast the per-block scale across the rhs_qbs k's of
+                    # each block via a fused reshape-multiply (no materialized
+                    # jnp.repeat expansion).
+                    col = w.shape[1]
+                    w = (w.reshape(num_blocks, rhs_qbs, col) *
+                         sc_blocks.astype(acc_ref.dtype)[:, None, :]).reshape(
+                             cfgs.tiles.tile_k, col)
 
                 # ONE matmul over the full tile_k.
                 acc_n = jnp.matmul(
@@ -543,9 +554,13 @@ def inner_kernel(
                 # lhs[t, k] is exactly (lhs_block_sums @ gbias_blocks)[t, n].
                 if cfgs.rhs_cfgs.has_groupbias:
                     rhs_gbias = tiled_rhs_ref.get_groupbias()
-                    gb_blocks = jnp.concatenate(
-                        [rhs_gbias[b, :, start_n:end_n] for b in block_read_ids],
-                        axis=0)
+                    if num_blocks == n_read:
+                        gb_blocks = rhs_gbias[:, 0, start_n:end_n]
+                    else:
+                        gb_blocks = jnp.concatenate([
+                            rhs_gbias[b, :, start_n:end_n]
+                            for b in block_read_ids
+                        ], axis=0)
                     acc_n += jnp.matmul(
                         lhs_block_sums, gb_blocks.astype(acc_ref.dtype),
                         preferred_element_type=jnp.float32).astype(acc_ref.dtype)
