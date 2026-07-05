@@ -51,12 +51,7 @@ through unchanged.
 import re
 from typing import Iterable, Iterator
 
-import jax.numpy as jnp
 import torch
-from torchax.ops.mappings import j2t
-
-from tpu_inference.layers.common.quantization import mlx_dequantize
-from tpu_inference.utils import t2j
 
 _SWITCH = re.compile(
     r"^(.*)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$"
@@ -78,27 +73,28 @@ def _dequant_to_bf16(weight: torch.Tensor, scales: torch.Tensor,
                      biases: torch.Tensor, group_size: int,
                      bits: int) -> torch.Tensor:
     # The weights arrive as PLAIN CPU torch.Tensor straight off the checkpoint
-    # stream (load device is "cpu"; torchax env is NOT active yet), so we use the
-    # repo's t2j() — the same idiom AWQ/FP8/unquantized use at load time — to
-    # cross into JAX, NOT jax_view() (which asserts an already-torchax tensor).
-    # The packed weight crosses as uint32; mlx_dequantize unpacks the 4-bit
-    # nibbles and applies the affine (w = scale * q + bias) in XLA, returning
-    # bf16. The .astype(bf16) guards the contract.
-    #
-    # We must materialize back to a PLAIN CPU torch.Tensor via j2t() (the mirror
-    # of t2j), NOT torch_view(): torch_view yields a torchax-wrapped tensor, but
-    # this weight is yielded into vLLM's load-time weight stream where the
-    # torchax env is DISABLED. The consuming weight_loaders end in
-    # param.data.copy_(loaded_weight) against a plain CPU param; a torchax src
-    # would dispatch into __torch_dispatch__ and assert "torchax Tensors can only
-    # do math within the torchax environment". j2t returns a real torch.Tensor.
+    # stream (load device is "cpu"; torchax env is NOT active yet), and must be
+    # yielded back into vLLM's load-time weight stream as plain CPU tensors
+    # (the consuming weight_loaders end in param.data.copy_(loaded_weight)
+    # against a plain CPU param; a torchax tensor would assert).
     packed = weight if weight.dtype == torch.uint32 else weight.to(torch.uint32)
-    w = mlx_dequantize(t2j(packed, use_dlpack=False),
-                       t2j(scales, use_dlpack=False),
-                       t2j(biases, use_dlpack=False),
-                       group_size=group_size,
-                       bits=bits)
-    return j2t(w.astype(jnp.bfloat16))
+    # Dequantize on HOST (pure numpy/torch): this is load-time-only work, and
+    # the fp32 intermediates for a vocab-sized tensor (~2GB for embed/lm_head)
+    # must not land in TPU HBM — when the DRAFT model loads (spec decode), the
+    # target's weights already occupy HBM and the allocation OOMs. JAX-on-CPU
+    # is not an option either: t2j commits its output to the TPU backend, and
+    # committed operands override jax.default_device.
+    import numpy as np
+    per_word = 32 // bits
+    mask = (1 << bits) - 1
+    p = packed.numpy()  # uint32 [out, in // per_word]
+    shifts = (np.arange(per_word, dtype=np.uint32) * bits)
+    # MLX order: element 0 = low bits (matches mlx_unpack).
+    q = ((p[..., None].astype(np.uint64) >> shifts) & mask).astype(np.float32)
+    q = q.reshape(*p.shape[:-1], -1)  # [out, in]
+    s = scales.to(torch.float32).numpy().repeat(group_size, axis=-1)
+    b = biases.to(torch.float32).numpy().repeat(group_size, axis=-1)
+    return torch.from_numpy(q * s + b).to(torch.bfloat16)
 
 
 def transform_mlx_weights(weights: Iterable[tuple[str, torch.Tensor]], *,

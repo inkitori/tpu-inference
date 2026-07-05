@@ -282,6 +282,7 @@ def moe_gmm_local(x: jax.Array,
                   group_offset: jax.Array,
                   topk_argsort_revert_indices: jax.Array,
                   topk_weights: jax.Array,
+                  shared_partial: jax.Array | None = None,
                   *,
                   activation: str,
                   topk: int,
@@ -293,9 +294,20 @@ def moe_gmm_local(x: jax.Array,
     """Main MoE logic on a local shard can run in TP or EP mode.
 
     Set parallelism for "tp" or "ep"
+
+    shared_partial: optional UNREDUCED shared-expert output for this shard,
+    local shape [1, num_tokens, hidden]. It is added into the routed partial
+    sums right before the combine psum, merging the shared-expert down_proj
+    all-reduce into the MoE combine all-reduce (one collective instead of
+    two; psum(r) + psum(s) == psum(r + s)). Only supported on the plain-psum
+    reduction path.
     """
 
     assert parallelism in ["tp", "ep"]
+    if shared_partial is not None:
+        assert not enable_rs_kernel and not scatter_results, (
+            "shared_partial psum-merge is only supported on the plain-psum "
+            "reduction path.")
 
     # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
     gmm1_res = gmm_wrapper(
@@ -450,6 +462,13 @@ def moe_gmm_local(x: jax.Array,
             else:
                 out = chunk_hidden.astype(x.dtype)
         else:
+            if shared_partial is not None:
+                # Fold this shard's shared-expert partial into the routed
+                # partial before the single combine psum. chunk_hidden may be
+                # hidden-padded; the shared partial carries the real hidden.
+                sp = shared_partial[0, start_tok:end_tok]
+                chunk_hidden = chunk_hidden.at[:, :sp.shape[-1]].add(
+                    sp.astype(chunk_hidden.dtype))
             out = jax.lax.psum(chunk_hidden,
                                axis_name=reduction_axis).astype(x.dtype)
 
@@ -472,6 +491,7 @@ def tensor_parallel_gmm(
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
+    shared_partial: jax.Array | None = None,
     *,
     activation: str,
     topk: int,
@@ -484,6 +504,11 @@ def tensor_parallel_gmm(
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
     group_offset = jnp.array([0])
+    # Stacked [tp, num_tokens, hidden] shared-expert partials: each device owns
+    # exactly its own partial slice along the reduction axis (pure relabel, no
+    # communication).
+    shared_partial_spec = (None if shared_partial is None else P(
+        ShardingAxisName.MLP_TENSOR, None, None))
 
     w1_spec = P(None, None, ShardingAxisName.MLP_TENSOR)
     w2_spec = P(None, ShardingAxisName.MLP_TENSOR, None)
@@ -536,6 +561,7 @@ def tensor_parallel_gmm(
             P(),
             data_p_spec,
             data_p_spec,
+            shared_partial_spec,
         ),
         out_specs=(final_out_specs),
         check_vma=False,
@@ -553,6 +579,7 @@ def tensor_parallel_gmm(
         group_offset,
         topk_argsort_revert_indices,
         topk_weights,
+        shared_partial,
     )
 
 
@@ -569,6 +596,7 @@ def expert_parallel_gmm(
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
+    shared_partial: jax.Array | None = None,
     *,
     activation: str,
     topk: int,
@@ -595,6 +623,9 @@ def expert_parallel_gmm(
     w2_scale_spec = None if w2_scale is None else ep_p_spec
     w2_groupbias_spec = None if w2_groupbias is None else ep_p_spec
     w2_bias_spec = None if w2_bias is None else ep_p_spec
+    # Stacked shared-expert partials, one slice per device on the combine axis.
+    shared_partial_spec = (None if shared_partial is None else P(
+        ShardingAxisName.EXPERT, None, None))
 
     if scatter_results:
         final_out_specs = attn_data_p_spec
@@ -629,6 +660,7 @@ def expert_parallel_gmm(
             ep_p_spec,
             data_p_spec,
             data_p_spec,
+            shared_partial_spec,
         ),
         out_specs=(final_out_specs),
         check_vma=False,
@@ -646,6 +678,7 @@ def expert_parallel_gmm(
         group_offset,
         topk_argsort_revert_indices,
         topk_weights,
+        shared_partial,
     )
 
 
@@ -700,6 +733,7 @@ def fused_moe_func(
     w2_groupbias: jax.Array | None = None,
     e_score_correction_bias: jax.Array | None = None,
     num_actual_tokens: jax.Array | int | None = None,
+    shared_partial: jax.Array | None = None,
     *,
     renormalize: bool,
     mesh: Mesh,
@@ -890,6 +924,7 @@ def fused_moe_func(
             group_sizes,
             topk_argsort_revert_indices,
             topk_weights,
+            shared_partial,
             activation=activation,
             topk=topk,
             mesh=mesh,
@@ -912,6 +947,7 @@ def fused_moe_func(
             group_sizes,
             topk_argsort_revert_indices,
             topk_weights,
+            shared_partial,
             activation=activation,
             topk=topk,
             mesh=mesh,

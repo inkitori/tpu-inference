@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import inspect
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
@@ -530,6 +531,18 @@ class VllmModelWrapper:
                 expert_indices = None
             return new_kv_caches, output, aux_hidden_states, expert_indices
 
+        # MTP draft models disagree on the name of the target-hidden-states
+        # kwarg: DeepSeek-style models take ``hidden_states`` while HYV3MTP
+        # (and other HF ``infer_mtp``-derived models) take
+        # ``previous_hidden_states``. Resolve it once from the draft model's
+        # forward signature; inside the traced function the name is static.
+        if self.is_draft_model:
+            _draft_fwd_params = inspect.signature(
+                self.model.vllm_model.forward).parameters
+            _hidden_states_kw = ("previous_hidden_states"
+                                 if "previous_hidden_states"
+                                 in _draft_fwd_params else "hidden_states")
+
         def draft_step_fun_impl(
             params_and_buffers,
             kv_caches: List[jax.Array],
@@ -550,7 +563,7 @@ class VllmModelWrapper:
                 kwargs = {
                     "input_ids": torch_view(input_ids),
                     "positions": torch_view(attn_metadata.input_positions),
-                    "hidden_states": torch_view(hidden_states),
+                    _hidden_states_kw: torch_view(hidden_states),
                     "inputs_embeds": None,
                 }
                 if self.vllm_config.speculative_config.method == "mtp":

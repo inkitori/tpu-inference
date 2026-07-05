@@ -81,6 +81,7 @@ def moe_apply(
     e_score_correction_bias: jax.Array | None = None,
     routed_scaling_factor: float | None = None,
     num_actual_tokens: jax.Array | int | None = None,
+    shared_partial_stacked: jax.Array | None = None,
 ) -> jax.Array:
     extra_backend_kwargs = dict(
         extra_backend_kwargs) if extra_backend_kwargs else {}
@@ -94,6 +95,12 @@ def moe_apply(
             swiglu_limit = getattr(layer, "swiglu_limit", None)
             if swiglu_limit is not None and swiglu_limit > 0:
                 activation = "silu_and_mul_with_clamp"
+        # The stacked shared-expert partial (psum merge) is only expressible on
+        # the GMM backends, whose combine is a plain psum the partial can fold
+        # into; the fused EP Pallas kernel and dense paths combine internally.
+        if shared_partial_stacked is not None:
+            assert moe_backend in (MoEBackend.GMM_EP, MoEBackend.GMM_TP), (
+                f"shared_partial_stacked is unsupported on {moe_backend}.")
         match moe_backend:
             case MoEBackend.FUSED_MOE:
                 subc_quant_w1_sz = None
@@ -172,6 +179,7 @@ def moe_apply(
                     expert_score_correction_bias=extra_backend_kwargs.get(
                         "e_score_correction_bias", None),
                     moe_chunk_size=moe_chunk_size,
+                    shared_partial=shared_partial_stacked,
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance
