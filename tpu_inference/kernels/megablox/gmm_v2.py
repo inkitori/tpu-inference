@@ -516,11 +516,19 @@ def inner_kernel(
                 lhs_block_sums = tiled_lhs.reshape(cfgs.tiles.tile_m, num_blocks,
                                                    rhs_qbs).sum(axis=2)
 
+            # Dequantize and multiply in the lhs dtype (bf16): the scale product
+            # only needs to be as precise as the int4 quantization it decodes
+            # (rel err ~2^-8 vs quant noise ~2^-4), the VPU processes bf16
+            # elementwise ops at twice the fp32 rate, and the MXU then runs a
+            # native bf16 x bf16 pass. Accuracy is preserved by keeping the
+            # matmul accumulation in fp32 via preferred_element_type.
+            deq_dtype = cfgs.lhs_cfgs.dtype
+
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
 
                 # Dequantize the full tile_k of rhs once for this n-chunk.
-                w = tiled_rhs[:, start_n:end_n].astype(acc_ref.dtype)
+                w = tiled_rhs[:, start_n:end_n].astype(deq_dtype)
                 if cfgs.rhs_cfgs.has_scale:
                     # Gather each block's scale row (clamped tail) -> [num_blocks,
                     # col]. When tile_k does not over-align (num_blocks ==
@@ -541,7 +549,7 @@ def inner_kernel(
                     # jnp.repeat expansion).
                     col = w.shape[1]
                     w = (w.reshape(num_blocks, rhs_qbs, col) *
-                         sc_blocks.astype(acc_ref.dtype)[:, None, :]).reshape(
+                         sc_blocks.astype(deq_dtype)[:, None, :]).reshape(
                              cfgs.tiles.tile_k, col)
 
                 # ONE matmul over the full tile_k.
@@ -562,7 +570,7 @@ def inner_kernel(
                             for b in block_read_ids
                         ], axis=0)
                     acc_n += jnp.matmul(
-                        lhs_block_sums, gb_blocks.astype(acc_ref.dtype),
+                        lhs_block_sums, gb_blocks.astype(deq_dtype),
                         preferred_element_type=jnp.float32).astype(acc_ref.dtype)
 
                 acc_list.append(acc_n)
