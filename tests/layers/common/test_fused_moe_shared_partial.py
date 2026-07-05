@@ -29,8 +29,10 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 NUM_DEVICES = 8
 NUM_EXPERTS = 16
 TOPK = 4
-HIDDEN = 64
-INTERMEDIATE = 32
+# Sized so the per-shard TP slice of 2*INTERMEDIATE still satisfies the gmm
+# fused-act lane constraint (2*I/8 divisible by 2*128).
+HIDDEN = 512
+INTERMEDIATE = 1024
 NUM_TOKENS = 16
 
 
@@ -87,5 +89,14 @@ def test_shared_partial_merges_into_combine(use_ep):
     merged = _run(mesh, use_ep, partials, x, w1, w2, gating)
 
     expected = np.asarray(routed) + partials_np.sum(axis=0)
-    np.testing.assert_allclose(np.asarray(merged), expected,
-                               rtol=1e-5, atol=1e-5)
+    # TP combines via dense_gather_reduce, which preserves fp32 — the merged
+    # add is then exact up to psum reassociation. EP combines via the
+    # sparse-core ragged_gather_reduce kernel whose per-shard partials are
+    # bf16, so the in-kernel (r_i + s_i) add rounds at bf16 per shard while
+    # the reference adds the shared term in fp64 outside: expect up to
+    # ~n_shards * bf16_eps relative difference. (Production runs bf16
+    # end-to-end, where the pre-merge code has the same rounding.)
+    # atol bound: bf16 eps (2^-8) x the ~10-magnitude routed addends ~= 0.04.
+    tol = dict(rtol=1e-5, atol=1e-5) if not use_ep else dict(rtol=2e-2,
+                                                             atol=5e-2)
+    np.testing.assert_allclose(np.asarray(merged), expected, **tol)
