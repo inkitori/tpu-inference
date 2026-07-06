@@ -129,8 +129,9 @@ def convert_torch_to_jax_with_view(loaded_weight: torch.Tensor,
     bit representation using a dtype view map.
     """
     torch_view_type = DTYPE_VIEW_MAP.get(jnp.dtype(cast_type))
-    loaded_weight = jnp.array(
-        loaded_weight.view(torch_view_type).numpy()).view(cast_type)
+    np_arr = loaded_weight.view(torch_view_type).numpy()
+    with cpu_mesh_context():
+        loaded_weight = jnp.array(np_arr).view(cast_type)
     return loaded_weight
 
 
@@ -777,7 +778,7 @@ def assign_and_shard_param(jax_param: nnx.Param,
         param_name: The name of the parameter, used for error logging.
         mesh: The device mesh to shard the parameter on.
     """
-    spec = jax_param.get_metadata().get("sharding", ())
+    spec = jax_param.get_metadata().get("out_sharding", ())
     if isinstance(spec, NamedSharding):
         spec = spec.spec
     elif isinstance(spec, SingleDeviceSharding):
