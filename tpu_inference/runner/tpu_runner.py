@@ -89,6 +89,7 @@ from tpu_inference.runner.structured_decoding_manager import \
     StructuredDecodingManager
 from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
+from tpu_inference.spec_decode.jax.fused_verify import fused_greedy_verify
 from tpu_inference.spec_decode.jax.utils import (
     concat_last_sampled_tokens_and_draft_tokens, extend_logits_simple,
     extract_last_sampled_tokens, filter_speculative_logprobs,
@@ -1654,6 +1655,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             step_rng = self.rng_params_for_sampling
 
         processed_bonus_logits = None
+        fused_last_sampled_token_id = None
+        fused_num_rejected_tokens = None
         if spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
             with self.maybe_forbid_compile:
@@ -1663,6 +1666,31 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     logits,
                     tpu_sampling_metadata,
                 )
+        elif (not tpu_sampling_metadata.do_sampling
+              and not tpu_sampling_metadata.logprobs
+              and os.environ.get("SPEC_PERFECT_DRAFT") != "1"
+              and os.environ.get("SPEC_FUSED_VERIFY", "1") == "1"):
+            # Greedy + no logprobs: fused verification avoids replicating the
+            # (padded_tokens, vocab) logits across chips and collapses five
+            # dispatches (bonus/target selects, sample, rejection, extract)
+            # into one.
+            assert input_ids is not None
+            with self.maybe_forbid_compile:
+                (next_tokens, fused_last_sampled_token_id,
+                 fused_num_rejected_tokens) = fused_greedy_verify(
+                     self.mesh,
+                     logits,
+                     input_ids,
+                     spec_decode_metadata.draft_lengths,
+                     spec_decode_metadata.target_logits_indices,
+                     spec_decode_metadata.bonus_logits_indices,
+                     spec_decode_metadata.final_logits_indices,
+                     num_speculative_tokens=self.speculative_config.
+                     num_speculative_tokens,
+                     max_num_reqs_per_dp_rank=self.max_num_reqs //
+                     self.dp_size,
+                     vocab_size=self.input_batch.vocab_size,
+                 )
         else:
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)
@@ -1778,11 +1806,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         spec_decode_num_rejected_tokens = None
         if self.speculative_config:
             with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
-                last_sampled_token_id, num_rejected_tokens = extract_last_sampled_tokens(
-                    spec_decode_metadata, next_tokens,
-                    self.speculative_config.num_speculative_tokens,
-                    self.input_batch.vocab_size,
-                    self.max_num_reqs // self.dp_size, self.mesh)
+                if fused_last_sampled_token_id is not None:
+                    last_sampled_token_id = fused_last_sampled_token_id
+                    num_rejected_tokens = fused_num_rejected_tokens
+                else:
+                    last_sampled_token_id, num_rejected_tokens = extract_last_sampled_tokens(
+                        spec_decode_metadata, next_tokens,
+                        self.speculative_config.num_speculative_tokens,
+                        self.input_batch.vocab_size,
+                        self.max_num_reqs // self.dp_size, self.mesh)
                 self.speculative_decoding_manager.propose_draft_token_ids(
                     next_tokens,
                     logits_indices_selector,
