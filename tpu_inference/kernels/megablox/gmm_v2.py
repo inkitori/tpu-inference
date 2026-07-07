@@ -107,6 +107,10 @@ class RhsRef(ABC):
         ...
 
     @abstractmethod
+    def get_groupbias(self) -> jax.Array:
+        ...
+
+    @abstractmethod
     def get_bias(self) -> jax.Array:
         ...
 
@@ -118,6 +122,7 @@ class WeightsRef(RhsRef):
 
     weight: Any
     scale: Any | None
+    groupbias: Any | None
     bias: Any | None
 
     def get_weight(self) -> jax.Array:
@@ -126,6 +131,10 @@ class WeightsRef(RhsRef):
     def get_scale(self) -> jax.Array:
         assert self.scale is not None
         return self.scale[...]
+
+    def get_groupbias(self) -> jax.Array:
+        assert self.groupbias is not None
+        return self.groupbias[...]
 
     def get_bias(self) -> jax.Array:
         assert self.bias is not None
@@ -149,6 +158,11 @@ class FusedWeightsRef(RhsRef):
         s_gate = self.gate.get_scale()
         s_up = self.up.get_scale()
         return jnp.concatenate([s_gate, s_up], axis=-1)
+
+    def get_groupbias(self) -> jax.Array:
+        gb_gate = self.gate.get_groupbias()
+        gb_up = self.up.get_groupbias()
+        return jnp.concatenate([gb_gate, gb_up], axis=-1)
 
     def get_bias(self) -> jax.Array:
         b_gate = self.gate.get_bias()
@@ -187,6 +201,7 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
+    has_groupbias: bool = False
 
     @property
     def should_bitcast(self) -> bool:
@@ -337,6 +352,7 @@ def generate_block_specs(
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
+    rhs_groupbias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
         rhs_bias_block_spec = pl.BlockSpec(
             (None, 1, cfgs.tiles.tile_n),
@@ -348,10 +364,19 @@ def generate_block_specs(
              cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
         )
+    if cfgs.rhs_cfgs.has_groupbias:
+        # groupbias shares the same [G, num_blocks, 1, N] layout and per-block
+        # index map as scale.
+        rhs_groupbias_block_spec = pl.BlockSpec(
+            (None, cfgs.num_quant_blocks_per_tile_k_read, 1,
+             cfgs.tiles.tile_n),
+            index_map.rhs_scale_index_map,
+        )
 
     rhs_block_spec = WeightsRef(
         weight=rhs_weight_spec,
         scale=rhs_scale_block_spec,
+        groupbias=rhs_groupbias_block_spec,
         bias=rhs_bias_block_spec,
     )
 
@@ -440,6 +465,13 @@ def inner_kernel(
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape,
                                             0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+            # The per-group additive bias contributes sum_{k in g} lhs[t, k],
+            # which is computed directly from lhs (not via the masked matmul).
+            # Zero out the padded K tail of lhs so it does not pollute the sum.
+            if cfgs.rhs_cfgs.has_groupbias:
+                mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape,
+                                                1) < valid_k
+                tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
 
         # Step 2: Matmul.
         acc_list = []
@@ -463,6 +495,13 @@ def inner_kernel(
             # contribution is 0 regardless of which in-bounds row is read.
             n_read = cfgs.num_quant_blocks_per_tile_k_read
             block_read_ids = [min(b, n_read - 1) for b in range(num_blocks)]
+
+            # n-independent: hoist the per-block lhs sums out of the start_n
+            # loop. lhs_block_sums[t, b] = sum_{k in block b} lhs[t, k].
+            if cfgs.rhs_cfgs.has_groupbias:
+                lhs_block_sums = tiled_lhs.reshape(cfgs.tiles.tile_m,
+                                                   num_blocks,
+                                                   rhs_qbs).sum(axis=2)
 
             # Dequantize and multiply in the lhs dtype (bf16): the scale
             # product only needs to be as precise as the quantization it
@@ -504,6 +543,27 @@ def inner_kernel(
                 acc_n = jnp.matmul(
                     tiled_lhs, w,
                     preferred_element_type=jnp.float32).astype(acc_ref.dtype)
+
+                # Per-group additive bias (affine quant: w = scale*q + bias).
+                # The contribution out[t, n] += sum_b gbias[b, n] *
+                # sum_{k in b} lhs[t, k] is exactly
+                # (lhs_block_sums @ gbias_blocks)[t, n].
+                if cfgs.rhs_cfgs.has_groupbias:
+                    rhs_gbias = tiled_rhs_ref.get_groupbias()
+                    if num_blocks == n_read:
+                        gb_blocks = rhs_gbias[:, 0, start_n:end_n]
+                    else:
+                        gb_blocks = jnp.concatenate([
+                            rhs_gbias[b, :, start_n:end_n]
+                            for b in block_read_ids
+                        ],
+                                                    axis=0)
+                    acc_n += jnp.matmul(
+                        lhs_block_sums,
+                        gb_blocks.astype(deq_dtype),
+                        preferred_element_type=jnp.float32).astype(
+                            acc_ref.dtype)
+
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
@@ -533,8 +593,6 @@ def inner_kernel(
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
                     block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-
                     # Perform lhs quantization. Note that for every block_lhs,
                     # same computation will be performed tiles_n//mxu_size times.
                     # But we can let compiler perform CSE and avoid recomputation.
@@ -552,36 +610,79 @@ def inner_kernel(
                     block_lhs_q = (block_lhs *
                                    block_scale_inv).astype(lhs_q_dtype)
 
-                    # Unlike unquantized path, compiler may not perform implicit type
-                    # conversion due to numeric concerns. As this can cause unsupported
-                    # matmul error, explicit type conversion is performed.
-                    if not tpu_info.is_matmul_supported(
-                            lhs_q_dtype, block_rhs.dtype):
-                        block_rhs = block_rhs.astype(lhs_q_dtype)
+                    # The rhs scale/groupbias may be FINER than the lhs quant
+                    # block (e.g. rhs group_size=64 vs lhs block=512). Quantize
+                    # the lhs once over the full lhs block (cheap, shared
+                    # scale), but apply the rhs per-sub-block scale/groupbias
+                    # inside the block so each rhs quant block gets its own
+                    # params -- otherwise a single matmul over the lhs block
+                    # mixes several rhs sub-blocks while only the first
+                    # sub-block's scale is applied (b_id collapses to
+                    # start_k//rhs_qbs), silently corrupting the result. When
+                    # the rhs has no finer block (rhs_qbs >= q_block_size),
+                    # rhs_sub == q_block_size and this reduces to the original
+                    # single matmul per lhs block.
+                    has_rhs_subblocks = (
+                        (cfgs.rhs_cfgs.has_scale
+                         or cfgs.rhs_cfgs.has_groupbias)
+                        and rhs_qbs < q_block_size)
+                    rhs_sub = rhs_qbs if has_rhs_subblocks else q_block_size
+                    for sub in range(0, end_k - start_k, rhs_sub):
+                        sub_end = min(end_k - start_k, sub + rhs_sub)
+                        k0 = start_k + sub
+                        sub_lhs_q = block_lhs_q[:, sub:sub_end]
+                        sub_rhs = tiled_rhs[k0:start_k + sub_end,
+                                            start_n:end_n]
+                        # Unlike unquantized path, compiler may not perform
+                        # implicit type conversion due to numeric concerns. As
+                        # this can cause unsupported matmul error, explicit
+                        # type conversion is performed.
+                        if not tpu_info.is_matmul_supported(
+                                lhs_q_dtype, sub_rhs.dtype):
+                            sub_rhs = sub_rhs.astype(lhs_q_dtype)
 
-                    block_acc = jnp.matmul(
-                        block_lhs_q,
-                        block_rhs,
-                        preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
+                        sub_acc = jnp.matmul(
+                            sub_lhs_q,
+                            sub_rhs,
+                            preferred_element_type=preferred_element_type,
+                        ).astype(acc_ref.dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                        # Undo lhs block scale (shared across rhs sub-blocks).
+                        sub_acc *= block_scale.astype(acc_ref.dtype)
 
-                    # Apply rhs subchannel scale per quant block. Clamp the
-                    # block index to the real blocks held in the buffer:
-                    # tile_k may over-align past size_k (when size_k is not a
-                    # multiple of num_lanes), so the scale buffer holds only
-                    # num_quant_blocks_per_tile_k_read blocks. The over-aligned
-                    # tail's rhs is already zeroed by the k-tail mask.
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = min(start_k // rhs_qbs,
-                                   cfgs.num_quant_blocks_per_tile_k_read - 1)
-                        rhs_scale_slice = tiled_rhs_ref.get_scale()
-                        block_acc *= rhs_scale_slice[b_id, :,
-                                                     start_n:end_n].astype(
-                                                         acc_ref.dtype)
+                        # Apply rhs subchannel scale per rhs quant block.
+                        # Clamp the block index to the real blocks held in the
+                        # buffer: tile_k may over-align past size_k, so the
+                        # scale/groupbias buffer holds only
+                        # num_quant_blocks_per_tile_k_read blocks. The
+                        # over-aligned tail's rhs/lhs are already zeroed by
+                        # the k-tail mask.
+                        if cfgs.rhs_cfgs.has_scale:
+                            b_id = min(
+                                k0 // rhs_qbs,
+                                cfgs.num_quant_blocks_per_tile_k_read - 1)
+                            rhs_scale_slice = tiled_rhs_ref.get_scale()
+                            sub_acc *= rhs_scale_slice[b_id, :,
+                                                       start_n:end_n].astype(
+                                                           acc_ref.dtype)
 
-                    acc_n += block_acc
+                        # Per-group additive bias (affine quant: w = scale*q +
+                        # bias). Use the full-precision lhs (not the quantized
+                        # one) for the sum_k lhs[t, k] term; added before
+                        # fuse_act.
+                        if cfgs.rhs_cfgs.has_groupbias:
+                            b_id = min(
+                                k0 // rhs_qbs,
+                                cfgs.num_quant_blocks_per_tile_k_read - 1)
+                            rhs_gbias_slice = tiled_rhs_ref.get_groupbias()
+                            sub_lhs_sum = jnp.sum(block_lhs[:, sub:sub_end],
+                                                  axis=1,
+                                                  keepdims=True)
+                            sub_acc += (
+                                rhs_gbias_slice[b_id, :, start_n:end_n] *
+                                sub_lhs_sum).astype(acc_ref.dtype)
+
+                        acc_n += sub_acc
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 
@@ -1073,6 +1174,7 @@ def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
+    rhs_groupbias: jax.Array | None,
     rhs_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
@@ -1093,6 +1195,19 @@ def validate_inputs(
         num_quant_blocks = rhs_scale.shape[1]
         assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
         assert size_k % num_quant_blocks == 0
+    if rhs_groupbias is not None:
+        # groupbias shares the same per-group, per-quant-block layout as scale.
+        num_groupbias_blocks = rhs_groupbias.shape[1]
+        assert rhs_groupbias.shape == (size_group, num_groupbias_blocks, 1,
+                                       size_n)
+        assert size_k % num_groupbias_blocks == 0
+        if rhs_scale is not None:
+            # Affine quant pairs scale + groupbias for the same quant blocks;
+            # a mismatch silently mis-dequantizes. Fail loudly.
+            assert rhs_scale.shape[1] == rhs_groupbias.shape[1], (
+                "rhs_scale and rhs_groupbias must share the same number of "
+                f"quant blocks, got {rhs_scale.shape[1]} (scale) vs "
+                f"{rhs_groupbias.shape[1]} (groupbias)")
 
     assert group_offset.shape == (1, )
 
@@ -1163,6 +1278,7 @@ def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
+    rhs_groupbias: jax.Array | None,
     rhs_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
@@ -1177,13 +1293,22 @@ def make_gmm_configs(
 ):
     """Fills the GMM config for the GMM kernel."""
 
-    dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
-                           group_offset, fuse_act)
+    dims = validate_inputs(lhs, rhs, rhs_scale, rhs_groupbias, rhs_bias,
+                           group_sizes, group_offset, fuse_act)
 
+    has_groupbias = rhs_groupbias is not None
     if rhs_scale is not None:
         has_scale = True
         rhs_quant_dtype = rhs.dtype
         num_blocks = rhs_scale.shape[1]
+        block_size = dims.size_k // num_blocks
+    elif has_groupbias:
+        # Affine quant may supply groupbias alongside scale; if scale is
+        # absent, derive the quant-block layout from groupbias (same
+        # [G, blocks, 1, N] layout).
+        has_scale = False
+        rhs_quant_dtype = rhs.dtype
+        num_blocks = rhs_groupbias.shape[1]
         block_size = dims.size_k // num_blocks
     else:
         has_scale = False
@@ -1196,6 +1321,7 @@ def make_gmm_configs(
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
+        has_groupbias=has_groupbias,
     )
 
     lhs_q_dtype = None
@@ -1253,14 +1379,14 @@ def make_gmm_configs(
         fuse_act=fuse_act,
     )
 
-    if has_scale:
-        # Invariant: the per-quant-block scale DMA/index count must never
-        # exceed the real blocks on the scale axis, else the BlockSpec
-        # over-reads adjacent HBM (disable_bounds_checks=True) and injects
-        # garbage. num_quant_blocks_per_tile_k_read enforces this; assert it
-        # so any future tiling change that breaks it fails loudly here.
+    if has_scale or has_groupbias:
+        # Invariant: the per-quant-block scale/groupbias DMA/index count must
+        # never exceed the real blocks on the scale/groupbias axis, else the
+        # BlockSpec over-reads adjacent HBM (disable_bounds_checks=True) and
+        # injects garbage. num_quant_blocks_per_tile_k_read enforces this;
+        # assert it so any future tiling change that breaks it fails loudly.
         assert cfgs.num_quant_blocks_per_tile_k_read <= cfgs.num_quant_blocks, (
-            "scale quant-block over-read: "
+            "scale/groupbias quant-block over-read: "
             f"{cfgs.num_quant_blocks_per_tile_k_read} > {cfgs.num_quant_blocks} "
             f"(tile_k={tiles.tile_k}, size_k={dims.size_k}, "
             f"quant_block_size={rhs_cfgs.quant_block_size})")
@@ -1295,6 +1421,8 @@ def gmm_v2(
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array
     | None = None,  # [size_group, num_blocks, 1, out_size]
+    rhs_groupbias: jax.Array
+    | None = None,  # [size_group, num_blocks, 1, out_size]
     rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
     *,
@@ -1318,6 +1446,9 @@ def gmm_v2(
         rhs: rhs with shape [size_group, size_k, size_n].
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
         rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
+        rhs_groupbias: The per-group additive bias of shape
+            [size_group, num_blocks, 1, out_size] for affine quant
+            (w = scale * q + groupbias). Same layout as rhs_scale.
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
@@ -1348,6 +1479,7 @@ def gmm_v2(
         lhs,
         rhs,
         rhs_scale,
+        rhs_groupbias,
         rhs_bias,
         group_sizes,
         group_offset,
@@ -1364,9 +1496,13 @@ def gmm_v2(
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
+    rhs_groupbias_spec = None
     if rhs_scale is not None:
         rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if rhs_groupbias is not None:
+        rhs_groupbias = rhs_groupbias.astype(jnp.float32)
+        rhs_groupbias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)
         rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -1414,7 +1550,10 @@ def gmm_v2(
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
-    rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    rhs_weights = WeightsRef(weight=rhs,
+                             scale=rhs_scale,
+                             groupbias=rhs_groupbias,
+                             bias=rhs_bias)
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
@@ -1426,6 +1565,7 @@ def gmm_v2(
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
+                    groupbias=rhs_groupbias_spec,
                     bias=rhs_bias_spec,
                 ),
             ],
