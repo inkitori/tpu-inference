@@ -88,16 +88,22 @@ class DFlashAttention(nnx.Module):
         self.mesh = mesh
         use_bias = bool(getattr(config, "attention_bias", False))
 
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        # Modern transformers folds rope_theta + yarn params into
+        # rope_parameters; older configs keep rope_theta / rope_scaling.
+        rope = dict(getattr(config, "rope_parameters", None) or {})
+        if not rope:
+            rope = dict(getattr(config, "rope_scaling", None) or {})
+        rope_theta = rope.get("rope_theta") or getattr(
+            config, "rope_theta", 10000.0)
         self.rotary_emb = GptOssRotaryEmbedding(
             head_dim=self.head_dim,
-            rope_theta=config.rope_theta,
+            rope_theta=rope_theta,
             dtype=dtype,
-            initial_context_length=rope_scaling.get(
+            initial_context_length=rope.get(
                 "original_max_position_embeddings", 4096),
-            rope_scaling_factor=rope_scaling.get("factor", 1.0),
-            rope_ntk_alpha=rope_scaling.get("beta_slow", 1.0),
-            rope_ntk_beta=rope_scaling.get("beta_fast", 32.0),
+            rope_scaling_factor=rope.get("factor", 1.0),
+            rope_ntk_alpha=rope.get("beta_slow", 1.0),
+            rope_ntk_beta=rope.get("beta_fast", 32.0),
         )
 
         self.q_proj = JaxEinsum(
@@ -382,10 +388,12 @@ class DFlashDraftModel(nnx.Module):
         x = jnp.take(self.embed_tokens.value, input_ids,
                      axis=0).astype(combined_ctx.dtype)
 
-        # The last num_layers KV caches belong to the draft.
+        # Resolve each draft layer's cache index from the runner's mapping;
+        # fall back to the last num_layers entries.
+        kv_index = dict(_layer_name_to_kvcache_index or ())
         draft_kv_start = len(kv_caches) - self.num_layers
         for i, layer in enumerate(self.layers):
-            idx = draft_kv_start + i
+            idx = kv_index.get(f"draft_layer.{i}", draft_kv_start + i)
             kv_caches[idx], x = layer(kv_caches[idx], x, combined_ctx, is_ctx,
                                       attention_metadata)
 

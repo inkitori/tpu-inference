@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+import huggingface_hub
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -149,8 +150,12 @@ def get_model_weights_files(
         logger.info(f"Found weights from local: {model_name_or_path}")
         weights_files = glob.glob(
             os.path.join(model_name_or_path, HF_WEIGHTS_FORMAT))
-    elif file_utils.is_hf_repo(model_name_or_path):
-        logger.info(f"Downloading weights from HF {model_name_or_path}")
+    elif huggingface_hub.constants.HF_HUB_OFFLINE or file_utils.is_hf_repo(
+            model_name_or_path):
+        # In offline mode is_hf_repo's existence check cannot reach the hub;
+        # snapshot_download(local_files_only=True) resolves straight from the
+        # local HF cache (and raises a clear error if the model is absent).
+        logger.info(f"Fetching weights from HF {model_name_or_path}")
         weights_files = file_utils.download_model_weights_from_hf(
             model_name_or_path, download_dir, HF_WEIGHTS_FORMAT)
     else:

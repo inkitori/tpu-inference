@@ -319,11 +319,15 @@ def get_flax_model(
     original_dtype = vllm_config.model_config.dtype
     model_dtype = to_jax_dtype(original_dtype)
     vllm_config.model_config.dtype = model_dtype
-    vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
+    # Draft models (e.g. bf16 DFlash drafts of an mxfp4 target) must neither
+    # inherit the target's quantization nor clobber the global quant config
+    # the already-loaded target is using.
+    if not is_draft_model:
+        vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
 
-    # Only perform qwix quantization if it is jax model.
-    if vllm_config.model_config:
-        update_vllm_config_for_qwix_quantization(vllm_config)
+        # Only perform qwix quantization if it is jax model.
+        if vllm_config.model_config:
+            update_vllm_config_for_qwix_quantization(vllm_config)
 
     if is_draft_model:
         model_class = _get_model_architecture(
