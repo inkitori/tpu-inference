@@ -114,6 +114,7 @@ def test_non_lane_multiple_size_k_does_not_overread_quant_blocks():
                             jnp.asarray(q, dtype=jnp.int4),
                             jnp.asarray(scale),
                             None,
+                            None,
                             jnp.asarray(group_sizes),
                             group_offset,
                             tile_info=calculate_tiling,
