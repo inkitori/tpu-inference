@@ -89,7 +89,8 @@ from tpu_inference.runner.structured_decoding_manager import \
     StructuredDecodingManager
 from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
-from tpu_inference.spec_decode.jax.fused_verify import fused_greedy_verify
+from tpu_inference.spec_decode.jax.fused_verify import (
+    fused_greedy_verify, fused_logits_greedy_verify)
 from tpu_inference.spec_decode.jax.utils import (
     concat_last_sampled_tokens_and_draft_tokens, extend_logits_simple,
     extract_last_sampled_tokens, filter_speculative_logprobs,
@@ -1120,6 +1121,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         with jax.set_mesh(self.mesh):
+            if grammar_output is not None and logits is None:
+                # Logits were deferred into the fused verify dispatch, but
+                # structured decoding needs them materialized; fall back.
+                selected_hidden = self._select_from_array_fn(
+                    hidden_states, spec_decode_metadata.final_logits_indices)
+                logits = self.compute_logits_fn(self.state_leaves,
+                                                selected_hidden, None)
             if grammar_output is not None:
                 (
                     require_struct_decoding, grammar_bitmask_padded, arange
@@ -1392,6 +1400,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 lora_metadata,
             )
             logits = self._select_from_array_fn(full_logits, logits_indices)
+        elif self._can_defer_spec_logits(spec_decode_metadata,
+                                         sampling_metadata):
+            # Greedy spec decode: the row-select + lm_head matmul run inside
+            # the fused greedy-verify dispatch in sample_tokens (the logits
+            # never materialize outside it). Saves two dispatches per step.
+            full_logits = None
+            logits = None
         else:
             full_logits = None
             hidden_states = self._select_from_array_fn(hidden_states,
@@ -1693,21 +1708,41 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # into one.
             assert input_ids is not None
             with self.maybe_forbid_compile:
-                (next_tokens, fused_last_sampled_token_id,
-                 fused_num_rejected_tokens) = fused_greedy_verify(
-                     self.mesh,
-                     logits,
-                     input_ids,
-                     spec_decode_metadata.draft_lengths,
-                     spec_decode_metadata.target_logits_indices,
-                     spec_decode_metadata.bonus_logits_indices,
-                     spec_decode_metadata.final_logits_indices,
-                     num_speculative_tokens=self.speculative_config.
-                     num_speculative_tokens,
-                     max_num_reqs_per_dp_rank=self.max_num_reqs //
-                     self.dp_size,
-                     vocab_size=self.input_batch.vocab_size,
-                 )
+                if logits is None:
+                    # Deferred logits: select + lm_head + verify in one
+                    # dispatch (lm_head shared from the drafter's state).
+                    (next_tokens, fused_last_sampled_token_id,
+                     fused_num_rejected_tokens) = fused_logits_greedy_verify(
+                         self.mesh,
+                         self.drafter.state.lm_head.value,
+                         hidden_states,
+                         input_ids,
+                         spec_decode_metadata.draft_lengths,
+                         spec_decode_metadata.target_logits_indices,
+                         spec_decode_metadata.bonus_logits_indices,
+                         spec_decode_metadata.final_logits_indices,
+                         num_speculative_tokens=self.speculative_config.
+                         num_speculative_tokens,
+                         max_num_reqs_per_dp_rank=self.max_num_reqs //
+                         self.dp_size,
+                         vocab_size=self.input_batch.vocab_size,
+                     )
+                else:
+                    (next_tokens, fused_last_sampled_token_id,
+                     fused_num_rejected_tokens) = fused_greedy_verify(
+                         self.mesh,
+                         logits,
+                         input_ids,
+                         spec_decode_metadata.draft_lengths,
+                         spec_decode_metadata.target_logits_indices,
+                         spec_decode_metadata.bonus_logits_indices,
+                         spec_decode_metadata.final_logits_indices,
+                         num_speculative_tokens=self.speculative_config.
+                         num_speculative_tokens,
+                         max_num_reqs_per_dp_rank=self.max_num_reqs //
+                         self.dp_size,
+                         vocab_size=self.input_batch.vocab_size,
+                     )
         else:
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)
@@ -1987,6 +2022,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             model_runner_output.routed_experts = routed_experts
 
         return model_runner_output
+
+    def _can_defer_spec_logits(self, spec_decode_metadata,
+                               sampling_metadata) -> bool:
+        """Whether logits computation can fold into the fused greedy-verify
+        dispatch (greedy DFlash spec decode, no logprobs/lora/diagnostics)."""
+        return (spec_decode_metadata is not None
+                and isinstance(self.drafter, DFlashProposer)
+                and not sampling_metadata.do_sampling
+                and not sampling_metadata.logprobs
+                and not self.input_batch.num_prompt_logprobs
+                and self.lora_config is None
+                and os.environ.get("SPEC_PERFECT_DRAFT") != "1"
+                and os.environ.get("SPEC_FUSED_VERIFY", "1") == "1")
 
     @jax.jit(static_argnums=(0, ))
     def _select_from_array_fn(self, array, indices_to_select):

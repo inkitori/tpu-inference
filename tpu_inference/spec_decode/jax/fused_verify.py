@@ -38,32 +38,18 @@ from tpu_inference.layers.jax.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID, _get_segment_info)
 
 
-@jax.jit(static_argnames=[
-    "num_speculative_tokens", "max_num_reqs_per_dp_rank", "vocab_size", "mesh"
-])
-def fused_greedy_verify(
+def _greedy_verify_from_ids(
     mesh: jax.sharding.Mesh,
-    logits: jax.Array,  # (padded_tokens, vocab), vocab-sharded
-    input_ids: jax.Array,  # (padded_total_scheduled_tokens,)
-    draft_lengths: jax.Array,  # (dp * padded_num_reqs_per_rank,)
-    target_logits_indices: jax.Array,  # (dp * padded_logits_len_per_rank,)
-    bonus_logits_indices: jax.Array,  # (dp * padded_num_reqs_per_rank,)
-    final_logits_indices: jax.Array,  # (dp * padded_logits_len_per_rank,)
+    greedy_ids: jax.Array,  # (padded_tokens,) per-row argmax of the logits
+    input_ids: jax.Array,
+    draft_lengths: jax.Array,
+    target_logits_indices: jax.Array,
+    bonus_logits_indices: jax.Array,
+    final_logits_indices: jax.Array,
     num_speculative_tokens: int,
     max_num_reqs_per_dp_rank: int,
     vocab_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Greedy-verify draft tokens against target logits in one fused program.
-
-    Returns:
-        output_token_ids: same layout as ``RejectionSampler`` output —
-            per rank ``[main_tokens (padded_logits_len), bonus (num_reqs)]``.
-        last_sampled_tokens: (max_num_reqs,) last accepted/bonus token per seq.
-        num_rejected_tokens: (max_num_reqs,) rejected count per seq.
-    """
-    # One argmax over the vocab-sharded logits; XLA emits a per-shard argmax
-    # plus a small cross-chip combine (no logits all-gather).
-    greedy_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
     def _body(greedy_ids, input_ids, draft_lens, target_idx, bonus_idx,
               final_idx):
@@ -143,3 +129,70 @@ def fused_greedy_verify(
         out_specs=(data_spec, data_spec, data_spec),
     )(greedy_ids, input_ids, draft_lengths, target_logits_indices,
       bonus_logits_indices, final_logits_indices)
+
+
+@jax.jit(static_argnames=[
+    "num_speculative_tokens", "max_num_reqs_per_dp_rank", "vocab_size", "mesh"
+])
+def fused_greedy_verify(
+    mesh: jax.sharding.Mesh,
+    logits: jax.Array,  # (padded_tokens, vocab), vocab-sharded
+    input_ids: jax.Array,  # (padded_total_scheduled_tokens,)
+    draft_lengths: jax.Array,  # (dp * padded_num_reqs_per_rank,)
+    target_logits_indices: jax.Array,  # (dp * padded_logits_len_per_rank,)
+    bonus_logits_indices: jax.Array,  # (dp * padded_num_reqs_per_rank,)
+    final_logits_indices: jax.Array,  # (dp * padded_logits_len_per_rank,)
+    num_speculative_tokens: int,
+    max_num_reqs_per_dp_rank: int,
+    vocab_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Greedy-verify draft tokens against precomputed target logits.
+
+    Returns:
+        output_token_ids: same layout as ``RejectionSampler`` output —
+            per rank ``[main_tokens (padded_logits_len), bonus (num_reqs)]``.
+        last_sampled_tokens: (max_num_reqs,) last accepted/bonus token per seq.
+        num_rejected_tokens: (max_num_reqs,) rejected count per seq.
+    """
+    # One argmax over the vocab-sharded logits; XLA emits a per-shard argmax
+    # plus a small cross-chip combine (no logits all-gather).
+    greedy_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    return _greedy_verify_from_ids(mesh, greedy_ids, input_ids, draft_lengths,
+                                   target_logits_indices,
+                                   bonus_logits_indices, final_logits_indices,
+                                   num_speculative_tokens,
+                                   max_num_reqs_per_dp_rank, vocab_size)
+
+
+@jax.jit(static_argnames=[
+    "num_speculative_tokens", "max_num_reqs_per_dp_rank", "vocab_size", "mesh"
+])
+def fused_logits_greedy_verify(
+    mesh: jax.sharding.Mesh,
+    lm_head_w: jax.Array,  # (padded_vocab, hidden), vocab-sharded
+    hidden_states: jax.Array,  # (padded_total_scheduled_tokens, hidden)
+    input_ids: jax.Array,
+    draft_lengths: jax.Array,
+    target_logits_indices: jax.Array,
+    bonus_logits_indices: jax.Array,
+    final_logits_indices: jax.Array,
+    num_speculative_tokens: int,
+    max_num_reqs_per_dp_rank: int,
+    vocab_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Row-select + lm_head matmul (f32 accumulate) + greedy verification in
+    ONE dispatch — the logits never leave this program."""
+    h = hidden_states[final_logits_indices]
+    logits = jax.lax.dot_general(
+        h,
+        lm_head_w,
+        dimension_numbers=(((1, ), (1, )), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    logits = logits[..., :vocab_size]
+    greedy_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    return _greedy_verify_from_ids(mesh, greedy_ids, input_ids, draft_lengths,
+                                   target_logits_indices,
+                                   bonus_logits_indices, final_logits_indices,
+                                   num_speculative_tokens,
+                                   max_num_reqs_per_dp_rank, vocab_size)
