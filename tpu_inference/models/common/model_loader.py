@@ -683,6 +683,14 @@ def resolve_model_architecture(vllm_config: VllmConfig,
         The model implementation type.
     """
 
+    if is_draft_model and envs.MODEL_IMPL_TYPE != "auto":
+        # A draft model must use the same impl as the target (enforced in
+        # Eagle3Proposer.load_model), so when the target impl is explicitly
+        # set, inherit it rather than guessing from the draft architecture,
+        # which may be registered in neither registry (e.g. an out-of-tree
+        # MTP head) and would mis-resolve to the flax_nnx default.
+        return envs.MODEL_IMPL_TYPE
+
     is_runai_streamer = getattr(getattr(vllm_config, 'load_config', None),
                                 'load_format', None) == 'runai_streamer'
     hf_config = vllm_config.speculative_config.draft_model_config.hf_config if is_draft_model else vllm_config.model_config.hf_config
