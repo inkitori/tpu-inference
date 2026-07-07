@@ -17,6 +17,12 @@ baseline. Session 3 also brought up the 120b variant (user request).
 | **120b DFlash (NS=3)**        | **8.30**  | 8.01   | 2.47       | **120**  | **1.50x**   |
 | 120b DFlash NS=5              | 8.52      | 8.03   | 2.79       | 117      | wash        |
 
+Final 256-prompt validation (fully warm): 20b DFlash mean 4.45 / median 4.28,
+accept 2.09, 5969 tok/s output; 120b DFlash mean 8.35-8.66 / median 7.97,
+accept 2.42. Noise-row-only draft o_proj/MLP (SPEC_DFLASH_NOISE_MLP) measured
+a WASH — the draft matmuls are weight-streaming-bound at these row counts;
+gated off. This also bounds what split-stream drafting could ever win.
+
 Serve: `bash scripts/serve_dflash.sh --async-scheduling` (now defaults
 NUM_SPEC=3, VLLM_TPU_BUCKET_PADDING_GAP=32, TARGET_F32_LOGITS=1).
 120b: `DFLASH_TARGET=openai/gpt-oss-120b DFLASH_DRAFT=z-lab/gpt-oss-120b-DFlash`.
