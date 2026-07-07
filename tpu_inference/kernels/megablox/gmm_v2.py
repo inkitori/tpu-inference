@@ -440,6 +440,14 @@ def inner_kernel(
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape,
                                             0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+            # The over-aligned lhs tail is an out-of-bounds read
+            # (disable_bounds_checks=True) and can hold non-finite garbage;
+            # NaN * 0 == NaN would poison whole output rows through the
+            # matmul, and on the quantized-lhs path the garbage would distort
+            # the per-block abs-max scale. Zero it alongside the rhs tail.
+            mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape,
+                                            1) < valid_k
+            tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
 
         # Step 2: Matmul.
         acc_list = []
