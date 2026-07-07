@@ -465,13 +465,16 @@ def inner_kernel(
             mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape,
                                             0) < valid_k
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
-            # The per-group additive bias contributes sum_{k in g} lhs[t, k],
-            # which is computed directly from lhs (not via the masked matmul).
-            # Zero out the padded K tail of lhs so it does not pollute the sum.
-            if cfgs.rhs_cfgs.has_groupbias:
-                mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape,
-                                                1) < valid_k
-                tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
+            # The over-aligned lhs tail is an out-of-bounds read
+            # (disable_bounds_checks=True) and can hold non-finite garbage;
+            # NaN * 0 == NaN would poison whole output rows through the
+            # matmul, on the quantized-lhs path the garbage would distort
+            # the per-block abs-max scale, and the per-group additive bias
+            # sums lhs directly (sum_{k in g} lhs[t, k]). Zero it alongside
+            # the rhs tail.
+            mask_lhs = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape,
+                                            1) < valid_k
+            tiled_lhs = jnp.where(mask_lhs, tiled_lhs, 0)
 
         # Step 2: Matmul.
         acc_list = []
