@@ -186,6 +186,10 @@ class SpeculativeDecodingManager:
         else:
             aux_hidden_states_for_drafter = aux_hidden_states
 
+        drafter_inputs = (attn_metadata, input_ids,
+                          aux_hidden_states_for_drafter,
+                          last_sampled_token_id, num_rejected_tokens)
+
         target_hidden_states, input_ids, last_token_indices, attn_metadata = self.runner.drafter.prepare_inputs(
             attn_metadata,
             input_ids,
@@ -204,6 +208,12 @@ class SpeculativeDecodingManager:
             last_token_indices=last_token_indices,
             target_hidden_states=target_hidden_states,
         )
+
+        if runner_utils.SPEC_DFLASH_DUMP_DIR:
+            runner_utils.dump_dflash_step(
+                self.runner, drafter_inputs,
+                (target_hidden_states, input_ids, last_token_indices,
+                 attn_metadata), draft_token_ids)
 
         if async_scheduling:
             if jnp.ndim(draft_token_ids) == 1:

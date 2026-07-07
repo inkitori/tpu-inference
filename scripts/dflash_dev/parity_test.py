@@ -29,7 +29,10 @@ TARGET_SNAP = glob.glob(
 D_CTX = 14400  # 5 layers * 2880
 D = 2880
 B = 8  # block size
-P = 13  # prompt/ctx rows step 1
+# P > 128 exercises multiple KV compute blocks (bkv_p=8 pages x 16 tokens)
+# and multiple pages in the non-causal kernel path — serving runs at these
+# lengths while the original parity run (P=13) fit in a single block.
+P = int(os.environ.get("PARITY_P", "300"))  # prompt/ctx rows step 1
 A2 = 3  # accepted rows step 2
 MASK_ID = 200000
 TOK0_STEP1 = 7  # noise[0] id step 1
@@ -131,7 +134,7 @@ with jax.set_mesh(mesh):
 
     # Paged KV cache: 8 layers, page_size 16, enough pages.
     PAGE = 16
-    NPAGES = 8
+    NPAGES = (P + A2 + B) // PAGE + 2
     cache_shape = get_kv_cache_shape(NPAGES, PAGE, 8, 64, jnp.bfloat16)
     kv_caches = [
         jnp.zeros(cache_shape, dtype=jnp.bfloat16) for _ in range(8)
@@ -174,15 +177,19 @@ with jax.set_mesh(mesh):
     jax_out2 = jax_out2_full[A2:]
 
 def report(name, hf_out, jax_out):
-    # hf_out: (block rows) — HF returns only the noise-block rows? The
-    # reference returns norm(hidden) for ALL forwarded rows (ctx + noise);
-    # slice its noise tail.
+    # The HF reference forwards only the noise block; ours forwards ctx+noise
+    # and we slice the noise tail on the JAX side before calling this.
     hf_noise = hf_out[-B:]
     diff = np.abs(hf_noise - jax_out)
     denom = np.abs(hf_noise) + 1e-3
+    row_cos = np.sum(hf_noise * jax_out, axis=1) / (
+        np.linalg.norm(hf_noise, axis=1) * np.linalg.norm(jax_out, axis=1))
     print(f"{name}: max_abs={diff.max():.4f} mean_abs={diff.mean():.5f} "
+          f"mean|hf|={np.abs(hf_noise).mean():.4f} "
           f"max_rel={(diff/denom).max():.3f} "
           f"cos={np.sum(hf_noise*jax_out)/ (np.linalg.norm(hf_noise)*np.linalg.norm(jax_out)):.6f}")
+    print(f"{name}: per-noise-row cos = "
+          f"{np.array2string(row_cos, precision=5, floatmode='fixed')}")
 
 report("step1", hf_out1, jax_out1)
 report("step2", hf_out2, jax_out2)

@@ -939,3 +939,67 @@ def get_pad_token_id(model_config: Any) -> int:
         if padding_token_id is None:
             padding_token_id = 0
     return padding_token_id
+
+
+# --- DFlash serving-path dump (debug; see scripts/dflash_dev/replay_dump.py) ---
+
+SPEC_DFLASH_DUMP_DIR = os.environ.get("SPEC_DFLASH_DUMP")
+_dflash_dump_step = 0
+
+
+def _np_f32(x):
+    return np.asarray(jax.device_get(x)).astype(np.float32)
+
+
+def _np_i(x):
+    return np.asarray(jax.device_get(x))
+
+
+def dump_dflash_step(runner, drafter_inputs, drafter_outputs,
+                     draft_token_ids) -> None:
+    """Dump one spec-decode step's drafter inputs/outputs to npz for offline
+    replay against the HF reference implementation."""
+    global _dflash_dump_step
+    max_steps = int(os.environ.get("SPEC_DFLASH_DUMP_STEPS", "40"))
+    if _dflash_dump_step >= max_steps:
+        return
+    os.makedirs(SPEC_DFLASH_DUMP_DIR, exist_ok=True)
+
+    (md_in, input_ids_in, aux, last_sampled, num_rejected) = drafter_inputs
+    (target_hidden_states, ids_out, last_token_indices,
+     md_out) = drafter_outputs
+    combined_out, is_ctx = target_hidden_states
+
+    payload = dict(
+        in_input_ids=_np_i(input_ids_in),
+        in_positions=_np_i(md_in.input_positions),
+        in_seq_lens=_np_i(md_in.seq_lens),
+        in_qsl=_np_i(md_in.query_start_loc),
+        last_sampled=_np_i(last_sampled),
+        num_rejected=_np_i(num_rejected),
+        out_ids=_np_i(ids_out),
+        out_is_ctx=_np_i(is_ctx),
+        out_combined=_np_f32(combined_out),
+        out_positions=_np_i(md_out.input_positions),
+        out_seq_lens=_np_i(md_out.seq_lens),
+        out_qsl=_np_i(md_out.query_start_loc),
+        out_last_token_indices=_np_i(last_token_indices),
+        draft_token_ids=_np_i(draft_token_ids),
+    )
+    for i, a in enumerate(aux):
+        payload[f"aux{i}"] = _np_f32(a)
+
+    if _dflash_dump_step == 0:
+        embed = runner.drafter.state.embed_tokens.value
+        lm_head = runner.drafter.state.lm_head.value
+        payload["embed_slice"] = _np_f32(embed[:512])
+        payload["lm_head_slice"] = _np_f32(lm_head[:512])
+        payload["embed_row_norms"] = _np_f32(
+            jnp.linalg.norm(embed.astype(jnp.float32), axis=1))
+        payload["lm_head_row_norms"] = _np_f32(
+            jnp.linalg.norm(lm_head.astype(jnp.float32), axis=1))
+
+    path = os.path.join(SPEC_DFLASH_DUMP_DIR,
+                        f"step_{_dflash_dump_step:04d}.npz")
+    np.savez_compressed(path, **payload)
+    _dflash_dump_step += 1
