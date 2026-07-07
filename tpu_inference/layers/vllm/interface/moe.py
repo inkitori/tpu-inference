@@ -65,7 +65,9 @@ def vllm_moe_apply(layer: RoutedExperts,
                    quant_method_instance: FusedMoEMethodBase,
                    x: torch.Tensor,
                    router_logits: torch.Tensor,
-                   input_ids: torch.Tensor | None = None) -> torch.Tensor:
+                   input_ids: torch.Tensor | None = None,
+                   shared_partial_stacked: torch.Tensor | None = None
+                   ) -> torch.Tensor:
     """
     Shared function for applying a FusedMoE layer for the TorchAX/vLLM backend.
 
@@ -132,4 +134,6 @@ def vllm_moe_apply(layer: RoutedExperts,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
             extra_backend_kwargs=extra_kwargs,
+            shared_partial_stacked=(None if shared_partial_stacked is None
+                                    else jax_view(shared_partial_stacked)),
         ))

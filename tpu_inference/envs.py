@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_BLOCK_SIZE_BUCKETS: list[int] = []
     MOE_APPROX_TOPK: bool = False
     MOE_APPROX_TOPK_RECALL_TARGET: float | None = None
+    MERGE_SHARED_EXPERT_PSUM: bool = True
     VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
     ENABLE_RS_KERNEL: bool = False
     NUM_PRECOMPILE_WORKERS: int = 1
@@ -385,6 +386,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable hierarchical reduce-scatter kernel for MoE
     "ENABLE_RS_KERNEL":
     env_bool("ENABLE_RS_KERNEL", default=False),
+    # Merge the shared-expert down_proj all-reduce into the routed-MoE combine
+    # all-reduce when eligible (see VllmMoERunner._shared_psum_merge_target).
+    "MERGE_SHARED_EXPERT_PSUM":
+    env_bool("MERGE_SHARED_EXPERT_PSUM", default=True),
     # Number of worker threads for parallel XLA precompilation.
     "NUM_PRECOMPILE_WORKERS":
     lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),

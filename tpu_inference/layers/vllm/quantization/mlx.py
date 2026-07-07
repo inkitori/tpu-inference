@@ -186,7 +186,7 @@ class VllmMLXConfig(QuantizationConfig, VllmQuantConfig):
 
 
 def _mlx_int4_matmul(x, codes, scale, groupbias, group_sizes, mesh, in_axis,
-                     out_axis, vmem_limit_bytes=None):
+                     out_axis, vmem_limit_bytes=None, stack_partials=False):
     """Single-group ``gmm_v2`` dense int4 matmul, sharded like the MoE TP path.
 
     ``gmm_v2`` is a Pallas kernel: GSPMD does not auto-partition it, so (exactly
@@ -204,7 +204,15 @@ def _mlx_int4_matmul(x, codes, scale, groupbias, group_sizes, mesh, in_axis,
     It only needs raising for a large UNSHARDED contraction dim (a dense down/o
     proj run at tp=1, where K never gets split across chips); at real serving TP
     the per-shard K is small and the default tiling fits.
+
+    ``stack_partials`` (RowParallel only) skips the psum and returns the
+    UNREDUCED per-shard partial sums stacked on a leading axis sharded over
+    ``in_axis`` -- global ``[n_shards, M, out]``, each device holding exactly
+    its own ``[1, M, out]`` slice (a pure relabel, no communication). Used to
+    merge the shared-expert down_proj all-reduce into the MoE combine psum.
     """
+    if stack_partials:
+        assert in_axis is not None, "stack_partials requires a RowParallel op"
 
     def _local(lhs, rhs, sc, gb, gs):
         y = gmm_v2(lhs=lhs,
@@ -216,11 +224,14 @@ def _mlx_int4_matmul(x, codes, scale, groupbias, group_sizes, mesh, in_axis,
                    preferred_element_type=jnp.bfloat16,
                    vmem_limit_bytes=vmem_limit_bytes,
                    tile_info=small_m_tiling)
+        if stack_partials:
+            return y[None]
         if in_axis is not None:  # RowParallel: reduce contraction-dim shards.
             y = jax.lax.psum(y, axis_name=in_axis)
         return y
 
-    out_specs = P(None, out_axis)
+    out_specs = (P(in_axis, None, out_axis)
+                 if stack_partials else P(None, out_axis))
     return jax.shard_map(
         _local,
         mesh=mesh,
@@ -384,6 +395,19 @@ class VllmMLXLinearMethod(QuantizeMethodBase):
             scale = jax_view(layer.scales)                   # [1, in//gs, 1, out]
             groupbias = jax_view(layer.biases)
             group_sizes = jnp.array([x_jax.shape[0]], dtype=jnp.int32)
+
+            # Stacked-partials mode (see _mlx_int4_matmul): skip this
+            # RowParallel op's psum and hand back the unreduced per-shard
+            # partials [n_shards, M, out] so the caller (VllmMoERunner's
+            # shared-expert psum merge) can fold them into the MoE combine
+            # all-reduce. Single-projection, bias-free ops only.
+            if getattr(layer, "_tpu_stack_partial_output", False):
+                assert bias is None or layer.skip_bias_add
+                assert len(self._output_sizes) == 1
+                return torch_view(
+                    _mlx_int4_matmul(x_jax, codes, scale, groupbias,
+                                     group_sizes, self._mesh, self._in_axis,
+                                     self._out_axis, stack_partials=True))
 
             # Single-group in-kernel int4 matmul (dequant inside gmm_v2).
             outs = _mlx_int4_matmul(x_jax, codes, scale, groupbias, group_sizes,
@@ -612,7 +636,8 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
                          layer: "RoutedExperts",
                          x: torch.Tensor,
                          router_logits: torch.Tensor,
-                         input_ids: Optional[torch.Tensor] = None
+                         input_ids: Optional[torch.Tensor] = None,
+                         shared_partial_stacked: Optional[torch.Tensor] = None
                          ) -> torch.Tensor:
         # w13 and w2: packed int4 + per-group scale + affine groupbias straight
         # through (dequant happens inside gmm_v2).
@@ -629,4 +654,5 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
                               weights=weights,
                               quant_method_instance=self,
                               x=x,
-                              router_logits=router_logits)
+                              router_logits=router_logits,
+                              shared_partial_stacked=shared_partial_stacked)
