@@ -85,6 +85,17 @@ class IncrementalModelLoader(DefaultModelLoader):
         load_config.load_format = "auto"
         super().__init__(load_config)
 
+    def get_all_weights(self, model_config, model):
+        """Stream raw weights, applying a checkpoint-format transform if the
+        quantization layer registers one for this model (see
+        get_weight_stream_transform); non-matching checkpoints pass through
+        the base iterator unchanged."""
+        weights = super().get_all_weights(model_config, model)
+        from tpu_inference.layers.vllm.quantization import \
+            get_weight_stream_transform
+        transform = get_weight_stream_transform(model_config.hf_config)
+        return transform(weights) if transform is not None else weights
+
     def load_model(self,
                    vllm_config: VllmConfig,
                    model_config: ModelConfig,

@@ -11,12 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-UNQUANTIZED = "unquantized"
-MXFP4 = "gpt_oss_mxfp4"
-AWQ = "auto_awq"
-COMPRESSED_TENSORS = "compressed-tensors"
-FP8 = "fp8"
-MLX = "mlx"
-NVFP4 = "modelopt_fp4"
-DSV4_FP8 = "deepseek_v4_fp8"
