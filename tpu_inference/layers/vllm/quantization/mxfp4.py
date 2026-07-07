@@ -46,6 +46,8 @@ from tpu_inference.layers.common.quant_methods import MXFP4
 from tpu_inference.layers.common.quantization import \
     dequantize_tensor_from_mxfp4_packed
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.kernels.ragged_paged_attention.v3.util import \
+    get_tpu_version
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -167,7 +169,14 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                     w2_weight_scale=None,
                     w2_bias=w2_bias,
                 ),
-                jnp.float4_e2m1fn,
+                # TPU generations before v7 lack a native float4_e2m1fn Mosaic
+                # lowering (tpu.unpack_subelements on f4E2M1FN), which crashes
+                # gmm_v2 at first prefill. Requantize MoE experts to
+                # float8_e4m3fn there instead; e4m3fn (not e5m2) because gmm_v2
+                # sets lhs_q_dtype=float8_e4m3fn and Mosaic cannot lower an
+                # e5m2->e4m3fn cast.
+                jnp.float4_e2m1fn
+                if get_tpu_version() >= 7 else jnp.float8_e4m3fn,
                 REQUANTIZED_BLOCK_SIZE,
                 w13_interleave=w13_interleave,
             )
