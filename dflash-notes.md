@@ -45,15 +45,51 @@ concurrent 1.05; ShareGPT c=32 `vllm bench` workload **accept len 1.58,
 rate 8.2%, pos-0 34.7%** (ignore-eos forces post-EOS OOD text + raw
 non-harmony ShareGPT turns → intrinsically hard to draft).
 
-## Levers if acceptance/net-speed must go up
+## FINAL BENCH RESULTS (ShareGPT c=32, greedy, warm server, 128 prompts;
+## JSONs in bench_results/)
 
-- **`MXFP4_DEQUANT_BF16=1`** (added to `mxfp4.py`, env-gated): keep dequantized
-  MoE experts in bf16 on v6e instead of fp8 requant → removes the 11% verifier
-  argmax flips + feature noise. Cost: 2x MoE weight HBM/BW (est +1.5-3ms/step
-  at c=32; EP shards 4 experts/chip ≈ 4.8GB/chip bf16). UNTESTED as of writing.
-- NUM_SPEC sweep: at accept~1.5, S=7 wastes draft+verify slots; try S=3.
-- The workload itself (ignore-eos ShareGPT raw turns) is the acceptance floor;
-  chat-formatted+harmony traffic accepts more.
+| config                  | mean TPOT | median | output tok/s | accept len |
+|-------------------------|-----------|--------|--------------|------------|
+| baseline sync           | 8.47 ms   | 8.44   | 2538         | –          |
+| **baseline async**      | **5.35**  | 5.31   | **3783**     | –          |
+| dflash sync fp8         | 17.0*     | 9.52   | 1877         | 2.21       |
+| **dflash async fp8**    | **6.24**  | 5.91   | **3194**     | 2.22       |
+| dflash async bf16-MoE   | 6.89      | 6.75   | 2894         | 2.20       |
+
+*sync dflash mean polluted by residual compiles (P99 277ms); median is
+representative. Per-user TPS ≈ 1000/TPOT: async baseline ≈ 187, async dflash
+≈ 160.
+
+**VERDICT: DFlash async beats the sync baseline by ~26% but TRAILS the async
+baseline by ~17%.** At accept len 2.22 the spec step (≈13.1ms = 5.91×2.22)
+costs ~2.5x a plain decode step (5.31ms); the acceptance doesn't cover it.
+Even at the reference ceiling (~2.9 tokens/step) it would win by only ~10%.
+Async scheduling itself works perfectly for dflash (token-identical output,
+same acceptance, 17.0→6.24ms mean TPOT — the sync spec path was host-bound).
+
+## Acceptance-noise attribution (closed)
+
+- bf16-MoE target (`MXFP4_REQUANT_DTYPE=bfloat16 MOE_NO_LHS_QUANT=1`, both
+  env gates committed): acceptance UNCHANGED (2.20 vs 2.22; smoke prompt
+  1.00 vs 1.05 acc/step) and ~10% slower. Target MoE quantization noise is
+  NOT what limits acceptance. The residual serving-vs-reference gap
+  (1.05 vs 1.84 acc/step on the probe prompt) lives elsewhere (attention
+  kernel / router bf16 numerics — unattributed, low ROI).
+- Scale-less bf16 gmm path produces GARBAGE output on v6e (unquantized rhs
+  through gmm_v2 broken there) — do not use; f16 rhs fails Mosaic lowering
+  ("Invalid vector type for load"). The working combo is bf16-with-block-
+  scales + normalize-to-1.0 patch in quantize_tensor (wide-float targets
+  only) + MOE_NO_LHS_QUANT=1.
+
+## What it would take for DFlash to win at c=32 (future work)
+
+1. Cut the spec-step overhead (~7.8ms over baseline step): profile; fuse
+   ctx-KV projection across draft layers, skip MLP for ctx rows, 2-stage
+   sharded argmax for draft logits, prepare_inputs donation/sharding audit.
+2. A stronger drafter for this traffic (accept 2.2 is intrinsic on
+   ShareGPT/ignore-eos; z-lab's 4.2-5.1 numbers are chat/harmony evals).
+3. NUM_SPEC<7 is nearly free to try but projected marginal (draft fwd cost is
+   block_size-bound, only verify width shrinks; pos rates 60/32/16/7/3/2/1%).
 
 ## Architecture implemented (unchanged from session 1, all pushed)
 
@@ -91,13 +127,9 @@ non-harmony ShareGPT turns → intrinsically hard to draft).
   truth_replay.py / aux_check.py / reference_e2e.py (all CPU, HF_HOME=gcs
   mount, HF_MODULES_CACHE=/tmp/hfmods, OMP_NUM_THREADS=32+).
 
-## Session-2 remaining plan
-
-1. [running] ShareGPT c=32 bench: dflash fp8 (tag dflash_fp8_c32).
-2. Baseline no-spec bench (restart server w/o spec config; same warmup rule).
-3. Async scheduling: flip --async-scheduling, verify, bench.
-4. Optional: MXFP4_DEQUANT_BF16=1 serve → acceptance + bench (net-win check).
-5. Optional: NUM_SPEC=3 bench.
+## Session-2 status: benches DONE (see FINAL BENCH RESULTS above), async
+## scheduling verified, acceptance question closed. Remaining work is the
+## optimization list under "What it would take for DFlash to win".
 
 ## Environment gotchas (rediscovery tax)
 

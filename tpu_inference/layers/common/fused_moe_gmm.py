@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import functools
 from typing import Literal
 
@@ -138,6 +139,10 @@ def gmm_wrapper(lhs,
         zero_initialize=False,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
+        # MOE_NO_LHS_QUANT=1 keeps activations unquantized even when the
+        # expert weights carry block scales (see MXFP4_REQUANT_DTYPE in
+        # layers/vllm/quantization/mxfp4.py).
+        maybe_quantize_lhs=os.environ.get("MOE_NO_LHS_QUANT") != "1",
     )
     return gmm_res
 

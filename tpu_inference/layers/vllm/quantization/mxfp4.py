@@ -161,41 +161,35 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w13_reorder_size = get_mesh_shape_product(
                 self.mesh, ShardingAxisName.MLP_TENSOR)
 
-            if os.environ.get("MXFP4_DEQUANT_BF16") == "1":
-                # Keep the dequantized experts in bf16 (no requant, no fp8
-                # activation quant in gmm). Costs ~2x MoE weight HBM/BW vs
-                # fp8 but removes the quantization noise from the target's
-                # hidden states — used to probe/raise DFlash draft acceptance
-                # (the drafter was trained on exact bf16 target features).
-                weights = FusedMoEWeights(
-                    w13_weight=w13_weight.astype(jnp.bfloat16),
+            # TPU generations before v7 lack a native float4_e2m1fn Mosaic
+            # lowering (tpu.unpack_subelements on f4E2M1FN), which crashes
+            # gmm_v2 at first prefill. Requantize MoE experts to
+            # float8_e4m3fn there instead; e4m3fn (not e5m2) because gmm_v2
+            # sets lhs_q_dtype=float8_e4m3fn and Mosaic cannot lower an
+            # e5m2->e4m3fn cast.
+            requant_dtype = (jnp.float4_e2m1fn
+                             if get_tpu_version() >= 7 else jnp.float8_e4m3fn)
+            if (env_dtype := os.environ.get("MXFP4_REQUANT_DTYPE")):
+                # Debug/quality override: e.g. float16 keeps the experts
+                # near-exact through the same block-scaled kernel path (e4m3
+                # at 512-block is genuinely lossy). Pair with
+                # MOE_NO_LHS_QUANT=1 to also skip fp8 activation quant —
+                # removes the target-side numeric noise that costs DFlash
+                # draft acceptance, at ~2x MoE weight HBM/BW.
+                requant_dtype = jnp.dtype(env_dtype)
+            weights = quantize_moe_weights(
+                FusedMoEWeights(
+                    w13_weight=w13_weight,
                     w13_weight_scale=None,
                     w13_bias=w13_bias,
-                    w2_weight=w2_weight.astype(jnp.bfloat16),
+                    w2_weight=w2_weight,
                     w2_weight_scale=None,
                     w2_bias=w2_bias,
-                )
-            else:
-                weights = quantize_moe_weights(
-                    FusedMoEWeights(
-                        w13_weight=w13_weight,
-                        w13_weight_scale=None,
-                        w13_bias=w13_bias,
-                        w2_weight=w2_weight,
-                        w2_weight_scale=None,
-                        w2_bias=w2_bias,
-                    ),
-                    # TPU generations before v7 lack a native float4_e2m1fn
-                    # Mosaic lowering (tpu.unpack_subelements on f4E2M1FN),
-                    # which crashes gmm_v2 at first prefill. Requantize MoE
-                    # experts to float8_e4m3fn there instead; e4m3fn (not
-                    # e5m2) because gmm_v2 sets lhs_q_dtype=float8_e4m3fn and
-                    # Mosaic cannot lower an e5m2->e4m3fn cast.
-                    jnp.float4_e2m1fn
-                    if get_tpu_version() >= 7 else jnp.float8_e4m3fn,
-                    REQUANTIZED_BLOCK_SIZE,
-                    w13_interleave=w13_interleave,
-                )
+                ),
+                requant_dtype,
+                REQUANTIZED_BLOCK_SIZE,
+                w13_interleave=w13_interleave,
+            )
             return process_moe_weights(
                 weights,
                 moe_backend=self.moe_backend,
@@ -217,10 +211,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
 
-        layer.w13_weight_scale = Parameter(weights.w13_weight_scale,
+        # Parameter(None) silently becomes an EMPTY tensor, which then reaches
+        # the gmm kernel as a bogus rhs_scale; keep None (bf16 dequant path).
+        layer.w13_weight_scale = (Parameter(
+            weights.w13_weight_scale, requires_grad=False)
+                                  if weights.w13_weight_scale is not None else
+                                  None)
+        layer.w2_weight_scale = (Parameter(weights.w2_weight_scale,
                                            requires_grad=False)
-        layer.w2_weight_scale = Parameter(weights.w2_weight_scale,
-                                          requires_grad=False)
+                                 if weights.w2_weight_scale is not None else
+                                 None)
 
         if has_bias:
             layer.w13_bias = Parameter(weights.w13_bias, requires_grad=False)
@@ -237,10 +237,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         has_bias = layer.moe_config.has_bias
         weights = FusedMoEWeights(
             w13_weight=jax_view(layer.w13_weight),
-            w13_weight_scale=jax_view(layer.w13_weight_scale),
+            w13_weight_scale=(jax_view(layer.w13_weight_scale)
+                              if layer.w13_weight_scale is not None else None),
             w13_bias=jax_view(layer.w13_bias) if has_bias else None,
             w2_weight=jax_view(layer.w2_weight),
-            w2_weight_scale=jax_view(layer.w2_weight_scale),
+            w2_weight_scale=(jax_view(layer.w2_weight_scale)
+                             if layer.w2_weight_scale is not None else None),
             w2_bias=jax_view(layer.w2_bias) if has_bias else None,
         )
 

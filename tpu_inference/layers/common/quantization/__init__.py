@@ -259,6 +259,15 @@ def quantize_tensor(
     dtype_max = float(dtype_info.max)
     dtype_min = float(dtype_info.min)
 
+    # For wide float targets (bf16+; only reachable via explicit requant
+    # overrides like MXFP4_REQUANT_DTYPE) any normalization works since float
+    # precision is scale-invariant — but scaling to dtype_max (~3.4e38 for
+    # bf16) overflows the f32 matmul accumulator downstream. Normalize blocks
+    # to [-1, 1] instead.
+    if jnp.issubdtype(dtype, jnp.floating) and dtype_info.bits >= 16:
+        dtype_max = 1.0
+        dtype_min = -1.0
+
     abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
     scale = abs_max / dtype_max
 
