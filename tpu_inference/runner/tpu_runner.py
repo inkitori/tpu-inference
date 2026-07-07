@@ -352,6 +352,26 @@ def _apply_prev_step_corrections_fn(
     return input_ids, seq_lens, positions
 
 
+@jax.jit(static_argnames=["keys", "sizes", "apply_corrections"],
+         donate_argnums=(0, ))
+def _unpack_blob_fn(blob: jax.Array, num_rejected_tokens, next_tokens, *,
+                    keys: tuple, sizes: tuple, apply_corrections: bool):
+    """Unpack the packed metadata blob and (optionally) apply the async
+    spec-decode corrections, all in one dispatch."""
+    indices = tuple(np.cumsum(sizes)[:-1])
+    parts = jnp.split(blob, indices)
+    md = {key: parts[i] for i, key in enumerate(keys)}
+    if apply_corrections:
+        input_ids, seq_lens, positions = _apply_prev_step_corrections_fn(
+            md["input_ids"], md["seq_lens"], md["positions"],
+            num_rejected_tokens, md["rej_seq_idx"], md["rej_pos_idx"],
+            next_tokens, md["sub_cur"], md["sub_pre"], md["sub_n"])
+        md["input_ids"] = input_ids
+        md["seq_lens"] = seq_lens
+        md["positions"] = positions
+    return md
+
+
 def _jax_logprobs_materialize(
         logprobs_tensors: LogprobsTensors,
         logits_indices_selector: Optional[List[int]] = None,
@@ -2733,8 +2753,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.mesh, (request_distribution, metadata_blob),
                 sharding=data_parallel_attn_sharding)
 
-        metadata = common_utils.DeviceBuffer.unpack_arrays(
-            dev_arrays_payload, metadata_layout)
+        apply_corr = bool(prev_step_corrections)
+        with self.maybe_forbid_compile:
+            metadata = _unpack_blob_fn(
+                dev_arrays_payload,
+                self._pre_async_results.spec_decode_num_rejected_tokens
+                if apply_corr else None,
+                self._pre_async_results.spec_decode_next_tokens
+                if apply_corr else None,
+                keys=tuple(metadata_layout.keys),
+                sizes=tuple(metadata_layout.sizes),
+                apply_corrections=apply_corr)
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
@@ -2756,22 +2785,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             positions = metadata["positions"]
 
         # The host-side `num_computed_tokens_cpu` assumes all speculatively
-        # proposed tokens from the previous step were accepted. Subtract the
-        # actual rejection counts from `seq_lens` and `positions` on TPU.
-        if prev_step_corrections:
-            # Fused: rejection subtraction + placeholder substitution in one
-            # dispatch, index arrays already on device via the blob.
-            with self.maybe_forbid_compile:
-                input_ids, seq_lens, positions = \
-                    _apply_prev_step_corrections_fn(
-                        input_ids, seq_lens, positions,
-                        self._pre_async_results.
-                        spec_decode_num_rejected_tokens,
-                        metadata["rej_seq_idx"], metadata["rej_pos_idx"],
-                        self._pre_async_results.spec_decode_next_tokens,
-                        metadata["sub_cur"], metadata["sub_pre"],
-                        metadata["sub_n"])
-        elif self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+        # proposed tokens from the previous step were accepted. The rejection
+        # subtraction (and placeholder substitution) already ran inside
+        # _unpack_blob_fn when prev_step_corrections is set.
+        if (not prev_step_corrections and self.speculative_config
+                and self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None):
             seq_lens, positions = self._subtract_num_rejected_tokens(
                 seq_lens, positions, req_ids_dp, scheduled_tokens_per_dp_rank)
 
