@@ -161,6 +161,32 @@ class SpeculativeDecodingManager:
             else:
                 attn_metadata = next(iter(attn_metadata.values()))
 
+        if self.runner.speculative_config.method == "mtp":
+            aux_hidden_states_for_drafter = (hidden_states, )
+        else:
+            aux_hidden_states_for_drafter = aux_hidden_states
+
+        if (isinstance(self.runner.drafter, DFlashProposer)
+                and not runner_utils.SPEC_DFLASH_DUMP_DIR
+                and spec_decode_metadata.prefill_aux is not None):
+            # Single-dispatch drafting path; the packed
+            # [next_prompt | is_in_prefill | num_reqs_dp] aux rode the
+            # metadata blob at prepare time (no host loop or transfer here).
+            (self.runner.kv_caches, draft_token_ids,
+             self._spec_next_tokens) = self.runner.drafter.prepare_and_propose(
+                 kv_caches=self.runner.kv_caches,
+                 attn_metadata=attn_metadata,
+                 input_ids=input_ids,
+                 aux_hidden_states=aux_hidden_states_for_drafter,
+                 last_sampled_token_id=last_sampled_token_id,
+                 packed_prefill_aux=spec_decode_metadata.prefill_aux,
+                 num_rejected_tokens=num_rejected_tokens,
+             )
+            if async_scheduling:
+                return draft_token_ids
+            draft_token_ids = np.array(draft_token_ids)
+            return draft_token_ids.tolist()
+
         req_ids = self.runner.input_batch.req_ids
         max_num_seqs = attn_metadata.seq_lens.shape[0]
         next_prompt_token_id = np.zeros(max_num_seqs, dtype=np.int32)
@@ -186,34 +212,6 @@ class SpeculativeDecodingManager:
                     next_prompt_token_id[
                         j + rank * max_num_reqs_per_dp_rank] = next_token_id
                     is_in_prefill[j + rank * max_num_reqs_per_dp_rank] = 1
-
-        if self.runner.speculative_config.method == "mtp":
-            aux_hidden_states_for_drafter = (hidden_states, )
-        else:
-            aux_hidden_states_for_drafter = aux_hidden_states
-
-        if (isinstance(self.runner.drafter, DFlashProposer)
-                and not runner_utils.SPEC_DFLASH_DUMP_DIR):
-            # Single-transfer, single-dispatch drafting path.
-            packed_prefill_aux = device_array(
-                self.runner.mesh,
-                np.concatenate(
-                    [next_prompt_token_id, is_in_prefill, num_reqs_dp]),
-                sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
-            (self.runner.kv_caches, draft_token_ids,
-             self._spec_next_tokens) = self.runner.drafter.prepare_and_propose(
-                 kv_caches=self.runner.kv_caches,
-                 attn_metadata=attn_metadata,
-                 input_ids=input_ids,
-                 aux_hidden_states=aux_hidden_states_for_drafter,
-                 last_sampled_token_id=last_sampled_token_id,
-                 packed_prefill_aux=packed_prefill_aux,
-                 num_rejected_tokens=num_rejected_tokens,
-             )
-            if async_scheduling:
-                return draft_token_ids
-            draft_token_ids = np.array(draft_token_ids)
-            return draft_token_ids.tolist()
 
         next_prompt_token_id, is_in_prefill, num_reqs_dp = device_array(
             self.runner.mesh,

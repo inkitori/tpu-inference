@@ -871,7 +871,9 @@ class PhasedBasedProfiler:
         "final_logits_indices",
     ],
     meta_fields=[],
-    drop_fields=["draft_lengths_cpu", "req_indices_dp", "req_ids_dp"],
+    drop_fields=[
+        "draft_lengths_cpu", "req_indices_dp", "req_ids_dp", "prefill_aux"
+    ],
 )
 @dataclass
 class SpecDecodeMetadata:
@@ -884,6 +886,10 @@ class SpecDecodeMetadata:
     draft_lengths_cpu: Any = field(init=False, default=None)
     req_indices_dp: dict = field(init=False, default_factory=dict)
     req_ids_dp: dict = field(init=False, default_factory=dict)
+    # Packed [next_prompt_token_id | is_in_prefill | num_reqs_dp] device
+    # array (rides the metadata blob); consumed by the DFlash drafting
+    # dispatch instead of a per-step host loop + transfer in the manager.
+    prefill_aux: Any = field(init=False, default=None)
 
 
 def host_extract_sampled_tokens(

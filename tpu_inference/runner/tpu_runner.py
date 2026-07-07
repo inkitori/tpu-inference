@@ -2520,6 +2520,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 ))
             logits_indices_view[:] = spec_decode_metadata.final_logits_indices
 
+            # Drafter aux: [next_prompt_token_id | is_in_prefill |
+            # num_reqs_dp], packed and staged into the metadata blob. For a
+            # partial-prefill request the drafter's noise block starts from
+            # the next PROMPT token (the sampled token is discarded).
+            aux_view = self.device_buffer.get_view(
+                (2 * self.max_num_reqs + dp_size, ), key="spec_prefill_aux")
+            aux_view[:] = 0
+            for rank in range(dp_size):
+                aux_view[2 * self.max_num_reqs + rank] = len(
+                    req_indices_dp[rank])
+                for j, req_idx in enumerate(req_indices_dp[rank]):
+                    req_id = self.input_batch.req_ids[req_idx]
+                    req_state = self.requests[req_id]
+                    seq_len = (req_state.num_computed_tokens +
+                               scheduler_output.num_scheduled_tokens[req_id])
+                    if seq_len < req_state.num_tokens:
+                        # Partial prefill: drafting continues from the next
+                        # prompt token.
+                        slot = j + rank * max_num_reqs_per_dp_rank
+                        aux_view[slot] = req_state.get_token_id(seq_len)
+                        aux_view[self.max_num_reqs + slot] = 1
+
         # Put to device
         sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
             self.mesh,
@@ -2680,6 +2702,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_metadata.bonus_logits_indices = metadata[
                 "spec_bonus_logits_indices"]
             spec_decode_metadata.final_logits_indices = logits_indices
+            spec_decode_metadata.prefill_aux = metadata["spec_prefill_aux"]
 
         if positions_in_blob:
             positions = metadata["positions"]

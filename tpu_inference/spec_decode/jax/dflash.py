@@ -38,6 +38,7 @@ groups (standard block tables), so batching, slot management, and preemption
 are handled by vLLM — the proposer holds no per-request state.
 """
 
+import os
 from dataclasses import replace
 from typing import Any
 
@@ -350,6 +351,124 @@ class DFlashProposer:
         target_hidden_states = (combined_out, is_ctx)
         return target_hidden_states, ids_out, last_token_indices, draft_md
 
+    def _prepare_split_impl(
+        self,
+        state_leaves: Any,
+        block_tables: jax.Array,
+        attn_metadata: AttentionMetadata,
+        input_ids: jax.Array,
+        aux_hidden_states: tuple[jax.Array, ...],
+        last_sampled_token_id: jax.Array,
+        next_prompt_token_id: jax.Array,
+        is_in_prefill: jax.Array,
+        num_rejected_tokens: jax.Array,
+        num_reqs_dp: jax.Array,
+    ):
+        """Split-stream layout: a compact ctx stream (size T_in) whose K/V
+        are written up front, and a fixed-size noise stream (B * max_reqs)
+        that alone runs through the draft transformer."""
+        B = self.block_size
+        S = self.num_speculative_tokens
+        qsl = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        max_reqs = seq_lens.shape[0]
+        T_in = input_ids.shape[0]
+        T_noise = B * max_reqs
+
+        num_reqs = num_reqs_dp.reshape(-1)[0]
+        req_ids = jnp.arange(max_reqs, dtype=jnp.int32)
+        req_mask = req_ids < num_reqs
+
+        q_lens = jnp.where(req_mask, qsl[1:] - qsl[:-1], 0)
+        n_rej = jnp.where(req_mask,
+                          num_rejected_tokens.reshape(-1)[:max_reqs], 0)
+        a = jnp.maximum(q_lens - n_rej, 0)
+        new_seq_lens = jnp.where(req_mask, seq_lens - n_rej, 0)
+
+        raw = jnp.concatenate(aux_hidden_states, axis=-1)
+        combined_all = self.combine_hidden_states_fn(state_leaves, raw)
+
+        distribution = jnp.stack([
+            jnp.zeros((), jnp.int32),
+            jnp.zeros((), jnp.int32),
+            num_reqs.astype(jnp.int32),
+        ])
+
+        # ---- ctx stream: the rejection-trimmed accepted rows, compacted ----
+        ctx_qsl = jnp.concatenate(
+            [jnp.zeros((1, ), jnp.int32),
+             jnp.cumsum(a).astype(jnp.int32)])
+        t = jnp.arange(T_in, dtype=jnp.int32)
+        req_of_c = jnp.sum(t[:, None] >= ctx_qsl[None, 1:],
+                           axis=1).astype(jnp.int32)
+        req_of_c = jnp.clip(req_of_c, 0, max_reqs - 1)
+        local_c = t - ctx_qsl[req_of_c]
+        valid_c = t < ctx_qsl[max_reqs]
+        src_c = jnp.clip(qsl[req_of_c] + local_c, 0, T_in - 1)
+        ctx_combined = jnp.where(valid_c[:, None], combined_all[src_c],
+                                 0).astype(combined_all.dtype)
+        ctx_positions = jnp.where(valid_c,
+                                  attn_metadata.input_positions[src_c],
+                                  0).astype(jnp.int32)
+        # kv span for the ctx write ends at new_seq_lens (which is already
+        # the committed-minus-newest length N'-1; see _prepare_inputs_impl):
+        # the end-aligned a rows land on [N-1, N'-1), exactly matching the
+        # combined-stream layout where kv_len = new_seq_lens + B covers ctx
+        # then noise.
+        ctx_seq_lens = jnp.where(req_mask, new_seq_lens, 0).astype(jnp.int32)
+        ctx_md = replace(
+            attn_metadata,
+            input_positions=ctx_positions,
+            seq_lens=ctx_seq_lens,
+            query_start_loc=ctx_qsl,
+            request_distribution=distribution,
+            block_tables=block_tables,
+        )
+
+        # ---- noise stream: B rows per active request -----------------------
+        noise_qsl = jnp.concatenate([
+            jnp.zeros((1, ), jnp.int32),
+            jnp.cumsum(jnp.where(req_mask, B, 0)).astype(jnp.int32)
+        ])
+        t2 = jnp.arange(T_noise, dtype=jnp.int32)
+        req_of_n = jnp.sum(t2[:, None] >= noise_qsl[None, 1:],
+                           axis=1).astype(jnp.int32)
+        req_of_n = jnp.clip(req_of_n, 0, max_reqs - 1)
+        noise_off = t2 - noise_qsl[req_of_n]
+        valid_n = t2 < noise_qsl[max_reqs]
+
+        first_token = jnp.where(
+            is_in_prefill.reshape(-1)[:max_reqs] != 0,
+            next_prompt_token_id.reshape(-1)[:max_reqs],
+            last_sampled_token_id.reshape(-1)[:max_reqs],
+        ).astype(jnp.int32)
+        ids_noise = jnp.where(
+            valid_n,
+            jnp.where(noise_off == 0, first_token[req_of_n],
+                      self.mask_token_id), 0).astype(jnp.int32)
+        pos_noise = jnp.where(valid_n, new_seq_lens[req_of_n] + noise_off,
+                              0).astype(jnp.int32)
+        noise_seq_lens = jnp.minimum(
+            new_seq_lens + jnp.where(req_mask, B, 0),
+            self.max_model_len).astype(jnp.int32)
+        noise_md = replace(
+            attn_metadata,
+            input_positions=pos_noise,
+            seq_lens=noise_seq_lens,
+            query_start_loc=noise_qsl,
+            request_distribution=distribution,
+            block_tables=block_tables,
+        )
+
+        # Draft tokens come from noise rows 1..S (row 0 is the bonus token).
+        last_token_indices = noise_qsl[:max_reqs, None] + 1 + jnp.arange(
+            S, dtype=jnp.int32)[None, :]
+        last_token_indices = jnp.clip(last_token_indices.reshape(-1), 0,
+                                      T_noise - 1)
+
+        target_hidden_states = (ctx_combined, ctx_md)
+        return target_hidden_states, ids_noise, last_token_indices, noise_md
+
     def propose(
         self,
         kv_caches: list[jax.Array],
@@ -471,8 +590,18 @@ class DFlashProposer:
         is_in_prefill = packed_prefill_aux[max_reqs:2 * max_reqs]
         num_reqs_dp = packed_prefill_aux[2 * max_reqs:]
 
+        # Split-stream drafting (ctx K/V written via a slim dummy-q kernel
+        # pass + noise-only transformer) is DISABLED by default: it passes
+        # single-request parity (bit-exact on 1 chip, cos 0.9999 on 8) but
+        # under real multi-request serving the ragged tiny-q ctx-write pass
+        # corrupts the draft cache (bench accept len 2.03 -> 1.26) and a
+        # multi-request kernel repro hangs. Suspected RPA v3 edge case with
+        # many tiny (0-4 row) non-causal segments. Keep for future debugging.
+        prepare = (self._prepare_split_impl
+                   if os.environ.get("SPEC_DFLASH_SPLIT", "0") == "1" else
+                   self._prepare_inputs_impl)
         (target_hidden_states, ids_out, last_token_indices,
-         draft_md) = self._prepare_inputs_impl(
+         draft_md) = prepare(
              state_leaves, block_tables, attn_metadata, input_ids,
              aux_hidden_states, last_sampled_token_id, next_prompt_token_id,
              is_in_prefill, num_rejected_tokens, num_reqs_dp)

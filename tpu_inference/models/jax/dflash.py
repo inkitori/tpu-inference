@@ -165,12 +165,43 @@ class DFlashAttention(nnx.Module):
             quant_config=quant_config,
         )
 
+    def write_ctx_kv(
+        self,
+        kv_cache: jax.Array,
+        combined_ctx: jax.Array,  # (T_ctx, D) compact ctx stream
+        md: AttentionMetadata,  # ctx-stream metadata (kv_len = N'-1)
+    ) -> jax.Array:
+        """Write this layer's context K/V (projected from ``combined_ctx``)
+        into the paged cache via the kernel's end-aligned write.
+
+        The attention output is discarded; a slim dummy query with
+        ``num_kv_heads`` heads keeps the wasted compute negligible. With
+        kv_len = N'-1 and q_len = a rows, the end-aligned write lands exactly
+        on [N-1, N'-1) — the freshly accepted context positions.
+        """
+        k = self.k_norm(self.k_proj(combined_ctx))
+        v = self.v_proj(combined_ctx)
+        q = jnp.zeros((combined_ctx.shape[0], self.num_kv_heads,
+                       self.head_dim), combined_ctx.dtype)
+        q, k = self.rotary_emb(q, k, md.input_positions)
+        new_kv_cache, _ = attention(
+            kv_cache,
+            q,
+            k,
+            v,
+            md,
+            self.mesh,
+            self.head_dim,
+            use_causal_mask=False,
+        )
+        return new_kv_cache
+
     def __call__(
         self,
         kv_cache: jax.Array,
         hidden_states: jax.Array,  # (T, D)
-        combined_ctx: jax.Array,  # (T, D) — valid at ctx rows only
-        is_ctx: jax.Array,  # (T,) bool
+        combined_ctx: Optional[jax.Array],  # (T, D) — valid at ctx rows only
+        is_ctx: Optional[jax.Array],  # (T,) bool
         md: AttentionMetadata,
     ) -> Tuple[jax.Array, jax.Array]:
         positions = md.input_positions
@@ -180,13 +211,18 @@ class DFlashAttention(nnx.Module):
         k_noise = self.k_norm(self.k_proj(hidden_states))
         v_noise = self.v_proj(hidden_states)
 
-        # Context rows: K/V from the shared projected context, NOT from the
-        # evolving hidden states. Same per-layer projections + k-norm + RoPE.
-        k_ctx = self.k_norm(self.k_proj(combined_ctx))
-        v_ctx = self.v_proj(combined_ctx)
+        if is_ctx is None:
+            # Pure noise-block stream (split mode): context K/V were already
+            # written by write_ctx_kv.
+            k, v = k_noise, v_noise
+        else:
+            # Context rows: K/V from the shared projected context, NOT from
+            # the evolving hidden states. Same projections + k-norm + RoPE.
+            k_ctx = self.k_norm(self.k_proj(combined_ctx))
+            v_ctx = self.v_proj(combined_ctx)
 
-        k = jnp.where(is_ctx[:, None, None], k_ctx, k_noise)
-        v = jnp.where(is_ctx[:, None, None], v_ctx, v_noise)
+            k = jnp.where(is_ctx[:, None, None], k_ctx, k_noise)
+            v = jnp.where(is_ctx[:, None, None], v_ctx, v_noise)
 
         q, k = self.rotary_emb(q, k, positions)
 
@@ -379,24 +415,47 @@ class DFlashDraftModel(nnx.Module):
         self,
         kv_caches: List[jax.Array],
         input_ids: jax.Array,  # (T,)
-        target_hidden_states,  # (combined_ctx (T, D), is_ctx (T,) bool)
+        target_hidden_states,  # see below
         attention_metadata: AttentionMetadata,
         _layer_name_to_kvcache_index=None,
     ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array],
                Optional[jax.Array]]:
-        combined_ctx, is_ctx = target_hidden_states
+        """Two input layouts:
 
-        x = jnp.take(self.embed_tokens.value, input_ids,
-                     axis=0).astype(combined_ctx.dtype)
+        - Combined stream (legacy): ``target_hidden_states = (combined_ctx
+          (T, D), is_ctx (T,) bool)`` — ctx and noise rows interleaved in one
+          stream; ctx rows' K/V overridden inside each attention layer.
+        - Split streams: ``target_hidden_states = (combined_ctx (T_ctx, D),
+          ctx_md AttentionMetadata)`` — all layers' context K/V are written
+          up front from the compact ctx stream, then the transformer runs on
+          the (fixed-size) noise-only stream. Skips q/o/MLP compute and
+          all-reduce payload for ctx rows.
+        """
+        combined_ctx, second = target_hidden_states
+        split_mode = isinstance(second, AttentionMetadata)
 
         # Resolve each draft layer's cache index from the runner's mapping;
         # fall back to the last num_layers entries.
         kv_index = dict(_layer_name_to_kvcache_index or ())
         draft_kv_start = len(kv_caches) - self.num_layers
+
+        if split_mode:
+            ctx_md = second
+            for i, layer in enumerate(self.layers):
+                idx = kv_index.get(f"draft_layer.{i}", draft_kv_start + i)
+                kv_caches[idx] = layer.self_attn.write_ctx_kv(
+                    kv_caches[idx], combined_ctx, ctx_md)
+            combined_ctx_rows, is_ctx = None, None
+        else:
+            combined_ctx_rows, is_ctx = combined_ctx, second
+
+        x = jnp.take(self.embed_tokens.value, input_ids,
+                     axis=0).astype(combined_ctx.dtype)
+
         for i, layer in enumerate(self.layers):
             idx = kv_index.get(f"draft_layer.{i}", draft_kv_start + i)
-            kv_caches[idx], x = layer(kv_caches[idx], x, combined_ctx, is_ctx,
-                                      attention_metadata)
+            kv_caches[idx], x = layer(kv_caches[idx], x, combined_ctx_rows,
+                                      is_ctx, attention_metadata)
 
         hidden_states = self.norm(x)
         return kv_caches, hidden_states, [hidden_states], None
@@ -411,8 +470,17 @@ class DFlashDraftModel(nnx.Module):
         Sliced to the true vocab: a padded lm_head has all-zero tail rows,
         and when every real logit is negative argmax would otherwise pick a
         padded id (guaranteed draft rejection).
+
+        f32 accumulation output (rather than rounding logits back to bf16):
+        the draft's argmax should approximate the target's as closely as
+        possible; bf16 output rounding flips near-tie argmaxes.
         """
-        logits = hidden_states @ self.lm_head.value.T
+        logits = jax.lax.dot_general(
+            hidden_states,
+            self.lm_head.value,
+            dimension_numbers=(((1, ), (1, )), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
         return logits[..., :self.vocab_size]
 
     def load_weights(self, _rng_key: jax.Array):

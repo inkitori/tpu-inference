@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
@@ -21,6 +22,7 @@ from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn
@@ -686,6 +688,34 @@ class VllmModelWrapper:
         return embed_input_ids_func
 
     def jit_compute_logits_func(self):
+        if (os.environ.get("TARGET_F32_LOGITS") == "1"
+                and self.vllm_config.lora_config is None):
+            # Numerics probe for spec-decode acceptance: emit f32 logits from
+            # the lm_head matmul (bf16 output rounding is ~0.06-0.125 at
+            # typical logit magnitudes — enough to flip near-tie argmaxes,
+            # which truncates draft acceptance chains). Bypasses the torch
+            # LogitsProcessor (no lora/soft-cap/scale on gpt-oss).
+            vocab_size = self.vllm_config.model_config.get_vocab_size()
+
+            @jax.jit(out_shardings=(NamedSharding(
+                self.mesh,
+                PartitionSpec(ShardingAxisName.MLP_DATA,
+                              ShardingAxisName.MLP_TENSOR))))
+            def compute_logits_f32(
+                params_and_buffers: Any,
+                hidden_states: jax.Array,
+                lora_metadata,
+            ) -> jax.Array:
+                w = params_and_buffers["vllm_model.lm_head.weight"]  # (V, D)
+                logits = jax.lax.dot_general(
+                    hidden_states,
+                    w,
+                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                return logits[..., :vocab_size]
+
+            return compute_logits_f32
 
         # TODO(gxd3): revisit if the sharding below is the best way to shard the
         # output logits.
