@@ -348,7 +348,19 @@ class DFlashProposer:
         last_token_indices = jnp.clip(last_token_indices.reshape(-1), 0,
                                       T_out - 1)
 
-        target_hidden_states = (combined_out, is_ctx)
+        # Default off: measured a wash on ShareGPT c=32 (draft matmuls are
+        # weight-streaming-bound at these row counts, so cutting rows saves
+        # nothing and the gather/scatter adds a hair).
+        if os.environ.get("SPEC_DFLASH_NOISE_MLP", "0") == "1":
+            # Noise-row indices (sentinel T_out for padded requests, dropped/
+            # zero-filled by the model): o_proj + MLP run on these rows only.
+            noise_idx = (out_qsl[:max_reqs] + a)[:, None] + jnp.arange(
+                B, dtype=jnp.int32)[None, :]
+            noise_idx = jnp.where(req_mask[:, None], noise_idx,
+                                  T_out).reshape(-1)
+            target_hidden_states = (combined_out, is_ctx, noise_idx)
+        else:
+            target_hidden_states = (combined_out, is_ctx)
         return target_hidden_states, ids_out, last_token_indices, draft_md
 
     def _prepare_split_impl(

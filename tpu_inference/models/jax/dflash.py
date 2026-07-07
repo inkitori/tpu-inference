@@ -203,6 +203,7 @@ class DFlashAttention(nnx.Module):
         combined_ctx: Optional[jax.Array],  # (T, D) — valid at ctx rows only
         is_ctx: Optional[jax.Array],  # (T,) bool
         md: AttentionMetadata,
+        out_rows: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         positions = md.input_positions
 
@@ -239,6 +240,12 @@ class DFlashAttention(nnx.Module):
             self.head_dim,
             use_causal_mask=False,
         )
+        if out_rows is not None:
+            # Only these rows' outputs are consumed downstream; skip o_proj
+            # for the rest (ctx rows' attention outputs are garbage by
+            # design). Out-of-range sentinel indices fill with zeros.
+            attn_out = jnp.take(attn_out, out_rows, axis=0, mode='fill',
+                                fill_value=0)
         return new_kv_cache, self.o_proj(attn_out)
 
 
@@ -276,16 +283,37 @@ class DFlashDecoderLayer(nnx.Module):
         combined_ctx: jax.Array,
         is_ctx: jax.Array,
         md: AttentionMetadata,
+        noise_idx: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        kv_cache, attn_out = self.self_attn(kv_cache, hidden_states,
-                                            combined_ctx, is_ctx, md)
-        hidden_states = residual + attn_out
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return kv_cache, residual + hidden_states
+        if noise_idx is None:
+            kv_cache, attn_out = self.self_attn(kv_cache, hidden_states,
+                                                combined_ctx, is_ctx, md)
+            hidden_states = residual + attn_out
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            return kv_cache, residual + hidden_states
+
+        # Noise-row-only epilogue: ctx rows' hidden states are never consumed
+        # (their K/V come from combined_ctx each layer), so o_proj + MLP run
+        # on the gathered noise rows only. The attention/KV-write kernel call
+        # is unchanged. Sentinel (out-of-range) indices in noise_idx gather
+        # zeros and drop on scatter, so padded requests can't clobber real
+        # rows.
+        kv_cache, attn_out = self.self_attn(kv_cache,
+                                            hidden_states,
+                                            combined_ctx,
+                                            is_ctx,
+                                            md,
+                                            out_rows=noise_idx)
+        noise_res = jnp.take(residual, noise_idx, axis=0, mode='fill',
+                             fill_value=0) + attn_out
+        noise_out = noise_res + self.mlp(
+            self.post_attention_layernorm(noise_res))
+        hidden_states = residual.at[noise_idx].set(noise_out, mode='drop')
+        return kv_cache, hidden_states
 
 
 class DFlashWeightLoader(BaseWeightLoader):
@@ -431,7 +459,13 @@ class DFlashDraftModel(nnx.Module):
           the (fixed-size) noise-only stream. Skips q/o/MLP compute and
           all-reduce payload for ctx rows.
         """
-        combined_ctx, second = target_hidden_states
+        noise_idx = None
+        if len(target_hidden_states) == 3:
+            # (combined_ctx, is_ctx, noise_idx): run o_proj/MLP on the noise
+            # rows only (indices with an out-of-range sentinel for padding).
+            combined_ctx, second, noise_idx = target_hidden_states
+        else:
+            combined_ctx, second = target_hidden_states
         split_mode = isinstance(second, AttentionMetadata)
 
         # Resolve each draft layer's cache index from the runner's mapping;
@@ -455,7 +489,8 @@ class DFlashDraftModel(nnx.Module):
         for i, layer in enumerate(self.layers):
             idx = kv_index.get(f"draft_layer.{i}", draft_kv_start + i)
             kv_caches[idx], x = layer(kv_caches[idx], x, combined_ctx_rows,
-                                      is_ctx, attention_metadata)
+                                      is_ctx, attention_metadata,
+                                      noise_idx=noise_idx)
 
         hidden_states = self.norm(x)
         return kv_caches, hidden_states, [hidden_states], None
