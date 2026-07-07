@@ -137,6 +137,13 @@ def general_device_put(tensor: jax.Array,
     `source_mesh` specifies the mesh on which the input tensor is currently located.
     """
 
+    if envs.TPU_MULTIHOST_BACKEND != "ray":
+        # Single-host: one batched device_put over the whole pytree. Issuing
+        # one transfer per leaf costs ~0.2ms of host time each; batching all
+        # leaves into a single call amortizes the dispatch overhead.
+        target = Format(layout, sharding) if layout is not None else sharding
+        return jax.device_put(tensor, target)
+
     def _put(t):
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         # If we are not in multi-host setup, or the tensor is not fully addressable,

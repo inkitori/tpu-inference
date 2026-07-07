@@ -24,6 +24,9 @@ from jax.sharding import Mesh
 from tpu_inference.runner.input_batch import InputBatch
 from tpu_inference.utils import device_array
 
+# (mesh, shape) -> constant on-device dummy, reused across steps.
+_CACHE_COLLISION_DUMMIES: dict = {}
+
 DEFAULT_SAMPLING_PARAMS = dict(
     temperature=-1.0,
     top_k=0,
@@ -64,11 +67,16 @@ class TPUSupportedSamplingMetadata:
         # Use a dummy tensor with a unique shape for each logprobs config.
         # This avoids persistent cache collisions.
         dummy_shape = (1 if needs_logprobs else 2, )
-        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
-        # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(mesh,
-                                             cache_collision_dummy,
-                                             sharding=None)
+        cache_key = (mesh, dummy_shape)
+        cache_collision_dummy = _CACHE_COLLISION_DUMMIES.get(cache_key)
+        if cache_collision_dummy is None:
+            # Constant zeros; reuse the device array across steps instead of
+            # paying a host->device transfer every step.
+            cache_collision_dummy = device_array(mesh,
+                                                 np.zeros(dummy_shape,
+                                                          dtype=np.int32),
+                                                 sharding=None)
+            _CACHE_COLLISION_DUMMIES[cache_key] = cache_collision_dummy
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,

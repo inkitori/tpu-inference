@@ -204,10 +204,16 @@ class DFlashProposer:
         # Use the block tables of whichever KV-cache group holds the draft
         # layers (they may be merged with same-spec target layers, e.g.
         # gpt-oss full-attention, rather than forming their own group).
-        draft_kv_cache_group_id = self._draft_kv_cache_group_id()
-        block_tables = self.runner.input_batch.block_table[
-            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
-        block_tables = device_array(self.mesh, block_tables)
+        # The SpeculativeDecodingManager hands us the draft layer's
+        # AttentionMetadata, whose block tables are already on device (part of
+        # the runner's packed metadata blob); re-uploading the CPU block table
+        # here would cost an extra host transfer per step.
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            draft_kv_cache_group_id = self._draft_kv_cache_group_id()
+            block_tables = self.runner.input_batch.block_table[
+                draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+            block_tables = device_array(self.mesh, block_tables)
 
         return self._prepare_inputs(
             self.state_leaves,
@@ -224,6 +230,24 @@ class DFlashProposer:
 
     @jax.jit(static_argnums=(0, ))
     def _prepare_inputs(
+        self,
+        state_leaves: Any,
+        block_tables: jax.Array,
+        attn_metadata: AttentionMetadata,
+        input_ids: jax.Array,
+        aux_hidden_states: tuple[jax.Array, ...],
+        last_sampled_token_id: jax.Array,
+        next_prompt_token_id: jax.Array,
+        is_in_prefill: jax.Array,
+        num_rejected_tokens: jax.Array,
+        num_reqs_dp: jax.Array,
+    ):
+        return self._prepare_inputs_impl(
+            state_leaves, block_tables, attn_metadata, input_ids,
+            aux_hidden_states, last_sampled_token_id, next_prompt_token_id,
+            is_in_prefill, num_rejected_tokens, num_reqs_dp)
+
+    def _prepare_inputs_impl(
         self,
         state_leaves: Any,
         block_tables: jax.Array,
@@ -358,6 +382,21 @@ class DFlashProposer:
         target_hidden_states,
         layer_name_to_kvcache_index: tuple,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
+        return self._propose_impl(state_leaves, kv_caches, input_ids,
+                                  attn_metadata, last_token_indices,
+                                  target_hidden_states,
+                                  layer_name_to_kvcache_index)
+
+    def _propose_impl(
+        self,
+        state_leaves: Any,
+        kv_caches: list[jax.Array],
+        input_ids: jax.Array,
+        attn_metadata: AttentionMetadata,
+        last_token_indices: jax.Array,
+        target_hidden_states,
+        layer_name_to_kvcache_index: tuple,
+    ) -> tuple[list[jax.Array], jnp.ndarray]:
         kv_caches, hidden_states, _, _ = self.model_fn(
             state_leaves,
             kv_caches,
@@ -375,3 +414,76 @@ class DFlashProposer:
         draft_token_ids = draft_token_ids.reshape(
             max_reqs, self.num_speculative_tokens)
         return kv_caches, draft_token_ids
+
+    def prepare_and_propose(
+        self,
+        kv_caches: list[jax.Array],
+        attn_metadata: AttentionMetadata,
+        input_ids: jax.Array,
+        aux_hidden_states: tuple[jax.Array, ...],
+        last_sampled_token_id: jax.Array,
+        packed_prefill_aux: jax.Array,
+        num_rejected_tokens: jax.Array,
+    ) -> tuple[list[jax.Array], jnp.ndarray, jnp.ndarray]:
+        """Single-dispatch drafting step (prepare + draft forward + argmax +
+        async next-token assembly). ``packed_prefill_aux`` packs
+        ``[next_prompt_token_id | is_in_prefill | num_reqs_dp]`` into one
+        int32 array so the manager pays one host transfer instead of three.
+        """
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            draft_kv_cache_group_id = self._draft_kv_cache_group_id()
+            block_tables = self.runner.input_batch.block_table[
+                draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+            block_tables = device_array(self.mesh, block_tables)
+        return self._prepare_and_propose(
+            self.state_leaves,
+            kv_caches,
+            block_tables,
+            attn_metadata,
+            input_ids,
+            tuple(aux_hidden_states),
+            last_sampled_token_id,
+            packed_prefill_aux,
+            num_rejected_tokens,
+            tuple(self.runner.layer_name_to_kvcache_index.items()),
+        )
+
+    @jax.jit(
+        static_argnums=(0, 10),
+        donate_argnames=("kv_caches", ),
+    )
+    def _prepare_and_propose(
+        self,
+        state_leaves: Any,
+        kv_caches: list[jax.Array],
+        block_tables: jax.Array,
+        attn_metadata: AttentionMetadata,
+        input_ids: jax.Array,
+        aux_hidden_states: tuple[jax.Array, ...],
+        last_sampled_token_id: jax.Array,
+        packed_prefill_aux: jax.Array,
+        num_rejected_tokens: jax.Array,
+        layer_name_to_kvcache_index: tuple,
+    ) -> tuple[list[jax.Array], jnp.ndarray, jnp.ndarray]:
+        max_reqs = attn_metadata.seq_lens.shape[0]
+        next_prompt_token_id = packed_prefill_aux[:max_reqs]
+        is_in_prefill = packed_prefill_aux[max_reqs:2 * max_reqs]
+        num_reqs_dp = packed_prefill_aux[2 * max_reqs:]
+
+        (target_hidden_states, ids_out, last_token_indices,
+         draft_md) = self._prepare_inputs_impl(
+             state_leaves, block_tables, attn_metadata, input_ids,
+             aux_hidden_states, last_sampled_token_id, next_prompt_token_id,
+             is_in_prefill, num_rejected_tokens, num_reqs_dp)
+
+        kv_caches, draft_token_ids = self._propose_impl(
+            state_leaves, kv_caches, ids_out, draft_md, last_token_indices,
+            target_hidden_states, layer_name_to_kvcache_index)
+
+        # Async scheduling consumes [last_sampled | drafts] flattened per req
+        # (see concat_last_sampled_tokens_and_draft_tokens).
+        spec_next_tokens = jnp.concatenate(
+            [last_sampled_token_id[:, None], draft_token_ids],
+            axis=1).reshape(-1)
+        return kv_caches, draft_token_ids, spec_next_tokens

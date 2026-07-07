@@ -334,6 +334,23 @@ def _subtract_num_rejected_tokens_fn(seq_lens: jax.Array, positions: jax.Array,
     return seq_lens, positions
 
 
+@jax.jit(donate_argnums=(0, 1, 2))
+def _apply_prev_step_corrections_fn(
+        input_ids: jax.Array, seq_lens: jax.Array, positions: jax.Array,
+        num_rejected_tokens: jax.Array, rej_seq_idx: jax.Array,
+        rej_pos_idx: jax.Array, next_tokens: jax.Array, sub_cur: jax.Array,
+        sub_pre: jax.Array, sub_n: jax.Array):
+    """Fused async-scheduling corrections for spec decode: subtract the
+    previous step's rejection counts from seq_lens/positions and substitute
+    placeholder tokens in input_ids, in one dispatch (index arrays arrive on
+    device via the packed metadata blob)."""
+    seq_lens, positions = _subtract_num_rejected_tokens_fn(
+        seq_lens, positions, num_rejected_tokens, rej_seq_idx, rej_pos_idx)
+    input_ids = _substitute_placeholder_token(input_ids, sub_cur, sub_pre,
+                                              next_tokens, sub_n)
+    return input_ids, seq_lens, positions
+
+
 def _jax_logprobs_materialize(
         logprobs_tensors: LogprobsTensors,
         logits_indices_selector: Optional[List[int]] = None,
@@ -1727,7 +1744,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 key=rejection_rng,
             )
 
-        logits = logits.astype(jnp.float32)
+        if tpu_sampling_metadata.logprobs or self.input_batch.num_prompt_logprobs:
+            # Only the logprobs paths consume the f32 logits; the cast on a
+            # (padded_tokens, vocab) array is a full rewrite plus a dispatch.
+            logits = logits.astype(jnp.float32)
         if full_logits is not None:
             full_logits = full_logits.astype(jnp.float32)
         with self.maybe_forbid_compile:
@@ -1848,10 +1868,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_next_tokens = None
             if self.speculative_config:
                 assert spec_decode_last_sampled_token_id is not None
-                with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
-                    spec_decode_next_tokens = concat_last_sampled_tokens_and_draft_tokens(
-                        spec_decode_last_sampled_token_id,
-                        self.speculative_decoding_manager._draft_token_ids)
+                if (self.speculative_decoding_manager._spec_next_tokens
+                        is not None):
+                    # Assembled inside the fused drafting dispatch.
+                    spec_decode_next_tokens = (
+                        self.speculative_decoding_manager._spec_next_tokens)
+                    self.speculative_decoding_manager._spec_next_tokens = None
+                else:
+                    with self.maybe_forbid_compile, jax.set_mesh(self.mesh):
+                        spec_decode_next_tokens = concat_last_sampled_tokens_and_draft_tokens(
+                            spec_decode_last_sampled_token_id,
+                            self.speculative_decoding_manager._draft_token_ids)
 
             # Save the previous results
             next_tokens = jax.copy_to_host_async(next_tokens)
@@ -2511,10 +2538,62 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             positions = device_array(self.mesh,
                                      mrope_positions,
                                      sharding=mrope_sharding)
+            positions_in_blob = False
         else:
-            positions = device_array(self.mesh,
-                                     positions,
-                                     sharding=data_parallel_attn_sharding)
+            # Ride along in the packed metadata blob instead of a dedicated
+            # per-step transfer.
+            self.device_buffer.get_view(
+                (padded_total_num_scheduled_tokens, ),
+                key="positions")[:] = positions
+            positions_in_blob = True
+
+        # Async-scheduling correction inputs (placeholder substitution and
+        # spec-decode rejection subtraction): compute the index arrays now so
+        # they ride the blob; the device ops run fused after unpack.
+        prev_step_corrections = None
+        if (self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None
+                and self.speculative_config and not self.uses_mrope):
+            sub_cur_list: list[int] = []
+            sub_pre_list: list[int] = []
+            for dp_rank in range(dp_size):
+                sub_cur_list.extend(token_in_tpu_cur_input_indices_dp[dp_rank])
+                sub_pre_list.extend(
+                    token_in_tpu_pre_next_tokens_indices_dp[dp_rank])
+            L = padded_total_num_scheduled_tokens
+            sub_cur = np.asarray(sub_cur_list, dtype=np.int32)
+            sub_pre = np.asarray(sub_pre_list, dtype=np.int32)
+            missing = np.setdiff1d(np.arange(L, dtype=np.int32), sub_cur)
+            buf = self.device_buffer
+            buf.get_view((L, ), key="sub_cur")[:] = np.concatenate(
+                [sub_cur, missing])
+            buf.get_view((L, ), key="sub_pre")[:] = np.pad(
+                sub_pre, (0, L - sub_pre.shape[0]),
+                mode="constant",
+                constant_values=-1)
+            buf.get_view((1, ), key="sub_n")[:] = sub_cur.shape[0]
+
+            rej_seq_idx = np.full(self.max_num_reqs, -1, dtype=np.int32)
+            rej_pos_idx = np.full(L, -1, dtype=np.int32)
+            placeholder_map = (
+                self._pre_async_results.placeholder_req_id_to_index)
+            for rank in range(dp_size):
+                acc_cur_len = 0
+                scheduled_tokens_cur_rank = scheduled_tokens_per_dp_rank[rank]
+                for i, req_id in enumerate(req_ids_dp[rank]):
+                    acc_cur_len += scheduled_tokens_cur_rank[i]
+                    if req_id not in placeholder_map:
+                        continue
+                    idx = placeholder_map[req_id]
+                    rej_seq_idx[i + rank * max_num_reqs_per_dp_rank] = idx
+                    base_offset = acc_cur_len - scheduled_tokens_cur_rank[i]
+                    for j in range(scheduled_tokens_cur_rank[i]):
+                        rej_pos_idx[base_offset + j + rank *
+                                    (L // dp_size)] = idx
+            buf.get_view((self.max_num_reqs, ), key="rej_seq_idx")[:] = \
+                rej_seq_idx
+            buf.get_view((L, ), key="rej_pos_idx")[:] = rej_pos_idx
+            prev_step_corrections = True
 
         # Collect block tables host arrays loops zone presence zones legality
         def build_block_table_host(kv_cache_gid: int) -> None:
@@ -2591,10 +2670,37 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
 
+        if spec_decode_metadata is not None:
+            # The spec-decode index arrays were staged into the metadata blob
+            # (one H2D transfer); patch the device arrays in post-unpack.
+            spec_decode_metadata.draft_lengths = metadata[
+                "spec_draft_lengths"]
+            spec_decode_metadata.target_logits_indices = metadata[
+                "spec_target_logits_indices"]
+            spec_decode_metadata.bonus_logits_indices = metadata[
+                "spec_bonus_logits_indices"]
+            spec_decode_metadata.final_logits_indices = logits_indices
+
+        if positions_in_blob:
+            positions = metadata["positions"]
+
         # The host-side `num_computed_tokens_cpu` assumes all speculatively
         # proposed tokens from the previous step were accepted. Subtract the
         # actual rejection counts from `seq_lens` and `positions` on TPU.
-        if self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+        if prev_step_corrections:
+            # Fused: rejection subtraction + placeholder substitution in one
+            # dispatch, index arrays already on device via the blob.
+            with self.maybe_forbid_compile:
+                input_ids, seq_lens, positions = \
+                    _apply_prev_step_corrections_fn(
+                        input_ids, seq_lens, positions,
+                        self._pre_async_results.
+                        spec_decode_num_rejected_tokens,
+                        metadata["rej_seq_idx"], metadata["rej_pos_idx"],
+                        self._pre_async_results.spec_decode_next_tokens,
+                        metadata["sub_cur"], metadata["sub_pre"],
+                        metadata["sub_n"])
+        elif self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
             seq_lens, positions = self._subtract_num_rejected_tokens(
                 seq_lens, positions, req_ids_dp, scheduled_tokens_per_dp_rank)
 
@@ -2627,7 +2733,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             }
 
         # Async scheduling: substitute placeholder tokens for DP
-        if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+        # (already applied in _apply_prev_step_corrections_fn when
+        # prev_step_corrections is set)
+        if (not prev_step_corrections and self.scheduler_config.
+                async_scheduling and self._pre_async_results is not None):
             # Collect all token indices that need substitution across all DP ranks
             all_token_indices_to_substitute = []
             all_pre_next_tokens_indices = []

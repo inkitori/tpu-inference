@@ -43,6 +43,9 @@ class SpeculativeDecodingManager:
         # Cached draft tokens.
         self._draft_token_ids: Optional[list[list[int]]] = None
         self._req_indices_dp: Optional[dict] = None
+        # Pre-assembled [last_sampled | drafts] for async scheduling, produced
+        # by the fused DFlash prepare_and_propose path.
+        self._spec_next_tokens = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
@@ -138,13 +141,21 @@ class SpeculativeDecodingManager:
             # When multiple KV cache groups are used (e.g., in hybrid models),
             # attn_metadata becomes a dict mapping layer names to AttentionMetadata.
             # Since all groups share the same seq_lens and input_positions, any would work for those.
-            # However, we specifically look for an attention layer key to get the correct
+            # If the draft layers live in a framework KV-cache group, their
+            # entry already carries the draft group's block tables on device —
+            # picking it saves the drafter a per-step host block-table upload.
+            # Otherwise we look for an attention layer key to get the correct
             # block_tables structure, just in case the draft model (which is all attention) needs it.
             attn_key = None
             for key in attn_metadata.keys():
-                if ".self_attn." in key:
+                if key.startswith("draft_layer."):
                     attn_key = key
                     break
+            if attn_key is None:
+                for key in attn_metadata.keys():
+                    if ".self_attn." in key:
+                        attn_key = key
+                        break
             if attn_key is not None:
                 attn_metadata = attn_metadata[attn_key]
             else:
@@ -176,15 +187,38 @@ class SpeculativeDecodingManager:
                         j + rank * max_num_reqs_per_dp_rank] = next_token_id
                     is_in_prefill[j + rank * max_num_reqs_per_dp_rank] = 1
 
-        next_prompt_token_id, is_in_prefill, num_reqs_dp = device_array(
-            self.runner.mesh,
-            (next_prompt_token_id, is_in_prefill, num_reqs_dp),
-            sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
-
         if self.runner.speculative_config.method == "mtp":
             aux_hidden_states_for_drafter = (hidden_states, )
         else:
             aux_hidden_states_for_drafter = aux_hidden_states
+
+        if (isinstance(self.runner.drafter, DFlashProposer)
+                and not runner_utils.SPEC_DFLASH_DUMP_DIR):
+            # Single-transfer, single-dispatch drafting path.
+            packed_prefill_aux = device_array(
+                self.runner.mesh,
+                np.concatenate(
+                    [next_prompt_token_id, is_in_prefill, num_reqs_dp]),
+                sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
+            (self.runner.kv_caches, draft_token_ids,
+             self._spec_next_tokens) = self.runner.drafter.prepare_and_propose(
+                 kv_caches=self.runner.kv_caches,
+                 attn_metadata=attn_metadata,
+                 input_ids=input_ids,
+                 aux_hidden_states=aux_hidden_states_for_drafter,
+                 last_sampled_token_id=last_sampled_token_id,
+                 packed_prefill_aux=packed_prefill_aux,
+                 num_rejected_tokens=num_rejected_tokens,
+             )
+            if async_scheduling:
+                return draft_token_ids
+            draft_token_ids = np.array(draft_token_ids)
+            return draft_token_ids.tolist()
+
+        next_prompt_token_id, is_in_prefill, num_reqs_dp = device_array(
+            self.runner.mesh,
+            (next_prompt_token_id, is_in_prefill, num_reqs_dp),
+            sharding=(PartitionSpec(ShardingAxisName.ATTN_DATA)))
 
         drafter_inputs = (attn_metadata, input_ids,
                           aux_hidden_states_for_drafter,
@@ -319,20 +353,26 @@ class SpeculativeDecodingManager:
         padded_bonus_logits_indices = np.concatenate(out_bonus_logits_indices)
         padded_num_draft_tokens = np.concatenate(out_draft_lengths)
         padded_num_draft_tokens_cpu = padded_num_draft_tokens
-        # CPU -> TPU copy.
-        (padded_num_draft_tokens, padded_logits_indices,
-         padded_target_logits_indices,
-         padded_bonus_logits_indices) = device_array(
-             self.runner.mesh,
-             (padded_num_draft_tokens, padded_logits_indices,
-              padded_target_logits_indices, padded_bonus_logits_indices),
-             sharding=NamedSharding(self.runner.mesh,
-                                    PartitionSpec(ShardingAxisName.ATTN_DATA)))
+
+        # Stage into the runner's packed metadata blob (single H2D transfer
+        # for the whole step) instead of issuing dedicated device_puts here.
+        # _prepare_inputs patches the device arrays in after the blob is
+        # unpacked; final_logits_indices rides along in the existing
+        # "logits_indices" view.
+        buf = self.runner.device_buffer
+        buf.get_view(padded_num_draft_tokens.shape,
+                     key="spec_draft_lengths")[:] = padded_num_draft_tokens
+        buf.get_view(
+            padded_target_logits_indices.shape,
+            key="spec_target_logits_indices")[:] = padded_target_logits_indices
+        buf.get_view(
+            padded_bonus_logits_indices.shape,
+            key="spec_bonus_logits_indices")[:] = padded_bonus_logits_indices
 
         metadata = SpecDecodeMetadata(
-            draft_lengths=padded_num_draft_tokens,
-            target_logits_indices=padded_target_logits_indices,
-            bonus_logits_indices=padded_bonus_logits_indices,
+            draft_lengths=None,
+            target_logits_indices=None,
+            bonus_logits_indices=None,
             final_logits_indices=padded_logits_indices,
         )
         metadata.draft_lengths_cpu = padded_num_draft_tokens_cpu
