@@ -127,6 +127,7 @@ class DFlashProposer:
             candidates = dict(target_state.items())
             embed_keys = [
                 "vllm_model.model.embed_tokens.weight",
+                "vllm_model.model.embedding.weight",  # gpt-oss
                 "vllm_model.language_model.model.embed_tokens.weight",
             ]
             head_keys = [
@@ -173,6 +174,19 @@ class DFlashProposer:
             lm_head_w = lm_head_w.T
         return embed_w, lm_head_w
 
+    def _draft_kv_cache_group_id(self) -> int:
+        if getattr(self, "_draft_group_id", None) is None:
+            groups = self.runner.kv_cache_config.kv_cache_groups
+            for gid, group in enumerate(groups):
+                if "draft_layer.0" in group.layer_names:
+                    self._draft_group_id = gid
+                    break
+            else:
+                raise RuntimeError(
+                    "No KV cache group contains draft_layer.0; groups: " +
+                    str([g.layer_names for g in groups]))
+        return self._draft_group_id
+
     def prepare_inputs(
         self,
         attn_metadata: AttentionMetadata,
@@ -187,10 +201,10 @@ class DFlashProposer:
         assert aux_hidden_states, (
             "DFlash requires auxiliary hidden states from the target model.")
 
-        # The last KV-cache groups belong to the draft; any of them works for
-        # block tables since all draft layers share one group layout.
-        num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
-        draft_kv_cache_group_id = num_kv_cache_groups - 1
+        # Use the block tables of whichever KV-cache group holds the draft
+        # layers (they may be merged with same-spec target layers, e.g.
+        # gpt-oss full-attention, rather than forming their own group).
+        draft_kv_cache_group_id = self._draft_kv_cache_group_id()
         block_tables = self.runner.input_batch.block_table[
             draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
         block_tables = device_array(self.mesh, block_tables)
@@ -331,7 +345,7 @@ class DFlashProposer:
         )
 
     @jax.jit(
-        static_argnums=(0, 6),
+        static_argnums=(0, 7),
         donate_argnames=("kv_caches", ),
     )
     def _propose(

@@ -329,6 +329,7 @@ class DFlashDraftModel(nnx.Module):
             hf_config, "num_target_layers", hf_config.num_hidden_layers)
 
         vocab_size = target_model_config.get_vocab_size()
+        self.vocab_size = vocab_size
 
         # Placeholders; the proposer shares the target's weights in (and
         # re-derives state leaves). Materialized as zeros so weight-loading
@@ -405,8 +406,14 @@ class DFlashDraftModel(nnx.Module):
         return self.hidden_norm(self.fc(hidden_states))
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
-        """Logits through the (shared) target lm_head."""
-        return hidden_states @ self.lm_head.value.T
+        """Logits through the (shared) target lm_head.
+
+        Sliced to the true vocab: a padded lm_head has all-zero tail rows,
+        and when every real logit is negative argmax would otherwise pick a
+        padded id (guaranteed draft rejection).
+        """
+        logits = hidden_states @ self.lm_head.value.T
+        return logits[..., :self.vocab_size]
 
     def load_weights(self, _rng_key: jax.Array):
         mappings = {

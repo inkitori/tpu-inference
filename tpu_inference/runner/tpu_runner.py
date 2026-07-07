@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import os
 import random
 import sys
 from contextlib import nullcontext
@@ -1682,6 +1683,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             draft_token_ids = self._extract_draft_token_ids(
                 input_ids, spec_decode_metadata.final_logits_indices,
                 spec_decode_metadata.target_logits_indices)
+            if os.environ.get("SPEC_PERFECT_DRAFT") == "1":
+                # Diagnostic: pretend the drafter predicted the target's own
+                # greedy tokens. Acceptance must be ~100%; anything less
+                # points at verify-side misalignment rather than the drafter.
+                draft_token_ids = jnp.argmax(target_logits, axis=-1).astype(
+                    draft_token_ids.dtype)
             next_tokens = self.rejection_sampler(
                 draft_token_ids=draft_token_ids,
                 num_draft_tokens=spec_decode_metadata.draft_lengths,

@@ -563,20 +563,6 @@ class KVCacheManager:
                             kv_cache_spec[
                                 f"draft_layer.{i}"] = self._create_attention_spec(
                                     block_size, num_kv_heads, head_size)
-                elif method == "dflash":
-                    # DFlash drafts are small full-attention transformers with
-                    # their own paged context KV cache, one group per layer.
-                    num_kv_heads = common_utils.get_padded_num_heads(
-                        draft_hf_config.num_key_value_heads, model_cnt)
-                    head_size = common_utils.get_padded_head_dim(
-                        getattr(
-                            draft_hf_config, "head_dim",
-                            draft_hf_config.hidden_size //
-                            draft_hf_config.num_attention_heads))
-                    for i in range(draft_hf_config.num_hidden_layers):
-                        kv_cache_spec[
-                            f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size, num_kv_heads, head_size)
         else:
             # Else propagate attention modules from compilation config.
             layers = get_layers_from_vllm_config(
@@ -676,6 +662,25 @@ class KVCacheManager:
                 else:
                     raise ValueError(
                         f"Unknown attention type: {attn_module.attn_type}")
+
+        # DFlash drafts are small full-attention transformers with their own
+        # paged context KV cache. Registered outside the impl branches: the
+        # draft is always JAX-native regardless of whether the target runs
+        # via flax_nnx or the vllm/torchax wrapper.
+        speculative_config = self.runner.speculative_config
+        if speculative_config and speculative_config.method == "dflash":
+            draft_hf_config = speculative_config.draft_model_config.hf_config
+            num_kv_heads = common_utils.get_padded_num_heads(
+                draft_hf_config.num_key_value_heads, model_cnt)
+            head_size = common_utils.get_padded_head_dim(
+                getattr(
+                    draft_hf_config, "head_dim",
+                    draft_hf_config.hidden_size //
+                    draft_hf_config.num_attention_heads))
+            for i in range(draft_hf_config.num_hidden_layers):
+                kv_cache_spec[
+                    f"draft_layer.{i}"] = self._create_attention_spec(
+                        block_size, num_kv_heads, head_size)
 
         return kv_cache_spec
 
