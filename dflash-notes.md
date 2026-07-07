@@ -1,145 +1,120 @@
 # DFlash on dflash-oss — working notes / session handoff
 
-_Last updated: 2026-07-07 (session 2). Remove this file before any upstream merge._
+_Last updated: 2026-07-07 (session 3). Remove this file before any upstream merge._
 
-**Goal**: clean DFlash spec decode (target `openai/gpt-oss-20b`, draft
-`z-lab/gpt-oss-20b-DFlash`) + async scheduling on v6e-8, maximize per-user TPS at 32
-concurrent, ShareGPT via `vllm bench serve`, must beat no-spec baseline clearly.
+**Goal**: maximize per-user TPS (ShareGPT, c=32, greedy, ignore-eos) for
+gpt-oss-20b + z-lab/gpt-oss-20b-DFlash on v6e-8; stretch goal 2x the no-spec
+baseline. Session 3 also brought up the 120b variant (user request).
 
-## SESSION 2 HEADLINE: the "acceptance bug" is RESOLVED — there is no bug.
+## SESSION 3 HEADLINE RESULTS (all warm, 128 prompts, c=32)
 
-Chain of evidence (all scripts in `scripts/dflash_dev/`, all committed):
+| config                        | mean TPOT | median | accept len | TPS/user | vs baseline |
+|-------------------------------|-----------|--------|------------|----------|-------------|
+| 20b baseline async (no spec)  | 5.28      | 5.27   | –          | 189      | 1.00x       |
+| 20b DFlash session-2 state    | 6.17      | 5.84   | 2.22       | 162      | 0.86x       |
+| **20b DFlash now (NS=3)**     | **4.35**  | 4.20   | 2.09       | **230**  | **1.21x**   |
+| 120b baseline async (no spec) | 12.45     | 12.63  | –          | 80       | 1.00x       |
+| **120b DFlash (NS=3)**        | **8.30**  | 8.01   | 2.47       | **120**  | **1.50x**   |
+| 120b DFlash NS=5              | 8.52      | 8.03   | 2.79       | 117      | wash        |
 
-1. **Parity test** (`parity_test.py`, now PARITY_P env for ctx length): our
-   `DFlashDraftModel` matches the HF reference at cos 0.9997+ for BOTH a
-   short (P=13) and long (P=300, multi-KV-block/multi-page) context, fresh and
-   cached steps. Draft model + weights + YaRN RoPE + non-causal hd64 kernel +
-   paged end-aligned cache: all correct.
-2. **Serving dump + HF replay** (`SPEC_DFLASH_DUMP=<dir>` env on the server →
-   `replay_dump.py`): feeding the DUMPED serving aux features through the HF
-   reference draft gives 1.15 accepted/step vs our served 1.05 — identical.
-   Shared embed/lm_head are bit-exact vs the checkpoint; fc+hidden_norm
-   (combine) matches at cos 1.0. Stream assembly (positions/is_ctx/noise
-   block/lti) verified correct in the dumps. Draft side fully exonerated.
-3. **Aux capture check** (`aux_check.py`; NOTE: HF CPU load needs
-   `Mxfp4Config(dequantize=True)` — `quantization_config=None` silently gives
-   RANDOM MoE weights): captured aux ≈ HF ground truth at cos 0.998-0.9995
-   (right layers, right rows). Serving target greedy == true-HF argmax 88.8%
-   of tokens (fp8-MoE numeric noise flips ~11%).
-4. **Truth-feature replay** (`truth_replay.py`): swapping ground-truth
-   features for TPU features improves replay only 1.15 → 1.23 accepted/step.
-   Feature noise is NOT the bottleneck; the serving VERIFIER's argmax flips
-   are what truncate acceptance chains (compounded per position).
-5. **Reference e2e** (`reference_e2e.py`, z-lab spec_generate loop, pure HF
-   CPU): on our exact 18-token raw prompt the checkpoint's TRUE capability is
-   **1.84 accepted/step (2.84 incl bonus)** — NOT ~6.
-6. **The "expected 6+" was a benchmark artifact**: origin/dflash's 6.3-6.9 was
-   measured at in=1/out=4096 (degenerate free-running repetitive text). Its
-   own real-prompt smoke was 2.35-3.14 accept len ≈ what we see. z-lab README
-   claims accept len 4.2-5.1 on CHAT-formatted evals (Math500/GSM8K/
-   HumanEval/MT-Bench, SGLang H200 bf16, medium reasoning).
+Serve: `bash scripts/serve_dflash.sh --async-scheduling` (now defaults
+NUM_SPEC=3, VLLM_TPU_BUCKET_PADDING_GAP=32, TARGET_F32_LOGITS=1).
+120b: `DFLASH_TARGET=openai/gpt-oss-120b DFLASH_DRAFT=z-lab/gpt-oss-120b-DFlash`.
+120b draft was downloaded and uploaded to the GCS bucket
+(models--z-lab--gpt-oss-120b-DFlash; block_size=10, aux layers [1,9,17,25,33]).
+Bench: `DATASET=<sharegpt.json> bash scripts/bench_dflash.sh <tag> 128 32`;
+run 3-4x after every restart — fine-grained buckets (gap=32) keep hitting cold
+XLA compiles for ~2-3 runs (SKIP_JAX_PRECOMPILE=1). Judge medians until P99
+settles < ~15ms.
 
-Measured acceptance on dflash-oss serving (fp8-requant target, greedy):
-raw 1-req prompt 1.05 acc/step (pos-0 59%); chat math request 1.24; 4-req
-concurrent 1.05; ShareGPT c=32 `vllm bench` workload **accept len 1.58,
-rate 8.2%, pos-0 34.7%** (ignore-eos forces post-EOS OOD text + raw
-non-harmony ShareGPT turns → intrinsically hard to draft).
+## Why 2x is out of reach on THIS workload (measured, not vibes)
 
-## FINAL BENCH RESULTS (ShareGPT c=32, greedy, warm server, 128 prompts;
-## JSONs in bench_results/)
+1. **Acceptance ceiling**: `scripts/dflash_dev/ceiling_probe.py` runs the pure
+   HF reference spec loop (HF draft vs HF target, CPU) on the same ShareGPT
+   prompts with forced continuation: **accept len 2.46** over 307 steps (20b,
+   full block 8). Serving measures 2.20-2.22 at NS=7 → we're at ~90% of the
+   intrinsic ceiling. The z-lab 4.2-5.1 numbers are chat/harmony evals; raw
+   ShareGPT + ignore-eos is simply hard to draft. Verifier-numerics hunting is
+   capped at +0.24 tok/step (f32 logits probe: no change; bf16-MoE probe
+   session 2: no change).
+2. **Verify floor**: the 128-token verify forward costs ~6.0ms (20b) vs the
+   32-token baseline forward inside its 5.28ms step. gmm weight streaming
+   (~1.75ms) + collectives (~0.95) + RPA (~0.86) + MoE plumbing (~1.3).
+   With accept ~2.1-2.5, ratio_max ≈ accept × baseline_step / (verify +
+   propose + extras) lands ≈ 1.5-1.7x. 120b confirms: bigger fwd amortizes
+   spec overheads better → 1.50x with the same code.
 
-| config                  | mean TPOT | median | output tok/s | accept len |
-|-------------------------|-----------|--------|--------------|------------|
-| baseline sync           | 8.47 ms   | 8.44   | 2538         | –          |
-| **baseline async**      | **5.35**  | 5.31   | **3783**     | –          |
-| dflash sync fp8         | 17.0*     | 9.52   | 1877         | 2.21       |
-| **dflash async fp8**    | **6.24**  | 5.91   | **3194**     | 2.22       |
-| dflash async bf16-MoE   | 6.89      | 6.75   | 2894         | 2.20       |
+## What session 3 changed (all committed on dflash-oss)
 
-*sync dflash mean polluted by residual compiles (P99 277ms); median is
-representative. Per-user TPS ≈ 1000/TPOT: async baseline ≈ 187, async dflash
-≈ 160.
+1. **Fused greedy verify** (`spec_decode/jax/fused_verify.py`): the old path
+   all-gathered the (256, 201k) vocab-sharded logits TWICE via shard_map'd
+   row-selects (~1ms each) before argmax. Now ONE dispatch does row-select +
+   f32 lm_head matmul + cross-shard argmax + greedy rejection + last-sampled
+   extraction (`fused_logits_greedy_verify`; logits never materialize outside
+   it — `_can_defer_spec_logits` in tpu_runner skips the standalone
+   compute_logits). CPU-verified bit-identical vs the old chain.
+   Fallbacks: logprobs / sampling / lora / grammar / SPEC_PERFECT_DRAFT.
+2. **Host-path cuts** (~15 device_puts + ~13 dispatches/step → ~4 + ~8):
+   spec metadata arrays, positions, async substitution + rejection-subtract
+   indices, and the drafter aux [next_prompt|is_in_prefill|num_reqs_dp] all
+   ride the packed DeviceBuffer blob (one H2D/step). Subtract+substitute
+   fused into `_apply_prev_step_corrections_fn`. Drafter reuses the draft
+   group's on-device block tables (manager picks `draft_layer.0` metadata).
+   DFlash drafting = ONE dispatch (`prepare_and_propose`, includes async
+   [last_sampled|drafts] assembly). `general_device_put` batches pytrees into
+   one `jax.device_put`. Sampling-metadata dummy cached across steps.
+3. **NUM_SPEC=3 + bucket gap 32**: verify width 256→128. Positions 3-6 accept
+   at <8%/3%/2%/1% (20b) and don't pay for their verify width. Sweep:
+   NS=3 4.35 mean / NS=4 4.62 / NS=7 5.02. 120b: NS=3 8.30 vs NS=5 8.52
+   (accept 2.47→2.79 doesn't cover +64 verify tokens).
+4. **TARGET_F32_LOGITS=1**: jax-native f32 lm_head matmul for the verifier
+   (bypasses torchax LogitsProcessor call), draft compute_logits f32 to
+   match. No acceptance change; slightly faster + fewer dispatches.
+5. **120b bring-up**: worked first try via config-driven paths (aux layers,
+   block size, requant gate all generic). Accept len 2.47 at NS=3 —
+   noticeably better drafter than 20b's (67/47/33% per-position vs 58/30/15).
 
-**VERDICT: DFlash async beats the sync baseline by ~26% but TRAILS the async
-baseline by ~17%.** At accept len 2.22 the spec step (≈13.1ms = 5.91×2.22)
-costs ~2.5x a plain decode step (5.31ms); the acceptance doesn't cover it.
-Even at the reference ceiling (~2.9 tokens/step) it would win by only ~10%.
-Async scheduling itself works perfectly for dflash (token-identical output,
-same acceptance, 17.0→6.24ms mean TPOT — the sync spec path was host-bound).
+## Step anatomy after all this (20b NS=3, from profile)
 
-## Acceptance-noise attribution (closed)
+verify fwd 6.05ms (op-sum 5.17: gmm 1.75, psum+AR 0.95, RPA 0.86, gathers
+0.32, copies 0.31, select_reduce 0.21, sort 0.16, ...) + fused verify 0.09 +
+prepare_and_propose 1.81 (AR 0.55, RPA 0.43, copies 0.26) + corrections/split
+~0.1 + host gaps ~0.8-1.5ms. Step ≈ 9.1ms, accept 2.09 → TPOT ~4.35.
 
-- bf16-MoE target (`MXFP4_REQUANT_DTYPE=bfloat16 MOE_NO_LHS_QUANT=1`, both
-  env gates committed): acceptance UNCHANGED (2.20 vs 2.22; smoke prompt
-  1.00 vs 1.05 acc/step) and ~10% slower. Target MoE quantization noise is
-  NOT what limits acceptance. The residual serving-vs-reference gap
-  (1.05 vs 1.84 acc/step on the probe prompt) lives elsewhere (attention
-  kernel / router bf16 numerics — unattributed, low ROI).
-- Scale-less bf16 gmm path produces GARBAGE output on v6e (unquantized rhs
-  through gmm_v2 broken there) — do not use; f16 rhs fails Mosaic lowering
-  ("Invalid vector type for load"). The working combo is bf16-with-block-
-  scales + normalize-to-1.0 patch in quantize_tensor (wide-float targets
-  only) + MOE_NO_LHS_QUANT=1.
+## Remaining ideas (diminishing returns, ~0.3-0.5ms each)
 
-## What it would take for DFlash to win at c=32 (future work)
+1. Draft "option d": keep the legacy combined stream through attention
+   (write semantics proven) but gather noise rows before o_proj+MLP each
+   layer (ctx rows' hidden states are never consumed — their K/V come from
+   combined_ctx). Saves ~1/3 of draft o/mlp matmul + AR payload.
+2. Verify epilogue: the ~1.3ms of MoE plumbing (gather_fusion/copies/sort)
+   inside step_fun — RAGGED_GATHER v1 path; needs a kernel-level dig.
+3. Host: ~8 dispatches/step remain (~0.3ms host each): fold the blob
+   jnp.split into the corrections jit; move _modify_prev_results loops off
+   the critical path.
+4. **SPLIT-STREAM DRAFTING (gated off, `SPEC_DFLASH_SPLIT=1` to enable): DO
+   NOT re-enable without fixing** — writes ctx K/V via a slim dummy-q kernel
+   pass then runs the transformer on noise rows only. Passes 1-chip parity
+   bit-exact and 8-chip cos>0.9999 (`scripts/dflash_dev/split_parity.py`) but
+   under real multi-request serving acceptance collapses 2.03→1.26 (pos-0
+   58%→21%) and a multi-request repro hangs the RPA v3 kernel. Suspect:
+   ragged non-causal calls with many tiny (0-4 row) q segments. The
+   CPU prepare-impl A/B (legacy vs split layouts) passes bit-exact.
 
-1. Cut the spec-step overhead (~7.8ms over baseline step): profile; fuse
-   ctx-KV projection across draft layers, skip MLP for ctx rows, 2-stage
-   sharded argmax for draft logits, prepare_inputs donation/sharding audit.
-2. A stronger drafter for this traffic (accept 2.2 is intrinsic on
-   ShareGPT/ignore-eos; z-lab's 4.2-5.1 numbers are chat/harmony evals).
-3. NUM_SPEC<7 is nearly free to try but projected marginal (draft fwd cost is
-   block_size-bound, only verify width shrinks; pos rates 60/32/16/7/3/2/1%).
+## Session-2 knowledge that still applies
 
-## Architecture implemented (unchanged from session 1, all pushed)
+- Acceptance debugging chain (parity_test.py, replay/dump tooling,
+  SPEC_DFLASH_DUMP env) — all still works; dump forces the legacy
+  (non-fused) drafting path automatically.
+- Env gotchas: `pkill -9 -f "[v]llm serve"` (bracket trick); engine dies
+  permanently on first EngineCore exception → full restart; HF_HOME on GCS
+  is read-only (HF_MODULES_CACHE elsewhere); Mxfp4Config(dequantize=True)
+  for HF CPU loads; disk ~48G — no dequantized checkpoints on disk.
+- fp8-requant target numerics cost ~11% argmax flips vs HF but bf16-MoE
+  doesn't fix acceptance (session 2) — consistent with the ceiling finding.
 
-- `tpu_inference/models/jax/dflash.py` — DFlashDraftModel (flax nnx): qwen3
-  arch, biases, q/k-norm, YaRN via GptOssRotaryEmbedding (params in
-  hf_config.rope_parameters), ctx-row K/V override each layer, non-causal
-  paged attention with end-aligned write, embed/lm_head shared from target
-  (gpt-oss unties them), compute_logits slices to true vocab.
-- `tpu_inference/spec_decode/jax/dflash.py` — DFlashProposer: batched, jitted
-  prepare/propose, eagle3-compatible signatures, draft KV in framework paged
-  cache (group found via draft_layer.0), `a = q_lens - num_rejected`,
-  `new_seq_lens = seq_lens - num_rejected`, noise at new_seq_lens + b.
-- kernels hd64 `use_causal_mask` flag; runner dispatch; kv spec registration;
-  precompile helpers; aux hook via set_eagle3_aux_hidden_state_layers (+1
-  convention verified BY VALUE vs HF, aux = x+residual after layers
-  1,6,11,16,21); v6e requant gate; SPEC_PERFECT_DRAFT=1 diagnostic (verify
-  path proven 175/175).
-- NEW session 2: `SPEC_DFLASH_DUMP=<dir>` + `SPEC_DFLASH_DUMP_STEPS` env on
-  the server dumps per-step drafter inputs/outputs npz
-  (runner/utils.py:dump_dflash_step, hooked in speculative_decoding_manager).
+## Bench hygiene for final numbers
 
-## Serve/bench recipes
-
-- Serve: `bash scripts/serve_dflash.sh [--no-async-scheduling|--async-scheduling]`
-  (EP mandatory; RAGGED_GATHER_VERSION=v1 on v6e; MAX_MODEL_LEN=2048
-  MAX_NUM_SEQS=32 NUM_SPEC=7 env-overridable). Boot ~4-5 min.
-- Baseline: same line minus --speculative-config.
-- Bench: `DATASET=<sharegpt.json> bash scripts/bench_dflash.sh <tag> <n> <c>`;
-  ShareGPT at
-  `/tmp/claude-2001/-home-enyouki-tpu-inference/df1a8d85-8c04-4be3-b316-1fb928b7c908/scratchpad/sharegpt.json`
-  (re-download URL in scripts; node has internet). WARM UP first (cold XLA).
-- Acceptance: `curl -s localhost:8000/metrics | grep spec_decode` or the bench
-  "Speculative Decoding" block.
-- Offline forensic loop: serve with SPEC_DFLASH_DUMP → replay_dump.py /
-  truth_replay.py / aux_check.py / reference_e2e.py (all CPU, HF_HOME=gcs
-  mount, HF_MODULES_CACHE=/tmp/hfmods, OMP_NUM_THREADS=32+).
-
-## Session-2 status: benches DONE (see FINAL BENCH RESULTS above), async
-## scheduling verified, acceptance question closed. Remaining work is the
-## optimization list under "What it would take for DFlash to win".
-
-## Environment gotchas (rediscovery tax)
-
-- `pkill -f "vllm serve"` kills YOUR OWN shell — use `pkill -9 -f "[v]llm serve"`.
-- HF_HOME=/tmp/gcs/bucket is READ-ONLY → HF_MODULES_CACHE elsewhere for
-  trust_remote_code; HF CPU gpt-oss load MUST use Mxfp4Config(dequantize=True).
-- vllm serve engine dies permanently on first EngineCore exception → full
-  restart (~4-5 min).
-- TPU "already in use": `~/tpu-tooling/free-tpu.sh`.
-- Disk on / is ~48G free — do NOT save a dequantized 40GB checkpoint; use the
-  in-process MXFP4_DEQUANT_BF16 path instead.
-- KV cache capacity at MAX_MODEL_LEN=2048/MAX_NUM_SEQS=32: watch
-  num_requests_waiting{reason=capacity} — effective concurrency can be <32.
+For publishable numbers serve with SKIP_JAX_PRECOMPILE=0 (precompile all
+buckets; slower boot) or run 4+ warm benches. The bench JSONs live in the
+session scratchpad `bench/` dir (mean/median/p99 TPOT + per-position accept).
