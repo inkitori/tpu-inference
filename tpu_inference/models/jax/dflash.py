@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,423 +11,239 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DFlash draft model for speculative decoding on JAX/TPU."""
+"""DFlash draft model (block-diffusion speculative decoding), JAX-native.
 
-from typing import List, Tuple
+Faithful port of the z-lab DFlash reference (e.g. z-lab/gpt-oss-20b-DFlash):
+a small Qwen3-style transformer that drafts a whole block of tokens in one
+non-causal forward pass.
+
+Reference semantics per drafting step::
+
+    combined  = hidden_norm(fc(concat(target aux hidden states)))
+    per layer: ctx K/V    = k/v_proj(combined)          # static, cacheable
+               noise Q/KV = q/k/v_proj(hidden states)   # evolving noise block
+               attn       = softmax(Q @ [ctx K | noise K]^T) @ [ctx V | ...]
+                            (non-causal: full context + bidirectional block)
+    logits    = target lm_head(norm(hidden[noise block][1:]))
+
+Paged TPU integration: the flat token stream carries, per request,
+``[a_i freshly-accepted context rows | block_size noise rows]``.  Both streams
+run through the transformer, but the context rows' K/V are overridden with
+projections of ``combined`` before each attention call — so the paged
+attention kernel's end-aligned cache write lands real context K/V at those
+rows' positions and noise K/V right behind them, while
+``use_causal_mask=False`` gives every noise token full visibility.  Context
+rows' attention outputs are garbage and never read; they cannot pollute the
+noise rows because cross-token flow happens only through the (overridden)
+K/V.
+
+The checkpoint ships neither ``embed_tokens`` nor ``lm_head``: both are
+shared from the target model (gpt-oss has untied embeddings, so these are two
+DIFFERENT matrices — using the input embedding for logits drops draft
+acceptance to 0%).  The proposer overwrites the zero-initialized placeholders
+after load.
+"""
+
+from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax import lax
 from jax.sharding import Mesh
-from transformers import Qwen3Config
 from vllm.config import VllmConfig
 
-from tpu_inference import utils
-from tpu_inference.kernels.flash_attention.kernel import (BlockSizes,
-                                                          SegmentIds,
-                                                          flash_attention)
-from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.jax.rope_interface import apply_rope
+from tpu_inference.layers.common.attention_interface import attention
+from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear
+from tpu_inference.layers.jax.norm import JaxRmsNorm
+from tpu_inference.layers.jax.rope import GptOssRotaryEmbedding
 from tpu_inference.logger import init_logger
+from tpu_inference.models.jax.qwen2 import Qwen2MLP
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
                                                          get_default_maps,
                                                          load_hf_weights)
-from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
-
-# vmem budget for the flash_attention Pallas kernel (128 MiB).
-_FA_VMEM_LIMIT = 128 * 1024 * 1024
+zeros_init = nnx.initializers.zeros_init()
 
 
 class DFlashAttention(nnx.Module):
-    """DFlash cross+self attention with on-device KV cache.
+    """Qwen3-style attention with the DFlash context-K/V override.
 
-    Each call:
-      1. Projects Q from noise embeddings, K/V from [context, noise].
-      2. Applies RoPE to Q and K.
-      3. Expands K/V for GQA.
-      4. Writes NEW K/V into the pre-allocated cache via dynamic_update_slice.
-      5. Runs non-causal flash_attention over the full cache up to the valid
-         length, using segment_ids to mask padding.
+    Rows where ``is_ctx`` is True contribute K/V computed from the shared
+    projected context (``combined_ctx``) instead of from the evolving hidden
+    states; everything else is standard Qwen3 attention (per-head q/k-norm,
+    YaRN RoPE, attention biases), run non-causally over the paged KV cache.
     """
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-        dtype: jnp.dtype,
-        rng: nnx.Rngs,
-        mesh: Mesh,
-    ):
+    def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, mesh: Mesh,
+                 quant_config):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.rope_theta = config.rope_theta
-        self.rope_scaling = getattr(config, "rope_scaling", None)
-        self.rms_norm_eps = config.rms_norm_eps
-
-        self.head_dim_original = getattr(config, "head_dim",
-                                         self.hidden_size // self.num_heads)
-        self.head_dim = utils.get_padded_head_dim(self.head_dim_original)
-
-        sharding_size = get_mesh_shape_product(mesh,
-                                               ShardingAxisName.MLP_TENSOR)
-        self.num_heads = utils.get_padded_num_heads(self.num_heads,
-                                                    sharding_size)
-        self.num_kv_heads = utils.get_padded_num_heads(self.num_kv_heads,
-                                                       sharding_size)
-        self.num_kv_groups = self.num_heads // self.num_kv_heads
-
+        self.head_dim = getattr(config, "head_dim",
+                                self.hidden_size // self.num_heads)
         self.mesh = mesh
+        use_bias = bool(getattr(config, "attention_bias", False))
 
-        self.q_proj = nnx.Einsum(
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        self.rotary_emb = GptOssRotaryEmbedding(
+            head_dim=self.head_dim,
+            rope_theta=config.rope_theta,
+            dtype=dtype,
+            initial_context_length=rope_scaling.get(
+                "original_max_position_embeddings", 4096),
+            rope_scaling_factor=rope_scaling.get("factor", 1.0),
+            rope_ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            rope_ntk_beta=rope_scaling.get("beta_fast", 32.0),
+        )
+
+        self.q_proj = JaxEinsum(
             "TD,DNH->TNH",
             (self.hidden_size, self.num_heads, self.head_dim),
+            bias_shape=(self.num_heads, self.head_dim) if use_bias else None,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (None, ShardingAxisName.ATTN_HEAD, None)),
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+            bias_init=nnx.with_partitioning(zeros_init, ("model", None)),
             rngs=rng,
+            quant_config=quant_config,
         )
-        self.k_proj = nnx.Einsum(
+        self.k_proj = JaxEinsum(
             "TD,DKH->TKH",
             (self.hidden_size, self.num_kv_heads, self.head_dim),
+            bias_shape=(self.num_kv_heads,
+                        self.head_dim) if use_bias else None,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (None, ShardingAxisName.ATTN_HEAD, None)),
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+            bias_init=nnx.with_partitioning(zeros_init, ("model", None)),
             rngs=rng,
+            quant_config=quant_config,
         )
-        self.v_proj = nnx.Einsum(
+        self.v_proj = JaxEinsum(
             "TD,DKH->TKH",
             (self.hidden_size, self.num_kv_heads, self.head_dim),
+            bias_shape=(self.num_kv_heads,
+                        self.head_dim) if use_bias else None,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (None, ShardingAxisName.ATTN_HEAD, None)),
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+            bias_init=nnx.with_partitioning(zeros_init, ("model", None)),
             rngs=rng,
+            quant_config=quant_config,
         )
-        self.o_proj = nnx.Einsum(
+        self.o_proj = JaxEinsum(
             "TNH,NHD->TD",
             (self.num_heads, self.head_dim, self.hidden_size),
+            bias_shape=(self.hidden_size, ) if use_bias else None,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (ShardingAxisName.ATTN_HEAD, None, None)),
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None, None)),
+            bias_init=nnx.with_partitioning(zeros_init, (None, )),
             rngs=rng,
+            quant_config=quant_config,
         )
-
-        self.q_norm = nnx.RMSNorm(
+        self.q_norm = JaxRmsNorm(
             self.head_dim,
-            epsilon=self.rms_norm_eps,
+            epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
+            quant_config=quant_config,
         )
-        self.k_norm = nnx.RMSNorm(
+        self.k_norm = JaxRmsNorm(
             self.head_dim,
-            epsilon=self.rms_norm_eps,
+            epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
+            quant_config=quant_config,
         )
 
     def __call__(
         self,
-        x_noise: jax.Array,
-        target_hidden: jax.Array,
-        noise_positions: jax.Array,
-        ctx_positions: jax.Array,
-        kv_cache_k: jax.Array,
-        kv_cache_v: jax.Array,
-        cache_len: jax.Array,
-        actual_ctx_count: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """Non-causal attention with on-device KV cache.
+        kv_cache: jax.Array,
+        hidden_states: jax.Array,  # (T, D)
+        combined_ctx: jax.Array,  # (T, D) — valid at ctx rows only
+        is_ctx: jax.Array,  # (T,) bool
+        md: AttentionMetadata,
+    ) -> Tuple[jax.Array, jax.Array]:
+        positions = md.input_positions
 
-        Uses a two-phase cache write to handle padded context correctly:
-          Phase A: write context K/V (with padding zeroed) at ``cache_len``.
-          Phase B: write noise K/V at ``cache_len + actual_ctx_count``,
-                   overwriting any padding zeros from Phase A.
+        q = self.q_norm(self.q_proj(hidden_states))
 
-        Args:
-            x_noise: (T_noise, D) noise hidden states.
-            target_hidden: (T_padded, D) padded context features.
-            noise_positions: (T_noise,) position ids for noise tokens.
-            ctx_positions: (T_padded,) position ids for context tokens.
-            kv_cache_k: (1, N_heads, max_kv_len, H) pre-allocated K cache.
-            kv_cache_v: (1, N_heads, max_kv_len, H) pre-allocated V cache.
-            cache_len: scalar int, valid entries already in cache.
-            actual_ctx_count: scalar int, real (non-padding) context tokens.
+        k_noise = self.k_norm(self.k_proj(hidden_states))
+        v_noise = self.v_proj(hidden_states)
 
-        Returns:
-            (output, new_kv_cache_k, new_kv_cache_v)
-        """
-        T_noise = x_noise.shape[0]
-        T_padded = target_hidden.shape[0]
+        # Context rows: K/V from the shared projected context, NOT from the
+        # evolving hidden states. Same per-layer projections + k-norm + RoPE.
+        k_ctx = self.k_norm(self.k_proj(combined_ctx))
+        v_ctx = self.v_proj(combined_ctx)
 
-        q = self.q_proj(x_noise)
-        q = self.q_norm(q)
-        q = apply_rope(
+        k = jnp.where(is_ctx[:, None, None], k_ctx, k_noise)
+        v = jnp.where(is_ctx[:, None, None], v_ctx, v_noise)
+
+        q, k = self.rotary_emb(q, k, positions)
+
+        # Non-causal: the noise block attends to the whole context and
+        # bidirectionally within itself. The kernel also writes k/v into the
+        # paged cache end-aligned at [kv_len - q_len, kv_len).
+        new_kv_cache, attn_out = attention(
+            kv_cache,
             q,
-            noise_positions,
-            self.head_dim_original,
-            self.rope_theta,
-            self.rope_scaling,
+            k,
+            v,
+            md,
+            self.mesh,
+            self.head_dim,
+            use_causal_mask=False,
         )
-
-        x_new = jnp.concatenate([target_hidden, x_noise], axis=0)
-        k_new = self.k_proj(x_new)
-        v_new = self.v_proj(x_new)
-        k_new = self.k_norm(k_new)
-
-        new_positions = jnp.concatenate([ctx_positions, noise_positions],
-                                        axis=0)
-        k_new = apply_rope(
-            k_new,
-            new_positions,
-            self.head_dim_original,
-            self.rope_theta,
-            self.rope_scaling,
-        )
-
-        if self.num_kv_groups > 1:
-            k_new = jnp.repeat(k_new, self.num_kv_groups, axis=1)
-            v_new = jnp.repeat(v_new, self.num_kv_groups, axis=1)
-
-        k_ctx = k_new[:T_padded]
-        v_ctx = v_new[:T_padded]
-        k_noise = k_new[T_padded:]
-        v_noise = v_new[T_padded:]
-
-        ctx_mask = (jnp.arange(T_padded) < actual_ctx_count)  # (T_padded,)
-        ctx_mask_kv = ctx_mask[:, jnp.newaxis, jnp.newaxis]  # (T_padded, 1, 1)
-        k_ctx = jnp.where(ctx_mask_kv, k_ctx, 0.0)
-        v_ctx = jnp.where(ctx_mask_kv, v_ctx, 0.0)
-
-        k_ctx_4d = k_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        v_ctx_4d = v_ctx.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        kv_cache_k = lax.dynamic_update_slice(kv_cache_k, k_ctx_4d,
-                                              (0, 0, cache_len, 0))
-        kv_cache_v = lax.dynamic_update_slice(kv_cache_v, v_ctx_4d,
-                                              (0, 0, cache_len, 0))
-
-        noise_start = cache_len + actual_ctx_count
-        k_noise_4d = k_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        v_noise_4d = v_noise.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        kv_cache_k = lax.dynamic_update_slice(kv_cache_k, k_noise_4d,
-                                              (0, 0, noise_start, 0))
-        kv_cache_v = lax.dynamic_update_slice(kv_cache_v, v_noise_4d,
-                                              (0, 0, noise_start, 0))
-
-        new_cache_len = cache_len + actual_ctx_count + T_noise
-        max_kv_len = kv_cache_k.shape[2]
-
-        q_4d = q.transpose(1, 0, 2)[jnp.newaxis, :, :, :]
-        kv_ids = (jnp.arange(max_kv_len) < new_cache_len).astype(jnp.int32)
-        q_ids = jnp.ones(T_noise, dtype=jnp.int32)
-        seg_ids = SegmentIds(
-            q=q_ids[jnp.newaxis, :],
-            kv=kv_ids[jnp.newaxis, :],
-        )
-
-        sm_scale = self.head_dim_original**-0.5
-        block_sizes = BlockSizes(
-            block_q=T_noise,
-            block_k_major=max_kv_len,
-            block_k=max_kv_len,
-            block_b=1,
-        )
-        attn_out = flash_attention(
-            q_4d,
-            kv_cache_k,
-            kv_cache_v,
-            segment_ids=seg_ids,
-            causal=False,
-            sm_scale=sm_scale,
-            block_sizes=block_sizes,
-            vmem_limit_bytes=_FA_VMEM_LIMIT,
-        )
-
-        attn_out = attn_out[0].transpose(1, 0, 2)
-        output = self.o_proj(attn_out)
-
-        return output, kv_cache_k, kv_cache_v
-
-
-class DFlashMLP(nnx.Module):
-
-    def __init__(self, config: Qwen3Config, dtype: jnp.dtype, rng: nnx.Rngs):
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        self.gate_proj = nnx.Linear(
-            hidden_size,
-            intermediate_size,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (None, ShardingAxisName.MLP_TENSOR)),
-            rngs=rng,
-        )
-        self.up_proj = nnx.Linear(
-            hidden_size,
-            intermediate_size,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (None, ShardingAxisName.MLP_TENSOR)),
-            rngs=rng,
-        )
-        self.down_proj = nnx.Linear(
-            intermediate_size,
-            hidden_size,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(
-                init_fn, (ShardingAxisName.MLP_TENSOR, None)),
-            rngs=rng,
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return new_kv_cache, self.o_proj(attn_out)
 
 
 class DFlashDecoderLayer(nnx.Module):
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-        dtype: jnp.dtype,
-        rng: nnx.Rngs,
-        mesh: Mesh,
-    ):
-        hidden_size = config.hidden_size
-        rms_norm_eps = config.rms_norm_eps
-
-        self.input_layernorm = nnx.RMSNorm(
-            hidden_size,
-            epsilon=rms_norm_eps,
+    def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, mesh: Mesh,
+                 quant_config):
+        self.input_layernorm = JaxRmsNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
+            quant_config=quant_config,
         )
-        self.self_attn = DFlashAttention(
-            config=config,
-            dtype=dtype,
-            rng=rng,
-            mesh=mesh,
-        )
-        self.post_attention_layernorm = nnx.RMSNorm(
-            hidden_size,
-            epsilon=rms_norm_eps,
+        self.self_attn = DFlashAttention(config, dtype, rng, mesh,
+                                         quant_config)
+        self.post_attention_layernorm = JaxRmsNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
+            quant_config=quant_config,
         )
-        self.mlp = DFlashMLP(config=config, dtype=dtype, rng=rng)
+        self.mlp = Qwen2MLP(config=config,
+                            dtype=dtype,
+                            rng=rng,
+                            quant_config=quant_config)
 
     def __call__(
         self,
-        x: jax.Array,
-        target_hidden: jax.Array,
-        noise_positions: jax.Array,
-        ctx_positions: jax.Array,
-        kv_cache_k: jax.Array,
-        kv_cache_v: jax.Array,
-        cache_len: jax.Array,
-        actual_ctx_count: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
-        """Returns (hidden_states, new_kv_cache_k, new_kv_cache_v)."""
-        residual = x
-        x = self.input_layernorm(x)
-        x, kv_cache_k, kv_cache_v = self.self_attn(
-            x,
-            target_hidden,
-            noise_positions,
-            ctx_positions,
-            kv_cache_k,
-            kv_cache_v,
-            cache_len,
-            actual_ctx_count,
-        )
-        x = residual + x
-
-        residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        x = residual + x
-        return x, kv_cache_k, kv_cache_v
-
-
-class DFlashModel(nnx.Module):
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        rng: nnx.Rngs,
-        mesh: Mesh,
-    ) -> None:
-        spec_config = vllm_config.speculative_config
-        assert spec_config is not None
-        hf_config = spec_config.draft_model_config.hf_config
-        dtype = jnp.bfloat16
-        hidden_size = hf_config.hidden_size
-        rms_norm_eps = hf_config.rms_norm_eps
-
-        self.embed_tokens = nnx.Embed(
-            num_embeddings=hf_config.vocab_size,
-            features=hidden_size,
-            param_dtype=dtype,
-            embedding_init=nnx.with_partitioning(
-                init_fn, (ShardingAxisName.VOCAB, None)),
-            rngs=rng,
-        )
-
-        self.layers = nnx.List([
-            DFlashDecoderLayer(
-                config=hf_config,
-                dtype=dtype,
-                rng=rng,
-                mesh=mesh,
-            ) for _ in range(hf_config.num_hidden_layers)
-        ])
-
-        dflash_config = getattr(hf_config, "dflash_config", {})
-        target_layer_ids = dflash_config.get("target_layer_ids", None)
-        num_target_layers = getattr(hf_config, "num_target_layers", None)
-        if target_layer_ids is not None:
-            num_context_features = len(target_layer_ids)
-        elif num_target_layers is not None:
-            num_context_features = num_target_layers
-        else:
-            num_context_features = hf_config.num_hidden_layers
-
-        target_hidden_size = getattr(hf_config, "target_hidden_size",
-                                     hidden_size)
-        fc_in_features = num_context_features * target_hidden_size
-
-        self.fc = nnx.Linear(
-            fc_in_features,
-            hidden_size,
-            use_bias=False,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, None)),
-            rngs=rng,
-        )
-
-        self.hidden_norm = nnx.RMSNorm(
-            hidden_size,
-            epsilon=rms_norm_eps,
-            param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None, )),
-            rngs=rng,
-        )
-        self.norm = nnx.RMSNorm(
-            hidden_size,
-            epsilon=rms_norm_eps,
-            param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None, )),
-            rngs=rng,
-        )
+        kv_cache: jax.Array,
+        hidden_states: jax.Array,
+        combined_ctx: jax.Array,
+        is_ctx: jax.Array,
+        md: AttentionMetadata,
+    ) -> Tuple[jax.Array, jax.Array]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        kv_cache, attn_out = self.self_attn(kv_cache, hidden_states,
+                                            combined_ctx, is_ctx, md)
+        hidden_states = residual + attn_out
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return kv_cache, residual + hidden_states
 
 
 class DFlashWeightLoader(BaseWeightLoader):
@@ -437,163 +253,179 @@ class DFlashWeightLoader(BaseWeightLoader):
         self.vllm_config = vllm_config
         self.mesh = mesh
 
-    def load_weights(self, model: "DFlashForCausalLM", mappings: dict):
+    def load_weights(self, model: "DFlashDraftModel", mappings: dict):
+        # embed_tokens / lm_head are not in the checkpoint (the proposer
+        # shares the target's weights in after load); materialize them so
+        # check_all_loaded doesn't trip on abstract placeholders.
+        from jax.sharding import NamedSharding, PartitionSpec
+        for param in (model.embed_tokens, model.lm_head):
+            if isinstance(param.value, jax.ShapeDtypeStruct):
+                param.value = jax.device_put(
+                    jnp.zeros(param.value.shape, param.value.dtype),
+                    NamedSharding(self.mesh, PartitionSpec("model", None)))
+
         metadata_map = get_default_maps(
-            self.vllm_config.speculative_config.draft_model_config,
-            self.mesh,
-            mappings,
-        )
+            self.vllm_config.speculative_config.draft_model_config, self.mesh,
+            mappings)
+
+        # Only what the checkpoint actually ships; embed_tokens / lm_head are
+        # shared from the target by the proposer after load.
+        filter_regex = (
+            r"^(layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight|"
+            r"layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.(weight|bias)|"
+            r"layers\.\d+\.self_attn\.(q_norm|k_norm)\.weight|"
+            r"layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)\.weight|"
+            r"(fc|hidden_norm|norm)\.weight)$")
+
         load_hf_weights(
             vllm_config=self.vllm_config,
             model=model,
             metadata_map=metadata_map,
             mesh=self.mesh,
+            filter_regex=filter_regex,
             is_draft_model=True,
         )
 
-        # If the embedding is not initialized, initialize it with a dummy
-        # array here to pass jit compilation. The real weights will be shared
-        # from the target model.
-        if isinstance(model.model.embed_tokens.embedding.value,
-                      jax.ShapeDtypeStruct):
-            model.model.embed_tokens.embedding.value = jnp.zeros(
-                model.model.embed_tokens.embedding.shape,
-                dtype=model.model.embed_tokens.embedding.dtype,
-            )
 
+class DFlashDraftModel(nnx.Module):
+    """DFlash draft for speculative decoding; architectures=[DFlashDraftModel].
 
-class DFlashForCausalLM(nnx.Module):
-    """DFlash draft model for speculative decoding on TPU."""
+    Weight sources:
+      - checkpoint: ``layers.*``, ``fc``, ``hidden_norm``, ``norm``
+      - target model (shared post-load by the proposer): ``embed_tokens``,
+        ``lm_head``
+    """
 
     WeightLoader = DFlashWeightLoader
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        rng_key: jax.Array,
-        mesh: Mesh,
-    ) -> None:
-        nnx.Module.__init__(self)
+    def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
+                 mesh: Mesh):
         self.vllm_config = vllm_config
-        self.rng = nnx.Rngs(rng_key)
         self.mesh = mesh
+        rng = nnx.Rngs(rng_key)
 
         spec_config = vllm_config.speculative_config
         assert spec_config is not None
-        hf_config = spec_config.draft_model_config.hf_config
-        self.hf_config = hf_config
-        self.block_size = getattr(hf_config, "block_size", 8)
-        dflash_config = getattr(hf_config, "dflash_config", {})
-        self.mask_token_id = dflash_config.get("mask_token_id", 0)
+        draft_config = spec_config.draft_model_config
+        hf_config = draft_config.hf_config
+        target_model_config = vllm_config.model_config
+        dtype = target_model_config.dtype
+        # DFlash draft checkpoints are unquantized bf16; never inherit the
+        # target's (e.g. mxfp4) quant config.
+        quant_config = None
 
-        self._position_scheme = dflash_config.get("position_scheme",
-                                                  "incremental")
+        self.hidden_size = hf_config.hidden_size
+        target_hidden_size = getattr(hf_config, "target_hidden_size",
+                                     target_model_config.get_hidden_size())
+        dflash_config = getattr(hf_config, "dflash_config", None) or {}
+        target_layer_ids = dflash_config.get("target_layer_ids") or []
+        num_target_layers = len(target_layer_ids) or getattr(
+            hf_config, "num_target_layers", hf_config.num_hidden_layers)
 
-        self.model = DFlashModel(
-            vllm_config=vllm_config,
-            rng=self.rng,
-            mesh=mesh,
+        vocab_size = target_model_config.get_vocab_size()
+
+        # Placeholders; the proposer shares the target's weights in (and
+        # re-derives state leaves). Materialized as zeros so weight-loading
+        # checks and jit tracing see concrete arrays.
+        self.embed_tokens = nnx.Param(
+            jnp.zeros((vocab_size, self.hidden_size), dtype=dtype),
+            sharding=("model", None),
         )
+        self.lm_head = nnx.Param(
+            jnp.zeros((vocab_size, self.hidden_size), dtype=dtype),
+            sharding=("model", None),
+        )
+
+        self.layers = nnx.List([
+            DFlashDecoderLayer(hf_config, dtype, rng, mesh, quant_config)
+            for _ in range(hf_config.num_hidden_layers)
+        ])
+
+        self.fc = JaxLinear(
+            num_target_layers * target_hidden_size,
+            self.hidden_size,
+            use_bias=False,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+            rngs=rng,
+            quant_config=quant_config,
+        )
+        self.hidden_norm = JaxRmsNorm(
+            self.hidden_size,
+            epsilon=hf_config.rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None, )),
+            rngs=rng,
+            quant_config=quant_config,
+        )
+        self.norm = JaxRmsNorm(
+            self.hidden_size,
+            epsilon=hf_config.rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None, )),
+            rngs=rng,
+            quant_config=quant_config,
+        )
+        self.num_layers = hf_config.num_hidden_layers
 
     def __call__(
         self,
         kv_caches: List[jax.Array],
-        input_ids: jax.Array,
-        target_hidden_states: jax.Array,
-        attention_metadata,
-    ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]]:
-        """Forward pass for the DFlash draft model.
+        input_ids: jax.Array,  # (T,)
+        target_hidden_states,  # (combined_ctx (T, D), is_ctx (T,) bool)
+        attention_metadata: AttentionMetadata,
+        _layer_name_to_kvcache_index=None,
+    ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array],
+               Optional[jax.Array]]:
+        combined_ctx, is_ctx = target_hidden_states
 
-        ``target_hidden_states`` is a 3-tuple:
-            (ctx_hidden, cache_len_arr, actual_ctx_count_arr)
-        where:
-            ctx_hidden: (T_padded, D) — padded context features.
-            cache_len_arr: (1,) int32 — valid entries already in KV cache.
-            actual_ctx_count_arr: (1,) int32 — real (non-padding) context count.
+        x = jnp.take(self.embed_tokens.value, input_ids,
+                     axis=0).astype(combined_ctx.dtype)
 
-        ``kv_caches`` is a flat list of length ``2 * num_layers``:
-            [k_cache_0, v_cache_0, k_cache_1, v_cache_1, ...]
-        Each cache has shape ``(1, num_heads, max_kv_len, head_dim)``.
+        # The last num_layers KV caches belong to the draft.
+        draft_kv_start = len(kv_caches) - self.num_layers
+        for i, layer in enumerate(self.layers):
+            idx = draft_kv_start + i
+            kv_caches[idx], x = layer(kv_caches[idx], x, combined_ctx, is_ctx,
+                                      attention_metadata)
 
-        Returns:
-            (kv_caches, hidden_states, [target_hidden_states])
-        """
-        ctx_hidden, cache_len_arr, actual_ctx_count_arr = target_hidden_states
-        cache_len = cache_len_arr[0]  # scalar
-        actual_ctx_count = actual_ctx_count_arr[0]  # scalar
-
-        noise_emb = self.model.embed_tokens(input_ids)
-        pos_offset = cache_len if self._position_scheme == "incremental" else 0
-        T_padded = ctx_hidden.shape[0]
-        T_noise = input_ids.shape[0]
-        ctx_positions = jnp.arange(T_padded, dtype=jnp.int32) + pos_offset
-        noise_positions = (jnp.arange(T_noise, dtype=jnp.int32) + pos_offset +
-                           actual_ctx_count)
-
-        x = noise_emb
-        for i, layer in enumerate(self.model.layers):
-            kv_k = kv_caches[2 * i]
-            kv_v = kv_caches[2 * i + 1]
-            x, kv_k, kv_v = layer(
-                x,
-                ctx_hidden,
-                noise_positions,
-                ctx_positions,
-                kv_k,
-                kv_v,
-                cache_len,
-                actual_ctx_count,
-            )
-            kv_caches[2 * i] = kv_k
-            kv_caches[2 * i + 1] = kv_v
-
-        x = self.model.norm(x)
-
-        return kv_caches, x, []
-
-    def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
-        """Compute logits using tied embedding weights."""
-        return jnp.dot(hidden_states,
-                       self.model.embed_tokens.embedding.value.T)
+        hidden_states = self.norm(x)
+        return kv_caches, hidden_states, [hidden_states], None
 
     def combine_hidden_states(self, hidden_states: jax.Array) -> jax.Array:
-        """Project concatenated target auxiliary hidden states.
+        """fc + hidden_norm over concatenated target aux hidden states."""
+        return self.hidden_norm(self.fc(hidden_states))
 
-        Args:
-            hidden_states: (T, num_target_layers * target_hidden_size)
+    def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
+        """Logits through the (shared) target lm_head."""
+        return hidden_states @ self.lm_head.value.T
 
-        Returns:
-            (T, hidden_size) projected + normalised context features.
-        """
-        return self.model.hidden_norm(self.model.fc(hidden_states))
-
-    def load_weights(self, rng_key: jax.Array):
-        self.rng = jax.random.key(self.vllm_config.model_config.seed)
-
+    def load_weights(self, _rng_key: jax.Array):
         mappings = {
-            "layers.*.input_layernorm": "model.layers.*.input_layernorm.scale",
-            "layers.*.self_attn.q_proj":
-            "model.layers.*.self_attn.q_proj.kernel",
-            "layers.*.self_attn.k_proj":
-            "model.layers.*.self_attn.k_proj.kernel",
-            "layers.*.self_attn.v_proj":
-            "model.layers.*.self_attn.v_proj.kernel",
-            "layers.*.self_attn.o_proj":
-            "model.layers.*.self_attn.o_proj.kernel",
-            "layers.*.self_attn.q_norm":
-            "model.layers.*.self_attn.q_norm.scale",
-            "layers.*.self_attn.k_norm":
-            "model.layers.*.self_attn.k_norm.scale",
+            # HF checkpoint key (".weight" stripped) -> model param path.
+            "layers.*.input_layernorm": "layers.*.input_layernorm.weight",
             "layers.*.post_attention_layernorm":
-            "model.layers.*.post_attention_layernorm.scale",
-            "layers.*.mlp.gate_proj": "model.layers.*.mlp.gate_proj.kernel",
-            "layers.*.mlp.up_proj": "model.layers.*.mlp.up_proj.kernel",
-            "layers.*.mlp.down_proj": "model.layers.*.mlp.down_proj.kernel",
-            "fc": "model.fc.kernel",
-            "hidden_norm": "model.hidden_norm.scale",
-            "norm": "model.norm.scale",
-            "embed_tokens": "model.embed_tokens.embedding",
+            "layers.*.post_attention_layernorm.weight",
+            "layers.*.self_attn.q_proj": "layers.*.self_attn.q_proj.weight",
+            "layers.*.self_attn.k_proj": "layers.*.self_attn.k_proj.weight",
+            "layers.*.self_attn.v_proj": "layers.*.self_attn.v_proj.weight",
+            "layers.*.self_attn.o_proj": "layers.*.self_attn.o_proj.weight",
+            "layers.*.self_attn.q_proj.bias":
+            "layers.*.self_attn.q_proj.bias",
+            "layers.*.self_attn.k_proj.bias":
+            "layers.*.self_attn.k_proj.bias",
+            "layers.*.self_attn.v_proj.bias":
+            "layers.*.self_attn.v_proj.bias",
+            "layers.*.self_attn.o_proj.bias":
+            "layers.*.self_attn.o_proj.bias",
+            "layers.*.self_attn.q_norm": "layers.*.self_attn.q_norm.weight",
+            "layers.*.self_attn.k_norm": "layers.*.self_attn.k_norm.weight",
+            "layers.*.mlp.gate_proj": "layers.*.mlp.gate_proj.weight",
+            "layers.*.mlp.up_proj": "layers.*.mlp.up_proj.weight",
+            "layers.*.mlp.down_proj": "layers.*.mlp.down_proj.weight",
+            "fc": "fc.weight",
+            "hidden_norm": "hidden_norm.weight",
+            "norm": "norm.weight",
         }
-
         loader = self.WeightLoader(self.vllm_config, self.mesh)
         loader.load_weights(self, mappings)

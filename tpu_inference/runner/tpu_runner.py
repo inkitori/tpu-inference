@@ -86,6 +86,7 @@ from tpu_inference.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from tpu_inference.runner.structured_decoding_manager import \
     StructuredDecodingManager
+from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.spec_decode.jax.utils import (
     concat_last_sampled_tokens_and_draft_tokens, extend_logits_simple,
@@ -743,6 +744,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if self.speculative_config:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "dflash":
+                # NOTE: must come before use_eagle(), which matches dflash.
+                self.drafter = DFlashProposer(self.vllm_config, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = Eagle3Proposer(self.vllm_config, self)
             else:

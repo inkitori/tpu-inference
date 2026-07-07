@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,37 +11,57 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DFlash proposer for speculative decoding on JAX/TPU."""
+"""Batched DFlash proposer for speculative decoding on JAX/TPU.
 
-import functools
+DFlash drafts a whole block of ``block_size`` tokens in ONE non-causal draft
+forward per step (no autoregressive loop like eagle3). This proposer keeps
+the eagle3 interface (``prepare_inputs`` / ``propose`` with the same
+signatures) so the SpeculativeDecodingManager and the async-scheduling path
+are reused unchanged.
+
+Per step, for each request with ``q_i`` scheduled tokens and ``n_i`` rejected
+tokens (``a_i = q_i - n_i`` accepted rows, committed length ``N'``):
+
+  flat draft stream: [ a_i ctx rows | B noise rows ]      (per request)
+    ctx rows    <- freshly accepted target rows; their K/V (projected from
+                   the target's aux hidden states) are written into the
+                   draft's paged KV cache at positions [N-1, N'-1)
+    noise rows  <- [bonus token, mask, ..., mask] at positions [N'-1, N'-1+B)
+
+  kv_len = (N'-1) + B, and the paged-attention kernel's END-ALIGNED write of
+  the ``a_i + B`` new K/V rows lands exactly on [N-1, N'-1+B). Attention is
+  non-causal, so every noise token sees the full context plus the whole
+  block. Draft tokens are argmax(target_lm_head(hidden[noise rows 1..S])).
+
+The draft KV cache lives in the LAST ``num_draft_layers`` framework KV-cache
+groups (standard block tables), so batching, slot management, and preemption
+are handled by vLLM — the proposer holds no per-request state.
+"""
+
 from dataclasses import replace
-from typing import Any, Optional
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax import lax
-from jax.sharding import NamedSharding, PartitionSpec
 from vllm.config import VllmConfig
 
-from tpu_inference import utils
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.model_loader import get_model
-from tpu_inference.utils import device_array, get_mesh_shape_product
+from tpu_inference.utils import device_array
 
 logger = init_logger(__name__)
 
 
 class DFlashProposer:
-    """Proposer for speculative decoding using DFlash block diffusion."""
+    """Block-diffusion (DFlash) drafter with framework-paged draft KV cache."""
 
     def __init__(
-        self,
-        vllm_config: VllmConfig,
-        runner: Any,
+            self,
+            vllm_config: VllmConfig,
+            runner: Any,  # TPUModelRunner
     ):
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
@@ -57,262 +77,240 @@ class DFlashProposer:
         hf_config = self.draft_model_config.hf_config
         self.block_size = getattr(hf_config, "block_size",
                                   self.num_speculative_tokens + 1)
-        dflash_config = getattr(hf_config, "dflash_config", {})
-        self.mask_token_id = dflash_config.get("mask_token_id", 0)
-        self.hidden_size = hf_config.hidden_size
-        self.num_layers = hf_config.num_hidden_layers
+        if self.num_speculative_tokens > self.block_size - 1:
+            raise ValueError(
+                f"num_speculative_tokens={self.num_speculative_tokens} "
+                f"exceeds draft block_size-1={self.block_size - 1}")
+        dflash_config = getattr(hf_config, "dflash_config", None) or {}
+        self.mask_token_id = dflash_config.get("mask_token_id")
+        assert self.mask_token_id is not None, (
+            "DFlash draft config must provide dflash_config.mask_token_id")
 
-        self.rng_key = jax.random.key(self.vllm_config.model_config.seed)
-        self.max_num_tokens = runner.max_num_tokens
+        if runner.dp_size != 1:
+            raise NotImplementedError(
+                "DFlash speculative decoding does not support DP > 1 yet.")
+
         self.max_model_len = runner.max_model_len
+        self.rng_key = jax.random.key(vllm_config.model_config.seed)
 
-        # Context length tracking (host-side counter)
-        self._ctx_len: int = 0
+    def load_model(self, target_state: Any) -> None:
+        """Load the draft model; share target embed_tokens and lm_head."""
+        model = get_model(self.vllm_config,
+                          self.rng_key,
+                          self.mesh,
+                          is_draft_model=True)
+        self.model_fn = model.model_fn
+        self.compute_logits_fn = model.compute_logits_fn
+        self.combine_hidden_states_fn = model.combine_hidden_states_fn
+        self.state = model.state
+        self.model = model.model
 
-        # On-device KV caches (allocated in load_model)
-        self._draft_kv_caches: Optional[list[jax.Array]] = None
-        self._cache_len: int = 0
-        self._max_kv_len: int = 0
-
-        # Track previous seq_len for GPU-compatible crop semantics.
-        # GPU calls past_key_values_draft.crop(start) AFTER each forward
-        # pass, where start = beginning of the CURRENT iteration's block.
-        # This equals the seq_len from the PREVIOUS call to prepare_inputs.
-        # We must match this: cache_len = prev_seq_len, not current seq_len.
-        self._prev_seq_len: int = 0
-
-        # Track the request currently occupying the single proposer slot;
-        # state must be reset when it changes so the previous request's
-        # hidden states do not leak into the next request's prefix.
-        self._last_req_id: Optional[str] = None
-
-    def load_model(self, target_model: Any) -> None:
-        """Load the DFlash draft model and share embeddings from target."""
-        draft_mi = get_model(self.vllm_config,
-                             self.rng_key,
-                             self.mesh,
-                             is_draft_model=True)
-        self.model_fn = draft_mi.model_fn
-        self.compute_logits_fn = draft_mi.compute_logits_fn
-        self.combine_hidden_states_fn = draft_mi.combine_hidden_states_fn
-        self.state = draft_mi.state
-
-        # Share the target model's embedding with the draft model.
-        # Only applicable to flax_nnx state (has .model); vllm-impl state is
-        # a params dict, in which case the draft keeps its own embedding.
-        if hasattr(self.state, "model") and hasattr(target_model, "model"):
-            draft_embed = getattr(self.state.model, "embed_tokens", None)
-            target_embed = getattr(target_model.model, "embed_tokens", None)
-            if target_embed is None:
-                target_embed = getattr(target_model.model, "embed", None)
-            if target_embed is not None:
-                if draft_embed is None or not jnp.any(draft_embed.embedding):
-                    logger.info(
-                        "Sharing target model embedding with DFlash draft model."
-                    )
-                    self.state.model.embed_tokens = target_embed
-                elif jnp.array_equal(draft_embed.embedding,
-                                     target_embed.embedding):
-                    logger.info(
-                        "Draft embedding identical to target; sharing.")
-                    self.state.model.embed_tokens = target_embed
-
-        # Allocate on-device KV caches
-        hf_config = self.draft_model_config.hf_config
-
-        sharding_size = get_mesh_shape_product(self.mesh,
-                                               ShardingAxisName.MLP_TENSOR)
-        num_heads = utils.get_padded_num_heads(hf_config.num_attention_heads,
-                                               sharding_size)
-        head_dim_orig = getattr(
-            hf_config, "head_dim",
-            hf_config.hidden_size // hf_config.num_attention_heads)
-        head_dim = utils.get_padded_head_dim(head_dim_orig)
-
-        self._max_kv_len = self._next_padded_size(self.max_model_len)
-        cache_shape = (1, num_heads, self._max_kv_len, head_dim)
-        self._draft_kv_caches = []
-        for _ in range(self.num_layers):
-            k_cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
-            v_cache = jnp.zeros(cache_shape, dtype=jnp.bfloat16)
-            self._draft_kv_caches.append(k_cache)
-            self._draft_kv_caches.append(v_cache)
-        self._cache_len = 0
-
+        embed_w, lm_head_w = self._find_target_weights(target_state)
+        # gpt-oss has untied embeddings: embed_tokens embeds the noise block,
+        # lm_head projects draft hidden states to logits. Sharing references
+        # (no copy) keeps the target's sharding.
+        self.state.embed_tokens.value = embed_w
+        self.state.lm_head.value = lm_head_w
         logger.info(
-            "Allocated DFlash on-device KV caches: %d layers, shape %s",
-            self.num_layers,
-            cache_shape,
-        )
+            "DFlash draft sharing target weights: embed_tokens%s lm_head%s",
+            embed_w.shape, lm_head_w.shape)
 
-    @functools.partial(jax.jit, static_argnums=(0, ))
-    def _project_aux_hidden(
-            self, state: nnx.State,
-            aux_hidden_states: tuple[jax.Array, ...]) -> jax.Array:
-        """Project and normalise auxiliary hidden states."""
-        raw = jnp.concatenate(aux_hidden_states, axis=-1)
-        return self.combine_hidden_states_fn(state, raw)
+        if isinstance(self.state, nnx.State):
+            self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
+        else:
+            self.state_leaves = self.state
 
     @staticmethod
-    def _next_padded_size(n: int) -> int:
-        """Round n up to the next power-of-two (min 16)."""
-        if n <= 16:
-            return 16
-        p = 16
-        while p < n:
-            p *= 2
-        return p
-
-    @functools.partial(jax.jit, static_argnums=(0, 3, 4))
-    def _build_noise_block(
-        self,
-        seq_len_arr: jax.Array,
-        next_token_ids: jax.Array,
-        mask_token_id: int,
-        block_size: int,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Build noise block and positions (JIT-compiled)."""
-        seq_len = seq_len_arr[0]
-        first_token = next_token_ids[0]
-        noise_input_ids = jnp.full((block_size, ),
-                                   mask_token_id,
-                                   dtype=jnp.int32)
-        noise_input_ids = noise_input_ids.at[0].set(first_token)
-        noise_positions = jnp.arange(block_size, dtype=jnp.int32) + seq_len
-        return noise_input_ids, noise_positions
+    def _find_target_weights(target_state: Any):
+        """Locate the target's input embedding and lm_head weights."""
+        if hasattr(target_state, "items"):  # torchax params dict
+            candidates = dict(target_state.items())
+            embed_keys = [
+                "vllm_model.model.embed_tokens.weight",
+                "vllm_model.language_model.model.embed_tokens.weight",
+            ]
+            head_keys = [
+                "vllm_model.lm_head.weight",
+                "vllm_model.language_model.lm_head.weight",
+            ]
+            embed_w = next((candidates[k]
+                            for k in embed_keys if k in candidates), None)
+            lm_head_w = next((candidates[k]
+                              for k in head_keys if k in candidates), None)
+            if lm_head_w is None:
+                lm_head_w = embed_w  # tied-embedding targets
+            if embed_w is not None:
+                return embed_w, lm_head_w
+            raise RuntimeError(
+                "DFlash: could not find target embed_tokens/lm_head in the "
+                f"torchax state. Available keys (sample): "
+                f"{[k for k in list(candidates) if 'embed' in k or 'head' in k][:10]}"
+            )
+        # flax_nnx target state
+        from tpu_inference.models.jax.utils.weight_utils import get_param
+        embed_w = lm_head_w = None
+        for path in ("model.embed_tokens.weight", "model.embed.embedding",
+                     "model.embed_tokens.embedding",
+                     "embedder.input_embedding_table_VD"):
+            try:
+                embed_w = get_param(target_state, path).value
+                break
+            except ValueError:
+                continue
+        for path in ("lm_head.weight", "lm_head.input_embedding_table_DV"):
+            try:
+                lm_head_w = get_param(target_state, path).value
+                break
+            except ValueError:
+                continue
+        if embed_w is None:
+            raise RuntimeError(
+                "DFlash: could not locate target embedding in nnx state")
+        if lm_head_w is None:
+            lm_head_w = embed_w
+        # gpt-oss JAX lm_head is stored (D, V); normalize to (V, D).
+        if lm_head_w.shape[0] == embed_w.shape[1]:
+            lm_head_w = lm_head_w.T
+        return embed_w, lm_head_w
 
     def prepare_inputs(
         self,
         attn_metadata: AttentionMetadata,
         input_ids: jax.Array,
         aux_hidden_states: tuple[jax.Array, ...],
-        next_token_ids: jax.Array,
-        num_rejected_tokens: Optional[jax.Array] = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, AttentionMetadata]:
-        """Prepare DFlash inputs with on-device KV cache."""
-        assert aux_hidden_states is not None and len(aux_hidden_states) > 0
+        last_sampled_token_id: jax.Array,
+        next_prompt_token_id: jax.Array,
+        is_in_prefill: jax.Array,
+        num_rejected_tokens: jax.Array,
+        num_reqs_dp: jax.Array,
+    ) -> tuple[Any, jax.Array, jax.Array, AttentionMetadata]:
+        assert aux_hidden_states, (
+            "DFlash requires auxiliary hidden states from the target model.")
 
-        # Reset proposer state when the single slot's request changes.
-        req_ids = self.runner.input_batch.req_ids
-        current_req_id = req_ids[0] if req_ids else None
-        if current_req_id != self._last_req_id:
-            self._ctx_len = 0
-            self._cache_len = 0
-            self._prev_seq_len = 0
-            self._last_req_id = current_req_id
-
-        # 1. Current sequence length
-        seq_len_jax = attn_metadata.seq_lens[0]
-        seq_len = int(jax.device_get(seq_len_jax))
-
-        # 2. Crop cache to match GPU DynamicCache.crop(start) semantics.
-        #
-        # GPU reference (zhongyan_dev/dflash/model/dflash.py line 246):
-        #   past_key_values_draft.crop(start)
-        # where `start` = beginning of the CURRENT block = position of
-        # the first accepted token from the previous iteration.
-        #
-        # After crop, GPU cache_seq_len = start, which equals the seq_len
-        # from the PREVIOUS prepare_inputs call (not the current one).
-        # Context + noise are then written starting from this position.
-        #
-        # Bug was: self._cache_len = seq_len (CURRENT accepted position),
-        # which left stale noise K/V entries from the previous iteration
-        # in positions [prev_seq_len, seq_len) and shifted all subsequent
-        # RoPE positions, accumulating errors every iteration.
-        if self._prev_seq_len > 0:
-            self._cache_len = self._prev_seq_len
-
-        if seq_len < self._ctx_len:
-            self._ctx_len = seq_len
-        self._prev_seq_len = seq_len
-
-        # 3. Project new auxiliary hidden states (on-device, JIT'd)
-        projected = self._project_aux_hidden(self.state, aux_hidden_states)
-
-        # 4. Compute context update — slicing and padding stay on device
-        #    to avoid host<->TPU transfer overhead.
-        num_new = seq_len - self._ctx_len
-        if num_new <= 0:
-            # Full rejection — trim context tracking, use zero placeholder.
-            # Noise writes at cache_len + 0, completely overwriting padding.
-            self._ctx_len = seq_len
-            self._cache_len = min(self._cache_len, seq_len)
-            actual_new_ctx_count = 0
-            new_ctx_jax = device_array(
-                self.mesh,
-                jnp.zeros((16, self.hidden_size), dtype=jnp.bfloat16),
-            )
-        else:
-            end = min(self._ctx_len + num_new, self.max_model_len)
-            n_copy = end - self._ctx_len
-            actual_new_ctx_count = n_copy
-            self._ctx_len = end
-
-            # 5. Slice and pad on device — no host<->TPU transfer.
-            # Padding to power-of-2 sizes (16/32/64/128) means JIT only
-            # traces ~4 unique shapes, eliminating per-token retracing.
-            ctx = projected[:n_copy].astype(jnp.bfloat16)
-            padded_size = self._next_padded_size(n_copy)
-            if padded_size > n_copy:
-                pad = jnp.zeros(
-                    (padded_size - n_copy, self.hidden_size),
-                    dtype=jnp.bfloat16,
-                )
-                ctx = jnp.concatenate([ctx, pad], axis=0)
-            new_ctx_jax = device_array(self.mesh, ctx)
-
-        # 6. Build noise block
-        seq_len_arr = device_array(self.mesh,
-                                   np.array([seq_len], dtype=np.int32))
-        noise_input_ids, noise_positions = self._build_noise_block(
-            seq_len_arr,
-            next_token_ids,
-            self.mask_token_id,
-            self.block_size,
-        )
-
-        # 7. Pack target_hidden_states as 3-tuple (always same pytree shape)
-        cache_len_arr = device_array(
-            self.mesh, np.array([self._cache_len], dtype=np.int32))
-        actual_ctx_count_arr = device_array(
-            self.mesh, np.array([actual_new_ctx_count], dtype=np.int32))
-        target_hidden = (new_ctx_jax, cache_len_arr, actual_ctx_count_arr)
-
-        # 8. Build draft attention metadata
+        # The last KV-cache groups belong to the draft; any of them works for
+        # block tables since all draft layers share one group layout.
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
-        block_tables = (
-            self.runner.input_batch.block_table[draft_kv_cache_group_id].
-            get_cpu_tensor().reshape(-1))
-        num_reqs = attn_metadata.seq_lens.shape[0]
-        draft_attn_metadata = replace(
+        block_tables = self.runner.input_batch.block_table[
+            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+        block_tables = device_array(self.mesh, block_tables)
+
+        return self._prepare_inputs(
+            self.state_leaves,
+            block_tables,
             attn_metadata,
-            input_positions=noise_positions,
-            query_start_loc=jnp.array([0, self.block_size], dtype=jnp.int32),
-            block_tables=device_array(self.mesh, block_tables),
+            input_ids,
+            tuple(aux_hidden_states),
+            last_sampled_token_id,
+            next_prompt_token_id,
+            is_in_prefill,
+            num_rejected_tokens,
+            num_reqs_dp,
         )
 
-        dummy_last_indices = jnp.zeros(num_reqs, dtype=jnp.int32)
-        return (
-            target_hidden,
-            noise_input_ids,
-            dummy_last_indices,
-            draft_attn_metadata,
-        )
-
-    @functools.partial(jax.jit, static_argnums=(0, ))
-    def _sample_block_draft_tokens(
+    @jax.jit(static_argnums=(0, ))
+    def _prepare_inputs(
         self,
-        state: nnx.State,
-        hidden_states: jax.Array,
-    ) -> jax.Array:
-        """Greedy-sample draft tokens from the block output."""
-        draft_hidden = hidden_states[1:1 + self.num_speculative_tokens]
-        logits = self.compute_logits_fn(state, draft_hidden, None)
-        draft_ids = jnp.argmax(logits, axis=-1)
-        return lax.with_sharding_constraint(
-            draft_ids, NamedSharding(self.mesh, PartitionSpec()))
+        state_leaves: Any,
+        block_tables: jax.Array,
+        attn_metadata: AttentionMetadata,
+        input_ids: jax.Array,
+        aux_hidden_states: tuple[jax.Array, ...],
+        last_sampled_token_id: jax.Array,
+        next_prompt_token_id: jax.Array,
+        is_in_prefill: jax.Array,
+        num_rejected_tokens: jax.Array,
+        num_reqs_dp: jax.Array,
+    ):
+        B = self.block_size
+        S = self.num_speculative_tokens
+        qsl = attn_metadata.query_start_loc  # (max_reqs + 1,)
+        seq_lens = attn_metadata.seq_lens  # (max_reqs,)
+        max_reqs = seq_lens.shape[0]
+        T_in = input_ids.shape[0]
+        T_out = T_in + B * max_reqs
+
+        num_reqs = num_reqs_dp.reshape(-1)[0]
+        req_ids = jnp.arange(max_reqs, dtype=jnp.int32)
+        req_mask = req_ids < num_reqs
+
+        q_lens = jnp.where(req_mask, qsl[1:] - qsl[:-1], 0)
+        n_rej = jnp.where(req_mask,
+                          num_rejected_tokens.reshape(-1)[:max_reqs], 0)
+        # Accepted target rows -> fresh ctx rows for the draft cache.
+        a = jnp.maximum(q_lens - n_rej, 0)
+        m = jnp.where(req_mask, a + B, 0)
+        out_qsl = jnp.concatenate(
+            [jnp.zeros((1, ), jnp.int32),
+             jnp.cumsum(m).astype(jnp.int32)])
+        # Committed-minus-newest length: ctx covers [0, N'-1).
+        new_seq_lens = jnp.where(req_mask, seq_lens - n_rej, 0)
+
+        # Map each output row to (request, local offset).
+        t = jnp.arange(T_out, dtype=jnp.int32)
+        req_of = jnp.sum(t[:, None] >= out_qsl[None, 1:],
+                         axis=1).astype(jnp.int32)
+        req_of = jnp.clip(req_of, 0, max_reqs - 1)
+        local = t - out_qsl[req_of]
+        a_t = a[req_of]
+        valid = t < out_qsl[max_reqs]
+        is_ctx = valid & (local < a_t)
+        is_noise = valid & (local >= a_t)
+        noise_off = jnp.clip(local - a_t, 0, B - 1)
+
+        # Gather source rows (rejection-trimmed) for ctx rows.
+        src = jnp.clip(qsl[req_of] + local, 0, T_in - 1)
+
+        raw = jnp.concatenate(aux_hidden_states, axis=-1)
+        combined_all = self.combine_hidden_states_fn(state_leaves, raw)
+        combined_out = jnp.where(is_ctx[:, None], combined_all[src],
+                                 0).astype(combined_all.dtype)
+
+        first_token = jnp.where(
+            is_in_prefill.reshape(-1)[:max_reqs] != 0,
+            next_prompt_token_id.reshape(-1)[:max_reqs],
+            last_sampled_token_id.reshape(-1)[:max_reqs],
+        ).astype(jnp.int32)
+        ids_noise = jnp.where(noise_off == 0, first_token[req_of],
+                              self.mask_token_id)
+        ids_out = jnp.where(is_ctx, input_ids[src],
+                            jnp.where(is_noise, ids_noise,
+                                      0)).astype(jnp.int32)
+
+        pos_noise = new_seq_lens[req_of] + noise_off
+        positions_out = jnp.where(
+            is_ctx, attn_metadata.input_positions[src],
+            jnp.where(is_noise, pos_noise, 0)).astype(jnp.int32)
+
+        # KV span = ctx [0, N'-1) plus the noise block. Clamped at
+        # max_model_len: a request that close to the cap gets (rejectable)
+        # garbage drafts but stays within its own pages.
+        seq_lens_out = jnp.minimum(new_seq_lens + jnp.where(req_mask, B, 0),
+                                   self.max_model_len).astype(jnp.int32)
+
+        distribution = jnp.stack([
+            jnp.zeros((), jnp.int32),
+            jnp.zeros((), jnp.int32),
+            num_reqs.astype(jnp.int32),
+        ])
+
+        draft_md = replace(
+            attn_metadata,
+            input_positions=positions_out,
+            seq_lens=seq_lens_out,
+            query_start_loc=out_qsl,
+            request_distribution=distribution,
+            block_tables=block_tables,
+        )
+
+        # Draft tokens come from noise rows 1..S (row 0 is the bonus token).
+        last_token_indices = (out_qsl[:max_reqs] + a)[:, None] + 1 + jnp.arange(
+            S, dtype=jnp.int32)[None, :]
+        last_token_indices = jnp.clip(last_token_indices.reshape(-1), 0,
+                                      T_out - 1)
+
+        target_hidden_states = (combined_out, is_ctx)
+        return target_hidden_states, ids_out, last_token_indices, draft_md
 
     def propose(
         self,
@@ -322,33 +320,44 @@ class DFlashProposer:
         last_token_indices: jax.Array,
         target_hidden_states,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
-        """Generate all draft tokens in one forward pass."""
-        # Use our own on-device KV caches
-        draft_kv_caches, hidden_states, _ = self.model_fn(
-            self.state,
-            self._draft_kv_caches,
+        return self._propose(
+            self.state_leaves,
+            kv_caches,
+            input_ids,
+            attn_metadata,
+            last_token_indices,
+            target_hidden_states,
+            tuple(self.runner.layer_name_to_kvcache_index.items()),
+        )
+
+    @jax.jit(
+        static_argnums=(0, 6),
+        donate_argnames=("kv_caches", ),
+    )
+    def _propose(
+        self,
+        state_leaves: Any,
+        kv_caches: list[jax.Array],
+        input_ids: jax.Array,
+        attn_metadata: AttentionMetadata,
+        last_token_indices: jax.Array,
+        target_hidden_states,
+        layer_name_to_kvcache_index: tuple,
+    ) -> tuple[list[jax.Array], jnp.ndarray]:
+        kv_caches, hidden_states, _, _ = self.model_fn(
+            state_leaves,
+            kv_caches,
             input_ids,
             target_hidden_states,
             attn_metadata,
+            layer_name_to_kvcache_index,
+            spec_step_idx=0,
         )
 
-        # Update cached references
-        self._draft_kv_caches = draft_kv_caches
-
-        # Update cache_len: model wrote actual_ctx_count + T_noise entries.
-        # This will be corrected at the start of the next prepare_inputs
-        # to match the actual accepted seq_len.
-        _, cache_len_arr, actual_ctx_count_arr = target_hidden_states
-        old_cache_len = int(jax.device_get(cache_len_arr)[0])
-        actual_ctx_count = int(jax.device_get(actual_ctx_count_arr)[0])
-        T_noise = self.block_size
-        self._cache_len = old_cache_len + actual_ctx_count + T_noise
-
-        draft_token_ids = self._sample_block_draft_tokens(
-            self.state, hidden_states)
-
-        if draft_token_ids.ndim == 1:
-            draft_token_ids = draft_token_ids[jnp.newaxis, :]
-
-        # Pass the FRAMEWORK kv_caches through unchanged
+        sampled_hidden = hidden_states[last_token_indices]
+        logits = self.compute_logits_fn(state_leaves, sampled_hidden, None)
+        draft_token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+        max_reqs = attn_metadata.seq_lens.shape[0]
+        draft_token_ids = draft_token_ids.reshape(
+            max_reqs, self.num_speculative_tokens)
         return kv_caches, draft_token_ids

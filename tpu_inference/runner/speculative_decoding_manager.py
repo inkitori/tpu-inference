@@ -26,6 +26,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.utils import SpecDecodeMetadata
+from tpu_inference.spec_decode.jax.dflash import DFlashProposer
 from tpu_inference.spec_decode.jax.eagle3 import Eagle3Proposer
 from tpu_inference.utils import device_array
 
@@ -131,7 +132,8 @@ class SpeculativeDecodingManager:
         async_scheduling: bool,
         hidden_states: jnp.ndarray,
     ) -> list[list[int]] | jnp.ndarray:
-        assert isinstance(self.runner.drafter, Eagle3Proposer)
+        assert isinstance(self.runner.drafter,
+                          (Eagle3Proposer, DFlashProposer))
         if isinstance(attn_metadata, dict):
             # When multiple KV cache groups are used (e.g., in hybrid models),
             # attn_metadata becomes a dict mapping layer names to AttentionMetadata.

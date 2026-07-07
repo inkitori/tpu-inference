@@ -1137,6 +1137,8 @@ class CompilationManager:
         self._precompile_extend_logits_simple()
         if self.runner.speculative_config.method == "eagle3":
             self._precompile_eagle3_helpers()
+        if self.runner.speculative_config.method == "dflash":
+            self._precompile_dflash_helpers()
         if self.runner.speculative_config.method == "mtp":
             self._precompile_mtp_helpers()
 
@@ -1425,6 +1427,102 @@ class CompilationManager:
                     num_rejected_tokens,
                     num_reqs_dp,
                     num_tokens=num_tokens,
+                )
+
+    def _precompile_dflash_helpers(self) -> None:
+        """Warm the DFlash drafter's prepare_inputs/propose jit caches.
+
+        DFlash's propose consumes exactly what its prepare_inputs returns, so
+        the propose warmup chains off real prepare outputs instead of
+        hand-built dummies.
+        """
+        logger.info(
+            "Compiling dflash jitted helpers with different input shapes.")
+        target_hidden_size = self.runner.model_config.get_hidden_size()
+        drafter = self.runner.drafter
+        num_aux = 0
+        draft_hf_config = (
+            self.runner.speculative_config.draft_model_config.hf_config)
+        dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+        num_aux = len(dflash_config.get("target_layer_ids") or []) or getattr(
+            draft_hf_config, "num_target_layers",
+            draft_hf_config.num_hidden_layers)
+        dp_size = self.runner.dp_size
+
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+
+        seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
+                                             jnp.int32, dp_sharding)
+        query_start_loc = self._create_dummy_tensor(
+            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+        request_distribution = device_array(self.runner.mesh,
+                                            np.array([0, 0, 0] * dp_size,
+                                                     dtype=np.int32),
+                                            sharding=dp_sharding)
+        num_reqs_dp = self._create_dummy_tensor((dp_size, ), jnp.int32,
+                                                dp_sharding)
+        last_sampled_token_id = self._create_dummy_tensor(
+            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+        next_prompt_token_id = self._create_dummy_tensor(
+            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+        is_in_prefill = self._create_dummy_tensor(
+            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+        num_rejected_tokens = self._create_dummy_tensor(
+            (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+
+        def drafter_propose_warmup(_fn, _args, _call_kwargs):
+            new_args = (self.runner.kv_caches, ) + _args[1:]
+            kv_caches, draft_token_ids = drafter.propose(
+                *new_args, **_call_kwargs)
+            self.runner.kv_caches = kv_caches
+            return draft_token_ids
+
+        for num_tokens in self.runner.num_tokens_paddings:
+            for num_reqs in self.runner.attn_num_reqs_paddings:
+                positions = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, dp_sharding)
+                attention_metadata = AttentionMetadata(
+                    input_positions=positions,
+                    block_tables=None,  # replaced by prepare_inputs
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                    padded_num_reqs=num_reqs,
+                )
+                input_ids = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, dp_sharding)
+                aux_hidden_states = tuple(
+                    self._create_dummy_tensor(
+                        (num_tokens, target_hidden_size), jnp.bfloat16,
+                        NamedSharding(
+                            self.runner.mesh,
+                            PartitionSpec(ShardingAxisName.ATTN_DATA, None)))
+                    for _ in range(num_aux))
+
+                prepare_args = (attention_metadata, input_ids,
+                                aux_hidden_states, last_sampled_token_id,
+                                next_prompt_token_id, is_in_prefill,
+                                num_rejected_tokens, num_reqs_dp)
+                self._run_compilation(
+                    "dflash_prepare_inputs",
+                    drafter.prepare_inputs,
+                    *prepare_args,
+                    num_tokens=num_tokens,
+                )
+                (target_hidden_states, draft_input_ids, last_token_indices,
+                 draft_md) = drafter.prepare_inputs(*prepare_args)
+
+                self._run_compilation(
+                    "dflash_propose",
+                    drafter.propose,
+                    self.runner.kv_caches,
+                    draft_input_ids,
+                    draft_md,
+                    last_token_indices,
+                    target_hidden_states,
+                    num_tokens=num_tokens,
+                    warmup_handler=drafter_propose_warmup,
                 )
 
     def _precompile_mtp_helpers(self) -> None:
