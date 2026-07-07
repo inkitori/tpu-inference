@@ -223,6 +223,33 @@ class GmmConfigs:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
 
     @property
+    def num_quant_blocks(self) -> int:
+        """Number of REAL per-group quant blocks on the scale axis."""
+        return pl.cdiv(self.dims.size_k, self.rhs_cfgs.quant_block_size)
+
+    @property
+    def num_quant_blocks_per_tile_k_read(self) -> int:
+        """Quant blocks actually DMA'd/indexed per k tile, clamped to the real
+        block count.
+
+        ``tile_k`` is lane-aligned (a multiple of ``num_lanes``), so when
+        ``size_k`` is NOT a multiple of ``num_lanes`` the tile over-aligns past
+        ``size_k`` and ``num_quant_blocks_per_tile_k`` can exceed the real
+        number of quant blocks (e.g. size_k=192, tile_k=256, qbs=64 ->
+        ``cdiv(256, 64)=4`` vs ``cdiv(192, 64)=3``). Reading 4 from a 3-long
+        scale axis is out of bounds. When there is a single k tile
+        (``tile_k >= size_k``) the whole axis fits in one read, so clamp the
+        read count to ``num_quant_blocks``; the over-aligned tail block's
+        matmul value is already zeroed by the k-tail mask, so dropping it
+        changes no result. With multiple k tiles the per-tile stride must stay
+        ``num_quant_blocks_per_tile_k`` (each tile is fully lane- and
+        block-aligned), so no clamp is applied there.
+        """
+        if self.tiles.tile_k >= self.dims.size_k:
+            return min(self.num_quant_blocks_per_tile_k, self.num_quant_blocks)
+        return self.num_quant_blocks_per_tile_k
+
+    @property
     def out_size_n(self) -> int:
         if self.fuse_act is None:
             return self.dims.size_n
@@ -317,7 +344,8 @@ def generate_block_specs(
         )
     if cfgs.rhs_cfgs.has_scale:
         rhs_scale_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (None, cfgs.num_quant_blocks_per_tile_k_read, 1,
+             cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
         )
 
@@ -389,9 +417,14 @@ def inner_kernel(
 
         # This should only be taken in the case where we don't requantize
         # the scales and thus we need to dequantize inside VMEM to avoid small
-        # contracting dimmensions
+        # contracting dimmensions.
+        #
+        # Only the quantized-lhs path relies on this pre-dequant; the
+        # unquantized-lhs path below folds the scale into the dequantized rhs
+        # itself, so firing both would double-apply the scale.
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-        if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+        if (cfgs.lhs_cfgs.quant_dtype is not None
+                and cfgs.rhs_cfgs.should_dequantize_before_matmul):
             tiled_rhs_scale = tiled_rhs_ref.get_scale().astype(
                 cfgs.lhs_cfgs.dtype)
             num_blocks = cfgs.num_quant_blocks_per_tile_k
@@ -411,30 +444,66 @@ def inner_kernel(
         # Step 2: Matmul.
         acc_list = []
         if cfgs.lhs_cfgs.quant_dtype is None:
-            # Unquantized matmul path.
+            # Unquantized matmul path (e.g. W4A16: bf16 lhs, quantized rhs
+            # dequantized on the fly).
+            #
+            # rhs_scale[b, 0, n] is constant across the rhs_qbs k's of quant
+            # block b, so (lhs @ q_block) * scale[b, n] == lhs @ (q_block *
+            # scale[b, n]). Folding the scale into the dequantized rhs columns
+            # runs ONE full-tile_k matmul per n-chunk instead of one
+            # quant-block-wide matmul per block, keeping the MXU contraction
+            # dim fully fed.
+            rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            num_blocks = cfgs.num_quant_blocks_per_tile_k
+
+            # Clamped per-block indices into the scale buffer. tile_k may
+            # over-align past size_k, in which case the buffer holds only
+            # num_quant_blocks_per_tile_k_read real blocks; the over-aligned
+            # tail's rhs is zeroed by the k-tail mask above, so its folded
+            # contribution is 0 regardless of which in-bounds row is read.
+            n_read = cfgs.num_quant_blocks_per_tile_k_read
+            block_read_ids = [min(b, n_read - 1) for b in range(num_blocks)]
+
+            # Dequantize and multiply in the lhs dtype (bf16): the scale
+            # product only needs to be as precise as the quantization it
+            # decodes, the VPU runs bf16 elementwise ops at twice the fp32
+            # rate, and the MXU then runs a native bf16 x bf16 pass. The
+            # matmul still accumulates in fp32 via preferred_element_type.
+            deq_dtype = cfgs.lhs_cfgs.dtype
+
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
 
-                acc_n = jnp.zeros((cfgs.tiles.tile_m, col_size),
-                                  dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
+                # Dequantize the full tile_k of rhs once for this n-chunk.
+                w = tiled_rhs[:, start_n:end_n].astype(deq_dtype)
+                if cfgs.rhs_cfgs.has_scale:
+                    # Gather each block's scale row (clamped tail). When
+                    # tile_k does not over-align (num_blocks == n_read, the
+                    # common case) this is a single squeeze; only the
+                    # over-aligned tail needs the per-block clamped concat
+                    # (built from static slices; Pallas disallows captured
+                    # array constants).
+                    rhs_scale = tiled_rhs_ref.get_scale()
+                    if num_blocks == n_read:
+                        sc_blocks = rhs_scale[:, 0, start_n:end_n]
+                    else:
+                        sc_blocks = jnp.concatenate([
+                            rhs_scale[b, :, start_n:end_n]
+                            for b in block_read_ids
+                        ],
+                                                    axis=0)
+                    # Broadcast the per-block scale across the rhs_qbs k's of
+                    # each block via a fused reshape-multiply (no materialized
+                    # jnp.repeat expansion).
+                    col = w.shape[1]
+                    w = (w.reshape(num_blocks, rhs_qbs, col) *
+                         sc_blocks.astype(deq_dtype)[:, None, :]).reshape(
+                             cfgs.tiles.tile_k, col)
 
-                    block_acc = jnp.matmul(
-                        tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
-
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        tiled_rhs_scale = tiled_rhs_ref.get_scale()
-                        block_acc *= tiled_rhs_scale[b_id, :,
-                                                     start_n:end_n].astype(
-                                                         acc_ref.dtype)
-
-                    acc_n += block_acc
+                # ONE matmul over the full tile_k.
+                acc_n = jnp.matmul(
+                    tiled_lhs, w,
+                    preferred_element_type=jnp.float32).astype(acc_ref.dtype)
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
@@ -498,9 +567,15 @@ def inner_kernel(
 
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
-                    # Apply rhs subchannel scale per quant block.
+                    # Apply rhs subchannel scale per quant block. Clamp the
+                    # block index to the real blocks held in the buffer:
+                    # tile_k may over-align past size_k (when size_k is not a
+                    # multiple of num_lanes), so the scale buffer holds only
+                    # num_quant_blocks_per_tile_k_read blocks. The over-aligned
+                    # tail's rhs is already zeroed by the k-tail mask.
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
+                        b_id = min(start_k // rhs_qbs,
+                                   cfgs.num_quant_blocks_per_tile_k_read - 1)
                         rhs_scale_slice = tiled_rhs_ref.get_scale()
                         block_acc *= rhs_scale_slice[b_id, :,
                                                      start_n:end_n].astype(
@@ -1167,7 +1242,7 @@ def make_gmm_configs(
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
 
-    return GmmConfigs(
+    cfgs = GmmConfigs(
         dims=dims,
         tiles=tiles,
         lhs_cfgs=lhs_cfgs,
@@ -1177,6 +1252,20 @@ def make_gmm_configs(
         zero_init=zero_initialize,
         fuse_act=fuse_act,
     )
+
+    if has_scale:
+        # Invariant: the per-quant-block scale DMA/index count must never
+        # exceed the real blocks on the scale axis, else the BlockSpec
+        # over-reads adjacent HBM (disable_bounds_checks=True) and injects
+        # garbage. num_quant_blocks_per_tile_k_read enforces this; assert it
+        # so any future tiling change that breaks it fails loudly here.
+        assert cfgs.num_quant_blocks_per_tile_k_read <= cfgs.num_quant_blocks, (
+            "scale quant-block over-read: "
+            f"{cfgs.num_quant_blocks_per_tile_k_read} > {cfgs.num_quant_blocks} "
+            f"(tile_k={tiles.tile_k}, size_k={dims.size_k}, "
+            f"quant_block_size={rhs_cfgs.quant_block_size})")
+
+    return cfgs
 
 
 def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
