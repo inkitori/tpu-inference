@@ -191,12 +191,17 @@ def test_apply_matches_golden(output_sizes, num_proj, n_shards, label):
     y_ref = x @ golden.astype(np.float32).T
 
     assert y.shape == (4, out)
-    np.testing.assert_allclose(y, y_ref, atol=2e-2, rtol=2e-2)
+    # apply computes in-kernel with a bf16 output (quantum ~0.125 at the
+    # |y|~20 magnitudes here), so tolerate bf16 rounding and bound the
+    # overall relative L2 error instead of tight elementwise equality.
+    np.testing.assert_allclose(y, y_ref, atol=2e-1, rtol=5e-2)
+    rel_l2 = np.linalg.norm(y - y_ref) / np.linalg.norm(y_ref)
+    assert rel_l2 < 5e-3, f"rel L2 {rel_l2} too large"
 
 
 @pytest.mark.parametrize("tp, in_features", [(2, 128), (8, 4096)])
 def test_rowparallel_input_dim_sharding_dequant_consistency(tp, in_features):
-    """Step-3 (Task 8): RowParallelLinear shards the INPUT dim via
+    """RowParallelLinear shards the INPUT dim via
     ``weight_sharding = P(ATTN_HEAD, None)`` (the [in, out] spec of the
     transposed jax weight). For MLX that input dim is BOTH
     packed (``weight`` [out, in//8], one uint32 word = 8 nibbles) and grouped
