@@ -51,6 +51,7 @@ class RaggedPagedAttentionHeadDim64KernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         use_attention_sink: bool = False,
+        use_causal_mask: bool = True,
     ):
         assert head_dim == 64
         rng = np.random.default_rng(1234)
@@ -174,6 +175,7 @@ class RaggedPagedAttentionHeadDim64KernelTest(jtu.JaxTestCase):
             "q_scale": q_scale,
             "k_scale": k_scale,
             "v_scale": v_scale,
+            "use_causal_mask": use_causal_mask,
         }
 
         expected, expected_kv_cache = ref_ragged_paged_attention_hd64(
@@ -202,6 +204,28 @@ class RaggedPagedAttentionHeadDim64KernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
+    def test_ragged_paged_attention_non_causal(self, dtype):
+        # DFlash-style block drafting: each request's query block is the last
+        # q_len tokens of its KV span and attends to the FULL span
+        # (bidirectional within the block, all of the context before it).
+        seq_lens = [(12, 49), (9, 9), (16, 127), (16, 250)]
+        num_heads = (64, 8)
+        head_dim = 64
+        page_size = 16
+        num_pages = 1000
+
+        self._test_ragged_paged_attention_hd64(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            use_causal_mask=False,
+        )
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
     def test_ragged_paged_attention_basic(self, dtype):

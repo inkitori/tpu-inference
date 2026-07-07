@@ -384,6 +384,7 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     update_kv_cache: bool = True,
+    use_causal_mask: bool = True,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -444,6 +445,7 @@ def sharded_ragged_paged_attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            use_causal_mask=use_causal_mask,
         )
         # update_kv_cache is supported by both the v3 default and batched
         # RPA kernels; only the hd64 path doesn't accept it. Default True
@@ -476,6 +478,7 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
+    use_causal_mask: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -515,6 +518,7 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
+        use_causal_mask=use_causal_mask,
     )
 
     return kv_cache, output

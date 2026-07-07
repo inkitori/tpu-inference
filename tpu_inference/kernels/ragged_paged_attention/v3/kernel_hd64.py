@@ -54,10 +54,13 @@ def ref_ragged_paged_attention_hd64(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
+    use_causal_mask: bool = True,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
 ):
+    assert use_causal_mask or sliding_window is None, (
+        "sliding_window requires causal masking")
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     dynamic_validate_inputs(
@@ -149,15 +152,17 @@ def ref_ragged_paged_attention_hd64(
         if q_scale is not None:
             attn *= q_scale
 
-        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
-            jnp.int32, attn.shape, 1)
-        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
-        mask = q_span < kv_span
-        if sliding_window is not None:
-            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
-        attn = jnp.where(mask, mask_value, attn)
+        if use_causal_mask:
+            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
+                jnp.int32, attn.shape, 1)
+            kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+            mask = q_span < kv_span
+            if sliding_window is not None:
+                mask = jnp.logical_or(mask,
+                                      q_span - sliding_window >= kv_span)
+            attn = jnp.where(mask, mask_value, attn)
 
         if attention_sink is not None:
             reshaped_attention_sink = attention_sink.reshape(
@@ -282,6 +287,7 @@ def _ragged_paged_attention_kernel(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float = DEFAULT_MASK_VALUE,
+    use_causal_mask: bool = True,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -290,6 +296,8 @@ def _ragged_paged_attention_kernel(
     bq_sz,
     debug_mode: bool = False,
 ):
+    assert use_causal_mask or sliding_window is None, (
+        "sliding_window requires causal masking")
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
     (
@@ -403,14 +411,19 @@ def _ragged_paged_attention_kernel(
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
-        q_span = (kv_len - q_len + bq_idx * bq_sz +
-                  lax.broadcasted_iota(jnp.int32, s.shape, 0) //
-                  num_q_heads_per_kv_head)
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        mask = k_span <= q_span
+        if use_causal_mask:
+            q_span = (kv_len - q_len + bq_idx * bq_sz +
+                      lax.broadcasted_iota(jnp.int32, s.shape, 0) //
+                      num_q_heads_per_kv_head)
+            mask = k_span <= q_span
 
-        if sliding_window is not None:
-            mask = jnp.logical_and(mask, q_span - sliding_window < k_span)
+            if sliding_window is not None:
+                mask = jnp.logical_and(mask, q_span - sliding_window < k_span)
+        else:
+            # Non-causal (e.g. DFlash block drafting): every query attends to
+            # the full effective KV span; only mask out-of-range KV slots.
+            mask = k_span < kv_len
 
         s = jnp.where(mask, s, mask_value)
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
@@ -1328,6 +1341,7 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size, sliding_window):
         "sliding_window",
         "soft_cap",
         "mask_value",
+        "use_causal_mask",
         "q_scale",
         "k_scale",
         "v_scale",
@@ -1357,6 +1371,7 @@ def ragged_paged_attention_hd64(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
+    use_causal_mask: bool = True,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -1538,6 +1553,7 @@ def ragged_paged_attention_hd64(
             sliding_window=sliding_window,
             soft_cap=soft_cap,
             mask_value=mask_value,
+            use_causal_mask=use_causal_mask,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
