@@ -120,6 +120,28 @@ def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
                 f"FusedMoE does not support {scoring_fn} scoring function")
 
 
+def mask_padding_rows(
+    topk_weights: jax.Array,
+    topk_indices: jax.Array,
+    num_actual_tokens: jax.Array | int,
+) -> tuple[jax.Array, jax.Array]:
+    """Route padding rows [num_actual_tokens:] to expert 0 with zero weight.
+
+    The runner pads the token dim up to a static compiled shape (e.g. 1 real
+    decode token padded to 16); the padding rows carry garbage hidden states
+    that route to arbitrary experts and inflate the number of distinct active
+    experts driving the grouped-matmul cost. Their outputs are discarded
+    downstream, so collapsing them onto a single expert is exact and only
+    affects performance. num_actual_tokens may be a dynamic traced scalar
+    (data-dependent jnp.where: no recompile per value, no new dynamic shape).
+    """
+    num_tokens = topk_indices.shape[0]
+    pad_mask = jnp.arange(num_tokens) >= num_actual_tokens
+    topk_indices = jnp.where(pad_mask[:, None], 0, topk_indices)
+    topk_weights = jnp.where(pad_mask[:, None], 0.0, topk_weights)
+    return topk_weights, topk_indices
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -591,6 +613,7 @@ def fused_moe_func(
     hash_based_topk_indices: jax.Array | None = None,
     expert_score_correction_bias: jax.Array | None = None,
     moe_chunk_size: int = 0,
+    num_actual_tokens: jax.Array | int | None = None,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -610,6 +633,9 @@ def fused_moe_func(
         activation: activation function to perform on the output of w1.
         scoring_fn: scoring function to apply on gating_output.
         enable_rs_kernel: enable custom Hierarchical Reduce-Scatter kernel.
+        num_actual_tokens: optional number of real (non-padding) rows in
+            hidden_states; padding rows are routed to expert 0 with zero
+            weight (see mask_padding_rows).
 
     Returns:
         Output of moe operation [num_tokens, hidden_size]
@@ -644,6 +670,10 @@ def fused_moe_func(
             topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    if num_actual_tokens is not None:
+        topk_weights, topk_indices = mask_padding_rows(topk_weights,
+                                                       topk_indices,
+                                                       num_actual_tokens)
     # All gathering topk_indices and topk_weights if attention dp is used.
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(

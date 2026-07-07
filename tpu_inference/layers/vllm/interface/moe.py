@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import jax.numpy as jnp
 import torch
 from torchax.interop import jax_view, torch_view
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -105,6 +107,29 @@ def vllm_moe_apply(layer: RoutedExperts,
                 pass
 
     mesh = quant_method_instance.mesh
+
+    # Number of real (non-padding) rows. The runner pads the token dim up to a
+    # static compiled shape (e.g. 1 real decode token padded to 16); padding
+    # rows carry garbage hidden states that route to arbitrary experts and
+    # inflate the distinct-active-expert count driving the grouped-matmul
+    # cost. query_start_loc is the per-request cumsum of scheduled tokens,
+    # padded with 1 past the last real request, so its max is the total actual
+    # token count (a dynamic traced scalar: no recompile, no new shape).
+    #
+    # Guard to the single attention-DP-rank case: with attention DP > 1, the
+    # token tensor seen by the MoE is the per-rank blocks concatenated, each
+    # with its own real-prefix + padding, so a single contiguous arange >= n
+    # mask is invalid. Fall back to None there (no masking).
+    num_actual_tokens = None
+    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) == 1:
+        fwd_ctx = get_forward_context()
+        attn_metadata = getattr(fwd_ctx, "attn_metadata", None)
+        query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+        if query_start_loc is not None:
+            # attn_metadata on the TPU forward context is the JAX
+            # AttentionMetadata dataclass; query_start_loc is a raw jax.Array.
+            num_actual_tokens = jnp.max(query_start_loc)
+
     attn_dp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA)
     dp_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_DATA)
     is_dp = (attn_dp_size // dp_size) > 1
@@ -132,4 +157,5 @@ def vllm_moe_apply(layer: RoutedExperts,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
             extra_backend_kwargs=extra_kwargs,
+            num_actual_tokens=num_actual_tokens,
         ))

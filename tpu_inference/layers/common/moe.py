@@ -79,6 +79,7 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
+    num_actual_tokens: jax.Array | int | None = None,
 ) -> jax.Array:
     extra_backend_kwargs = dict(
         extra_backend_kwargs) if extra_backend_kwargs else {}
@@ -164,6 +165,7 @@ def moe_apply(
                     expert_score_correction_bias=extra_backend_kwargs.get(
                         "e_score_correction_bias", None),
                     moe_chunk_size=moe_chunk_size,
+                    num_actual_tokens=num_actual_tokens,
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance
