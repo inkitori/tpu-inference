@@ -21,6 +21,7 @@ exec ~/tpu-tooling/tpu-env.sh vllm bench serve \
   --dataset-path "$DATASET" \
   --num-prompts "$NUM_PROMPTS" \
   --max-concurrency "$CONCURRENCY" \
+  --temperature "${TEMPERATURE:-0}" \
   --ignore-eos \
   --save-result \
   --result-dir "$OUT_DIR" \

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import jax
@@ -160,26 +161,41 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w13_reorder_size = get_mesh_shape_product(
                 self.mesh, ShardingAxisName.MLP_TENSOR)
 
-            weights = quantize_moe_weights(
-                FusedMoEWeights(
-                    w13_weight=w13_weight,
+            if os.environ.get("MXFP4_DEQUANT_BF16") == "1":
+                # Keep the dequantized experts in bf16 (no requant, no fp8
+                # activation quant in gmm). Costs ~2x MoE weight HBM/BW vs
+                # fp8 but removes the quantization noise from the target's
+                # hidden states — used to probe/raise DFlash draft acceptance
+                # (the drafter was trained on exact bf16 target features).
+                weights = FusedMoEWeights(
+                    w13_weight=w13_weight.astype(jnp.bfloat16),
                     w13_weight_scale=None,
                     w13_bias=w13_bias,
-                    w2_weight=w2_weight,
+                    w2_weight=w2_weight.astype(jnp.bfloat16),
                     w2_weight_scale=None,
                     w2_bias=w2_bias,
-                ),
-                # TPU generations before v7 lack a native float4_e2m1fn Mosaic
-                # lowering (tpu.unpack_subelements on f4E2M1FN), which crashes
-                # gmm_v2 at first prefill. Requantize MoE experts to
-                # float8_e4m3fn there instead; e4m3fn (not e5m2) because gmm_v2
-                # sets lhs_q_dtype=float8_e4m3fn and Mosaic cannot lower an
-                # e5m2->e4m3fn cast.
-                jnp.float4_e2m1fn
-                if get_tpu_version() >= 7 else jnp.float8_e4m3fn,
-                REQUANTIZED_BLOCK_SIZE,
-                w13_interleave=w13_interleave,
-            )
+                )
+            else:
+                weights = quantize_moe_weights(
+                    FusedMoEWeights(
+                        w13_weight=w13_weight,
+                        w13_weight_scale=None,
+                        w13_bias=w13_bias,
+                        w2_weight=w2_weight,
+                        w2_weight_scale=None,
+                        w2_bias=w2_bias,
+                    ),
+                    # TPU generations before v7 lack a native float4_e2m1fn
+                    # Mosaic lowering (tpu.unpack_subelements on f4E2M1FN),
+                    # which crashes gmm_v2 at first prefill. Requantize MoE
+                    # experts to float8_e4m3fn there instead; e4m3fn (not
+                    # e5m2) because gmm_v2 sets lhs_q_dtype=float8_e4m3fn and
+                    # Mosaic cannot lower an e5m2->e4m3fn cast.
+                    jnp.float4_e2m1fn
+                    if get_tpu_version() >= 7 else jnp.float8_e4m3fn,
+                    REQUANTIZED_BLOCK_SIZE,
+                    w13_interleave=w13_interleave,
+                )
             return process_moe_weights(
                 weights,
                 moe_backend=self.moe_backend,
