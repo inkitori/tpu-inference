@@ -445,6 +445,28 @@ class KVCacheManager:
         block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
+        # The specs below size the engine's KV budget check, so they must see
+        # the real cache dtype. Recompute it from cache_config here instead of
+        # trusting runner.kv_cache_dtype: if anything between runner init and
+        # spec time replaced or reset that attribute, a quantized cache dtype
+        # (e.g. fp8) would silently size specs at the model dtype — 2x the
+        # bytes — and full-context configs would fail engine init.
+        _cache_dtype = self.runner.vllm_config.cache_config.cache_dtype
+        if _cache_dtype == "auto":
+            _cache_dtype = self.runner.model_config.dtype
+        _fresh_kv_dtype = common_utils.to_torch_dtype(_cache_dtype)
+        if _fresh_kv_dtype != self.runner.kv_cache_dtype:
+            logger.warning(
+                "runner.kv_cache_dtype (%s) does not match "
+                "cache_config.cache_dtype=%r (-> %s); using the fresh value "
+                "for KV cache specs.", self.runner.kv_cache_dtype,
+                self.runner.vllm_config.cache_config.cache_dtype,
+                _fresh_kv_dtype)
+            self.runner.kv_cache_dtype = _fresh_kv_dtype
+        logger.info("KV cache spec dtype: %s (cache_config.cache_dtype=%r)",
+                    self.runner.kv_cache_dtype,
+                    self.runner.vllm_config.cache_config.cache_dtype)
+
         tp_axis_name = ShardingAxisName.ATTN_HEAD
         model_cnt = common_utils.get_mesh_shape_product(
             self.runner.mesh, tp_axis_name)
