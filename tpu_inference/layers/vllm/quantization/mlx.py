@@ -281,6 +281,27 @@ _MOE_BARRIER_EVERY = 4
 _moe_layers_since_barrier = 0
 
 
+def _host_put_sharded(t: torch.Tensor, sharding: NamedSharding) -> jax.Array:
+    """Host torch tensor -> jax array placed directly with `sharding`.
+
+    t2j() lands the full tensor on a single device, so a ~150GB checkpoint
+    serializes through one chip's PCIe lane before shard_moe_weights spreads
+    it out. Putting the host array with its target sharding up front slices
+    on host and transfers every chip's shard in parallel instead.
+
+    bf16 rides the same bitcast trick as t2j (numpy has no bfloat16): view as
+    uint16 on host, reinterpret after the put — .view() is a local
+    reinterpret, so the sharding is preserved.
+    """
+    t = t.detach().cpu()
+    if t.dtype == torch.bfloat16:
+        if t.is_contiguous() and t.dim():
+            raw = t.view(torch.uint16).numpy()
+            return jax.device_put(raw, sharding).view(jnp.bfloat16)
+        return jax.device_put(t2j(t, use_dlpack=False), sharding)
+    return jax.device_put(t.numpy(), sharding)
+
+
 class VllmMLXLinearMethod(QuantizeMethodBase):
     """MLX 4-bit affine linear method — in-kernel dequant via ``gmm_v2``.
 
@@ -580,14 +601,25 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         assert isinstance(layer, RoutedExperts)
         bits = self.quant_config.bits
 
-        # Loaded params are CPU torch tensors; cross into JAX with t2j (the AWQ/
-        # FP8/unquantized load-time idiom), not jax_view.
-        w13_weight = t2j(layer.w13_weight, use_dlpack=False)
-        w13_scales = t2j(layer.w13_scales, use_dlpack=False)
-        w13_biases = t2j(layer.w13_biases, use_dlpack=False)
-        w2_weight = t2j(layer.w2_weight, use_dlpack=False)
-        w2_scales = t2j(layer.w2_scales, use_dlpack=False)
-        w2_biases = t2j(layer.w2_biases, use_dlpack=False)
+        # Loaded params are CPU torch tensors. For expert-parallel backends the
+        # whole transform is expert-local, so put the raw tensors on device
+        # ALREADY expert-sharded: 8 parallel PCIe streams instead of funneling
+        # ~150GB through device 0 and resharding after (was the load-time
+        # bottleneck at ~1.2GB/s effective). Non-EP backends keep the t2j path.
+        num_experts = layer.w13_weight.shape[0]
+        ep_size = get_mesh_shape_product(self.mesh, ShardingAxisName.EXPERT)
+        if (self.moe_backend in (MoEBackend.FUSED_MOE, MoEBackend.GMM_EP)
+                and num_experts % ep_size == 0):
+            ep_sharding = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
+            _put = functools.partial(_host_put_sharded, sharding=ep_sharding)
+        else:
+            _put = functools.partial(t2j, use_dlpack=False)
+        w13_weight = _put(layer.w13_weight)
+        w13_scales = _put(layer.w13_scales)
+        w13_biases = _put(layer.w13_biases)
+        w2_weight = _put(layer.w2_weight)
+        w2_scales = _put(layer.w2_scales)
+        w2_biases = _put(layer.w2_biases)
         for name in ("w13_weight", "w2_weight", "w13_scales", "w2_scales",
                      "w13_biases", "w2_biases"):
             delattr(layer, name)
