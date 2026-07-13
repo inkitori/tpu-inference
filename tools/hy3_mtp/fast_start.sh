@@ -1,36 +1,53 @@
 #!/bin/bash
-# fast_start.sh — sub-5-minute Hy3 serving startup on a fresh v6e-8 node.
+# fast_start.sh — self-contained sub-5-minute Hy3 serving on a fresh v6e-8.
 #
-# Measured 2026-07-13 (warm bucket caches, this repo @ hy3): prefetch ~45s
-# (168GB weights ~40s + XLA cache ~5s) + serve-to-ready 202s = ~250s total,
-# with zero runtime XLA compiles (VLLM_XLA_CHECK_RECOMPILATION=1 verified).
-# Serve breakdown: ~40s imports+TPU init, 46s safetensors read, ~14s MoE
-# processing (expert-sharded device_put, 8-way parallel PCIe), 7s draft,
-# ~91s AOT precompile+warmup (fully persistent-cache-hit).
+# Everything needed to go from empty node to serving lives in this script;
+# the only prerequisites are a vLLM/tpu-inference venv (TPU_VENV, default
+# ~/vllm_env), gcloud auth for prefetch/save-cache, and the checkpoint in
+# the bucket under vllm/models/$MODEL_NAME.
 #
-# Why this exists: serving straight off the gcsfuse mount reads the 168 GB
-# checkpoint at ~550 MB/s single-stream (~5 min just for weights, and the
-# 160 GB default file-cache cap means the model NEVER stays warm — LRU
-# thrashes on every sequential re-read). Parallel `gcloud storage rsync`
-# pulls the same bytes at ~6 GiB/s (measured 2026-07-13: 168 GB in ~40 s),
-# and safetensors load from tmpfs runs at ~1.2 s/shard vs 8.9 s/shard
-# through gcsfuse.
+#   $0 prefetch     (default) parallel-download checkpoint + XLA compile
+#                   cache into /dev/shm (~45s total when the bucket is warm)
+#   $0 serve        PRODUCTION serve, foreground (use & / systemd / tmux to
+#                   background). Extra args pass through to vllm serve.
+#   $0 fill         like serve, but with VLLM_XLA_CHECK_RECOMPILATION=1 —
+#                   run this INSTEAD of serve once per new (jax/libtpu/
+#                   flags/geometry) configuration to build a complete cache
+#   $0 warm         exercise a LIVE server with the request variants that
+#                   JIT lazily (concurrency/greedy/logprobs/top-k/n>1)
+#   $0 save-cache   upload the local XLA cache to the bucket
+#   $0 stop         stop the serve process started by this script
 #
-# Subcommands:
-#   prefetch    (default) parallel-download the checkpoint + XLA compile
-#               cache into /dev/shm, then print the serve command.
-#   warm        exercise a LIVE server with the request variants that JIT
-#               lazily (concurrency/greedy/logprobs/top-k) so they land in
-#               the compile cache; reports new-entry count.
-#   save-cache  upload the local XLA compile cache to the bucket. Run once
-#               after warm on a new (jax/libtpu/flag) configuration;
-#               prefetch restores it on the next fresh node.
+# New-config workflow: prefetch -> fill -> warm -> save-cache. Every node
+# after that: prefetch -> serve (~45s + ~220s to ready at 32k/bs256,
+# measured 2026-07-13; zero runtime XLA compiles).
 #
-# The XLA cache lives in the bucket under vllm/xla-cache/$CACHE_TAG. Cache
-# keys include jax/libtpu versions and compile flags, so stale entries are
-# harmless (they just miss); re-run save-cache after upgrading the stack.
+# Why prefetch instead of serving off the gcsfuse mount: the mount reads
+# the 168 GB checkpoint at ~550 MB/s single-stream and the 160 GB file
+# cache cap LRU-thrashes on every re-read; `gcloud storage rsync` pulls
+# ~6 GiB/s and safetensors load from tmpfs at ~1.2 s/shard vs 8.9.
 #
-# Overridable env: GCS_BUCKET, TPU_GCS_MOUNT, MODEL_NAME, CACHE_TAG, SHM_ROOT.
+# Notes that earned their place the hard way:
+#   * --block-size 256 is REQUIRED for max-model-len > 8192. The platform
+#     heuristic (flash_attn.py get_page_size, "temporary fix for vmem OOM")
+#     drops to 16-token KV pages above 8k; the RPA kernel statically
+#     unrolls one DMA per page per kv block, so Pallas lowering — which
+#     runs EVERY startup and cannot be skipped by the persistent compile
+#     cache (lowering produces the cache key) — took ~46s per token bucket
+#     (~20min startups). At 256-token pages it is ~5s. No VMEM OOM seen at
+#     32k/bs256 on v6e-8.
+#   * --max-model-len / --block-size change block-table shapes: backbone
+#     cache entries are keyed per (context, page size). The bucket cache
+#     accumulates every config that ran fill+warm+save-cache; stale
+#     entries are harmless.
+#   * VLLM_XLA_CHECK_RECOMPILATION=1 (fill) both persists sub-1s compiles
+#     (write thresholds -> -1) and turns guarded runtime recompiles into
+#     request-failing RuntimeErrors. Perfect for validation, wrong for
+#     production: serve uses =0, so a missed shape stalls one request and
+#     self-heals. Cache reads are identical either way.
+#
+# Overridable env: TPU_VENV, GCS_BUCKET, TPU_GCS_MOUNT, MODEL_NAME,
+# CACHE_TAG, SHM_ROOT, SERVE_URL, OMP_NUM_THREADS, NUM_PRECOMPILE_WORKERS.
 set -euo pipefail
 
 MOUNT=${TPU_GCS_MOUNT:-/tmp/gcs/bucket}
@@ -41,20 +58,24 @@ MODEL_DST="$SHM_ROOT/models/$MODEL_NAME"
 XLA_DST="$SHM_ROOT/xla_cache_hy3"
 
 # Bucket: explicit env > the mounted bucket > same-region auto-discovery.
-BUCKET=${GCS_BUCKET:-$(findmnt -n -o SOURCE "$MOUNT" 2>/dev/null || true)}
-if [ -z "$BUCKET" ]; then
-    zone=$(curl -s -m 5 -H "Metadata-Flavor: Google" \
-      "http://metadata.google.internal/computeMetadata/v1/instance/zone" | awk -F/ '{print $NF}')
-    region_uc=$(printf '%s' "${zone%-*}" | tr '[:lower:]' '[:upper:]')
-    BUCKET=$(gcloud storage buckets list --format="value(name,location)" \
-             | awk -v r="$region_uc" '$2 == r {print $1; exit}')
-fi
-[ -n "$BUCKET" ] || { echo "cannot determine bucket; set GCS_BUCKET" >&2; exit 1; }
-
-MODEL_SRC="gs://$BUCKET/vllm/models/$MODEL_NAME"
-XLA_SRC="gs://$BUCKET/vllm/xla-cache/$CACHE_TAG"
+# Only prefetch/save-cache need it; serve/fill/warm/stop never touch GCS.
+resolve_bucket() {
+    BUCKET=${GCS_BUCKET:-$(findmnt -n -o SOURCE "$MOUNT" 2>/dev/null || true)}
+    if [ -z "$BUCKET" ]; then
+        local zone region_uc
+        zone=$(curl -s -m 5 -H "Metadata-Flavor: Google" \
+          "http://metadata.google.internal/computeMetadata/v1/instance/zone" | awk -F/ '{print $NF}')
+        region_uc=$(printf '%s' "${zone%-*}" | tr '[:lower:]' '[:upper:]')
+        BUCKET=$(gcloud storage buckets list --format="value(name,location)" \
+                 | awk -v r="$region_uc" '$2 == r {print $1; exit}')
+    fi
+    [ -n "$BUCKET" ] || { echo "cannot determine bucket; set GCS_BUCKET" >&2; exit 1; }
+    MODEL_SRC="gs://$BUCKET/vllm/models/$MODEL_NAME"
+    XLA_SRC="gs://$BUCKET/vllm/xla-cache/$CACHE_TAG"
+}
 
 save_cache() {
+    resolve_bucket
     [ -d "$XLA_DST" ] && [ -n "$(ls -A "$XLA_DST" 2>/dev/null)" ] \
       || { echo "no local XLA cache at $XLA_DST — run a serve first" >&2; exit 1; }
     echo "uploading XLA cache $XLA_DST -> $XLA_SRC"
@@ -63,6 +84,7 @@ save_cache() {
 }
 
 prefetch() {
+    resolve_bucket
     # /dev/shm is tmpfs (RAM): checkpoint+cache need ~170 GB, kept for the
     # life of the node. The v6e-8 host has 1.4 TB; if this node is smaller,
     # point SHM_ROOT at local NVMe instead.
@@ -80,54 +102,80 @@ prefetch() {
     if gcloud storage ls "$XLA_SRC" >/dev/null 2>&1; then
         echo "restoring XLA cache $XLA_SRC -> $XLA_DST"
         time gcloud storage rsync -r -q "$XLA_SRC" "$XLA_DST"
-    else
-        echo "NOTE: no XLA cache in bucket yet ($XLA_SRC)."
-        echo "      First serve compiles cold; afterwards run: $0 save-cache"
-    fi
+        cat <<EOF
 
-    cat <<EOF
-
-ready. serve with (low-concurrency c<=8 MTP k=2 config; for c=16-32 use
---max-num-seqs 32 and add --additional-config '{"compilation_sizes":[96]}'):
-
-  cd \$HOME/tpu-inference   # NOT ~: the ~/vllm checkout would shadow the vllm package
-  SKIP_JAX_PRECOMPILE=0 ONEHOT_MOE_PERMUTE_THRESHOLD=1024 \\
-  VLLM_XLA_CACHE_PATH=$XLA_DST \\
-  VLLM_XLA_CHECK_RECOMPILATION=1 NUM_PRECOMPILE_WORKERS=4 \\
-  ~/tpu-tooling/tpu-env.sh vllm serve $MODEL_DST \\
-    --tensor-parallel-size 8 --max-model-len 32768 --max-num-seqs 8 \\
-    --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 \\
-    --block-size 256 \\
-    --trust-remote-code --enable-expert-parallel --async-scheduling \\
-    --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
-
---block-size 256 is REQUIRED for max-model-len > 8192: the platform
-heuristic (flash_attn.py get_page_size, "temporary fix for vmem OOM")
-drops to 16-token pages above 8k, and the RPA kernel statically unrolls
-one DMA per page per kv block — 16x more pages meant ~46s of Pallas
-lowering per token bucket, EVERY startup (the persistent compile cache
-cannot skip lowering), i.e. ~20min startups. With 256 pages it's ~5s.
-Measured 2026-07-13 at 32k/bs256: no VMEM OOM, cold fill 373s.
-
-NOTE: --max-model-len and --block-size change block-table shapes, i.e.
-the backbone cache entries are keyed per (context size, page size). The
-bucket cache accumulates every config that ran fill+warm+save-cache; a
-new geometry compiles cold once, then is fast everywhere.
-
-VLLM_XLA_CHECK_RECOMPILATION does two things: (a) drops jax's
-persistent-cache WRITE thresholds (default: skip compiles <1s) so the
-~300 small helper jits get cached too, and (b) arms a guard that turns
-guarded runtime recompiles into request-500ing RuntimeErrors.
-  - fill/warm/validation runs (and after stack upgrades): set =1 —
-    complete cache writes + loud coverage regressions.
-  - PRODUCTION serving: set =0 / drop it. A shape you missed then costs
-    a one-time compile stall and self-heals (compiles >1s still persist);
-    cache READS are unaffected, warm startup is equally fast either way.
-
-after the first cold serve on a new jax/libtpu/config: run '$0 warm' against
-the live server (some sampler/RNG jit variants only materialize under real
-traffic: concurrency, greedy, logprobs), THEN '$0 save-cache'.
+ready. start serving (foreground; use & / systemd / tmux to background):
+  $0 serve
+extra vllm args pass through (last occurrence wins), e.g.:
+  $0 serve --max-num-seqs 32 --additional-config '{"compilation_sizes":[96]}'
 EOF
+    else
+        cat <<EOF
+NOTE: no XLA cache in bucket yet ($XLA_SRC).
+First serve on this configuration compiles cold — use the fill workflow:
+  $0 fill          # serve with recompile-guard + full cache writes
+  $0 warm          # then, against the live server
+  $0 save-cache    # persist for every future node
+EOF
+    fi
+}
+
+# Production serve (check=0) / cache-fill serve (check=1). Foreground: exec's
+# into vllm so signals/systemd work as expected. Extra args go to vllm serve.
+serve() {
+    local check=$1; shift
+    [ -f "$MODEL_DST/config.json" ] \
+      || { echo "no model at $MODEL_DST — run: $0 prefetch" >&2; exit 1; }
+
+    # --- environment (inlined; no external wrapper needed) -----------------
+    local venv="${TPU_VENV:-$HOME/vllm_env}"
+    [ -f "$venv/bin/activate" ] \
+      || { echo "no venv at $venv — set TPU_VENV to your vllm env" >&2; exit 1; }
+    # shellcheck disable=SC1091
+    source "$venv/bin/activate"
+    # Weights/tokenizer are read from $MODEL_DST; HF stays offline so vllm
+    # never hits the network (or takes write locks on a RO gcsfuse mount).
+    export HF_HOME="${HF_HOME:-$MOUNT}"
+    export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+    export MODEL_IMPL_TYPE="${MODEL_IMPL_TYPE:-vllm}"
+    # Single-host TP uses UniProcExecutor, which does not clamp torch
+    # threads; unclamped, the MoE weight copy oversubscribes a high-vCPU
+    # host and checkpoint load balloons from ~1 min to ~20 min.
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
+
+    export SKIP_JAX_PRECOMPILE=0       # AOT-precompile everything at startup
+    export ONEHOT_MOE_PERMUTE_THRESHOLD=1024
+    export VLLM_XLA_CACHE_PATH="$XLA_DST"
+    export VLLM_XLA_CHECK_RECOMPILATION="$check"
+    export NUM_PRECOMPILE_WORKERS="${NUM_PRECOMPILE_WORKERS:-4}"
+
+    # cwd guard: python puts the cwd on sys.path, so launching from a
+    # directory that contains a vllm/ checkout (e.g. $HOME) shadows the
+    # installed package and vLLM's model-registry subprocess dies with
+    # "cannot import name 'SamplingParams'". The script's own dir is safe.
+    cd "$(dirname "$(readlink -f "$0")")"
+
+    exec vllm serve "$MODEL_DST" \
+      --tensor-parallel-size 8 --max-model-len 32768 --max-num-seqs 8 \
+      --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 \
+      --block-size 256 \
+      --trust-remote-code --enable-expert-parallel --async-scheduling \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+      "$@"
+}
+
+stop() {
+    local pat="vllm serve $MODEL_DST"
+    pgrep -f "$pat" >/dev/null || { echo "no serve process found"; return 0; }
+    pkill -f "$pat" || true
+    for _ in $(seq 1 30); do
+        pgrep -f "$pat" >/dev/null || { echo "stopped."; return 0; }
+        sleep 2
+    done
+    echo "still up after 60s — force-killing"
+    pkill -9 -f "$pat" || true
+    sleep 2
+    echo "stopped."
 }
 
 # Exercise the request classes that lazily JIT outside the AOT precompile
@@ -172,9 +220,14 @@ PYEOF
         || echo "no new compiles — cache already covers this traffic"
 }
 
-case "${1:-prefetch}" in
+cmd=${1:-prefetch}
+[ $# -gt 0 ] && shift || true
+case "$cmd" in
     prefetch)   prefetch ;;
+    serve)      serve 0 "$@" ;;
+    fill)       serve 1 "$@" ;;
     warm)       warm ;;
     save-cache) save_cache ;;
-    *) echo "usage: $0 [prefetch|warm|save-cache]" >&2; exit 1 ;;
+    stop)       stop ;;
+    *) echo "usage: $0 [prefetch|serve|fill|warm|save-cache|stop] [extra vllm args for serve/fill]" >&2; exit 1 ;;
 esac
