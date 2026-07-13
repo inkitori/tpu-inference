@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Any, Optional
 
 import jax
@@ -196,6 +197,90 @@ def _mlx_int4_matmul(x, codes, scale, groupbias, group_sizes, mesh, in_axis,
     )(x, codes, scale, groupbias, group_sizes)
 
 
+@functools.lru_cache(maxsize=None)
+def _linear_transform_fn(bits: int, do_reorder: bool,
+                         output_sizes: tuple[int, ...], n_shards: int):
+    """Shared jitted linear-weight transform, one trace per config.
+
+    Every linear layer with the same (bits, reorder, output_sizes, n_shards)
+    reuses one jax.jit object; a per-layer inner @jax.jit would re-trace,
+    re-lower and re-read the persistent cache for each of the ~O(100) layers
+    at load time.
+    """
+    output_sizes_list = list(output_sizes)
+
+    @jax.jit
+    def _transform(weight, scales, biases):
+        # Reorder the fused output (dim 0) into interleaved-by-shard order
+        # BEFORE the transpose, so apply's slice/concat recovers each proj.
+        if do_reorder:
+            weight = reorder_concatenated_tensor_for_sharding(
+                weight, output_sizes_list, n_shards, dim=0)
+            scales = reorder_concatenated_tensor_for_sharding(
+                scales, output_sizes_list, n_shards, dim=0)
+            biases = reorder_concatenated_tensor_for_sharding(
+                biases, output_sizes_list, n_shards, dim=0)
+        # Unpack uint32 -> unsigned codes [out, in], shift to signed int4,
+        # fold the -8 offset into groupbias. Transpose in int32, cast last.
+        codes = mlx_unpack(weight, bits) - 8                # int32 [out, in]
+        scale = scales.astype(jnp.float32)                  # [out, in//gs]
+        groupbias = biases.astype(jnp.float32) + 8.0 * scale
+        codes = jnp.transpose(codes, (1, 0))[None].astype(jnp.int4)
+        scale = jnp.transpose(scale, (1, 0))[None, :, None, :]
+        groupbias = jnp.transpose(groupbias, (1, 0))[None, :, None, :]
+        return codes, scale, groupbias
+
+    return _transform
+
+
+@functools.lru_cache(maxsize=None)
+def _moe_process_fn(bits: int, moe_backend: MoEBackend, w13_reorder_size: int,
+                    w13_interleave: bool):
+    """Shared jitted MoE-weight transform, one trace per config (see
+    _linear_transform_fn — same rationale, one reuse per MoE layer)."""
+
+    @jax.jit
+    def _process(w13q, w13s, w13b, w2q, w2s, w2b):
+        # Both projections: unpack uint32 -> unsigned codes, shift to signed
+        # int4 [-8, 7], fold the -8 offset back into groupbias = bias +
+        # 8*scale. process_moe_weights reshapes scale/groupbias from
+        # [E, out, n_groups] to [E, num_blocks, 1, N] identically.
+        def _fold(q, s, b):
+            codes = (mlx_unpack(q, bits) - 8).astype(jnp.int4)
+            scale = s.astype(jnp.float32)
+            groupbias = b.astype(jnp.float32) + 8.0 * scale
+            return codes, scale, groupbias
+
+        w13_codes, w13_scale, w13_groupbias = _fold(w13q, w13s, w13b)
+        w2_codes, w2_scale, w2_groupbias = _fold(w2q, w2s, w2b)
+
+        weights = FusedMoEWeights(
+            w13_weight=w13_codes,
+            w13_weight_scale=w13_scale,
+            w13_groupbias=w13_groupbias,
+            w13_bias=None,
+            w2_weight=w2_codes,
+            w2_weight_scale=w2_scale,
+            w2_groupbias=w2_groupbias,
+            w2_bias=None,
+        )
+        return process_moe_weights(
+            weights,
+            moe_backend=moe_backend,
+            w13_reorder_size=w13_reorder_size,
+            w13_interleave=w13_interleave,
+        )
+
+    return _process
+
+
+# MoE layers processed since the last effects barrier. Draining device work
+# only every few layers lets layer N's transfers/compute overlap layer N+1's
+# host-side prep while still bounding cross-layer buffer accumulation.
+_MOE_BARRIER_EVERY = 4
+_moe_layers_since_barrier = 0
+
+
 class VllmMLXLinearMethod(QuantizeMethodBase):
     """MLX 4-bit affine linear method — in-kernel dequant via ``gmm_v2``.
 
@@ -301,26 +386,8 @@ class VllmMLXLinearMethod(QuantizeMethodBase):
             f"got fuse_matmuls=False with output_sizes={output_sizes}.")
         do_reorder = self.linear_config.fuse_matmuls and len(output_sizes) > 1
 
-        @jax.jit
-        def _transform(weight, scales, biases):
-            # Reorder the fused output (dim 0) into interleaved-by-shard order
-            # BEFORE the transpose, so apply's slice/concat recovers each proj.
-            if do_reorder:
-                weight = reorder_concatenated_tensor_for_sharding(
-                    weight, output_sizes, n_shards, dim=0)
-                scales = reorder_concatenated_tensor_for_sharding(
-                    scales, output_sizes, n_shards, dim=0)
-                biases = reorder_concatenated_tensor_for_sharding(
-                    biases, output_sizes, n_shards, dim=0)
-            # Unpack uint32 -> unsigned codes [out, in], shift to signed int4,
-            # fold the -8 offset into groupbias. Transpose in int32, cast last.
-            codes = mlx_unpack(weight, bits) - 8                # int32 [out, in]
-            scale = scales.astype(jnp.float32)                  # [out, in//gs]
-            groupbias = biases.astype(jnp.float32) + 8.0 * scale
-            codes = jnp.transpose(codes, (1, 0))[None].astype(jnp.int4)
-            scale = jnp.transpose(scale, (1, 0))[None, :, None, :]
-            groupbias = jnp.transpose(groupbias, (1, 0))[None, :, None, :]
-            return codes, scale, groupbias
+        _transform = _linear_transform_fn(bits, do_reorder,
+                                          tuple(output_sizes), n_shards)
 
         codes, scale, groupbias = _transform(
             t2j(layer.weight, use_dlpack=False),
@@ -529,37 +596,8 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         w13_reorder_size = get_mesh_shape_product(self.mesh,
                                                   ShardingAxisName.MLP_TENSOR)
 
-        @jax.jit
-        def _process(w13q, w13s, w13b, w2q, w2s, w2b):
-            # Both projections: unpack uint32 -> unsigned codes, shift to signed
-            # int4 [-8, 7], fold the -8 offset back into groupbias = bias +
-            # 8*scale. process_moe_weights reshapes scale/groupbias from
-            # [E, out, n_groups] to [E, num_blocks, 1, N] identically.
-            def _fold(q, s, b):
-                codes = (mlx_unpack(q, bits) - 8).astype(jnp.int4)
-                scale = s.astype(jnp.float32)
-                groupbias = b.astype(jnp.float32) + 8.0 * scale
-                return codes, scale, groupbias
-
-            w13_codes, w13_scale, w13_groupbias = _fold(w13q, w13s, w13b)
-            w2_codes, w2_scale, w2_groupbias = _fold(w2q, w2s, w2b)
-
-            weights = FusedMoEWeights(
-                w13_weight=w13_codes,
-                w13_weight_scale=w13_scale,
-                w13_groupbias=w13_groupbias,
-                w13_bias=None,
-                w2_weight=w2_codes,
-                w2_weight_scale=w2_scale,
-                w2_groupbias=w2_groupbias,
-                w2_bias=None,
-            )
-            return process_moe_weights(
-                weights,
-                moe_backend=self.moe_backend,
-                w13_reorder_size=w13_reorder_size,
-                w13_interleave=w13_interleave,
-            )
+        _process = _moe_process_fn(bits, self.moe_backend, w13_reorder_size,
+                                   w13_interleave)
 
         weights = _process(w13_weight, w13_scales, w13_biases, w2_weight,
                            w2_scales, w2_biases)
@@ -581,9 +619,14 @@ class VllmMLXMoEMethod(FusedMoEMethodBase):
         layer.w2_groupbias = Parameter(weights.w2_groupbias,
                                        requires_grad=False)
 
-        # Release intermediate buffers before the next layer (mirrors the
-        # unquantized path's barrier to avoid cross-layer buffer accumulation).
-        jax.effects_barrier()
+        # Drain device work every few layers (not every layer): bounds
+        # cross-layer buffer accumulation like the unquantized path's barrier,
+        # but lets transfers/compute overlap the next layers' host-side prep.
+        global _moe_layers_since_barrier
+        _moe_layers_since_barrier += 1
+        if _moe_layers_since_barrier >= _MOE_BARRIER_EVERY:
+            _moe_layers_since_barrier = 0
+            jax.effects_barrier()
 
     def apply_monolithic(self,
                          layer: "RoutedExperts",

@@ -12,9 +12,12 @@
 # Subcommands:
 #   prefetch    (default) parallel-download the checkpoint + XLA compile
 #               cache into /dev/shm, then print the serve command.
+#   warm        exercise a LIVE server with the request variants that JIT
+#               lazily (concurrency/greedy/logprobs/top-k) so they land in
+#               the compile cache; reports new-entry count.
 #   save-cache  upload the local XLA compile cache to the bucket. Run once
-#               after the first fully-warm serve on a new (jax/libtpu/flag)
-#               configuration; prefetch restores it on the next fresh node.
+#               after warm on a new (jax/libtpu/flag) configuration;
+#               prefetch restores it on the next fresh node.
 #
 # The XLA cache lives in the bucket under vllm/xla-cache/$CACHE_TAG. Cache
 # keys include jax/libtpu versions and compile flags, so stale entries are
@@ -82,19 +85,69 @@ ready. serve with (low-concurrency c<=8 MTP k=2 config; for c=16-32 use
 
   SKIP_JAX_PRECOMPILE=0 ONEHOT_MOE_PERMUTE_THRESHOLD=1024 \\
   VLLM_XLA_CACHE_PATH=$XLA_DST \\
+  VLLM_XLA_CHECK_RECOMPILATION=1 NUM_PRECOMPILE_WORKERS=4 \\
   ~/tpu-tooling/tpu-env.sh vllm serve $MODEL_DST \\
     --tensor-parallel-size 8 --max-model-len 4096 --max-num-seqs 8 \\
     --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 \\
     --trust-remote-code --enable-expert-parallel --async-scheduling \\
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 
-after the first cold serve on a new jax/libtpu/config, persist the cache:
-  $0 save-cache
+VLLM_XLA_CHECK_RECOMPILATION=1 matters on BOTH the fill run and warm runs:
+it drops jax's persistent-cache thresholds (default: skip compiles <1s) so
+the ~300 small helper jits get cached too, and it makes guarded runtime
+recompiles raise instead of silently stalling a request.
+
+after the first cold serve on a new jax/libtpu/config: run '$0 warm' against
+the live server (some sampler/RNG jit variants only materialize under real
+traffic: concurrency, greedy, logprobs), THEN '$0 save-cache'.
 EOF
+}
+
+# Exercise the request classes that lazily JIT outside the AOT precompile
+# sweep (batch-shape RNG splits, greedy + sampled mixes, logprobs, top-k/p,
+# n>1). Run once against a live server after a cold fill, then save-cache.
+warm() {
+    local base=${SERVE_URL:-http://localhost:8000}
+    local before after
+    before=$(ls "$XLA_DST" 2>/dev/null | wc -l)
+    echo "warming $base with variant traffic (cache: $before entries)"
+    python3 - "$base" "$MODEL_DST" <<'PYEOF'
+import concurrent.futures as cf
+import json, subprocess, sys
+base, model = sys.argv[1], sys.argv[2]
+def req(body):
+    body = {"model": model, "max_tokens": 24, **body}
+    r = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+         f"{base}/v1/completions", "-H", "Content-Type: application/json",
+         "-d", json.dumps(body)], capture_output=True, text=True)
+    return r.stdout
+cases = [
+    {"prompt": "hi", "temperature": 0.7},
+    {"prompt": "hi", "temperature": 0.0},
+    {"prompt": "hi", "temperature": 0.7, "logprobs": 3},
+    {"prompt": "hi", "temperature": 0.0, "logprobs": 3},
+    {"prompt": "hi", "temperature": 0.9, "top_p": 0.9, "top_k": 40},
+    {"prompt": "hi", "temperature": 0.9, "n": 2},
+]
+for c in cases:
+    print(c.get("temperature"), c.get("logprobs"), "->", req(c))
+# max-concurrency mixed batch (hits batched sampler/RNG-split shapes)
+mix = [{"prompt": "p " * (50 * i + 5),
+        "temperature": 0.0 if i % 2 else 0.7,
+        "logprobs": 2 if i % 3 == 0 else None} for i in range(8)]
+with cf.ThreadPoolExecutor(8) as ex:
+    print("concurrent:", list(ex.map(req, mix)))
+PYEOF
+    after=$(ls "$XLA_DST" 2>/dev/null | wc -l)
+    echo "cache: $before -> $after entries"
+    [ "$after" -gt "$before" ] && echo "new variants captured; run: $0 save-cache" \
+        || echo "no new compiles — cache already covers this traffic"
 }
 
 case "${1:-prefetch}" in
     prefetch)   prefetch ;;
+    warm)       warm ;;
     save-cache) save_cache ;;
-    *) echo "usage: $0 [prefetch|save-cache]" >&2; exit 1 ;;
+    *) echo "usage: $0 [prefetch|warm|save-cache]" >&2; exit 1 ;;
 esac
