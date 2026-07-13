@@ -114,10 +114,15 @@ the backbone cache entries are keyed per (context size, page size). The
 bucket cache accumulates every config that ran fill+warm+save-cache; a
 new geometry compiles cold once, then is fast everywhere.
 
-VLLM_XLA_CHECK_RECOMPILATION=1 matters on BOTH the fill run and warm runs:
-it drops jax's persistent-cache thresholds (default: skip compiles <1s) so
-the ~300 small helper jits get cached too, and it makes guarded runtime
-recompiles raise instead of silently stalling a request.
+VLLM_XLA_CHECK_RECOMPILATION does two things: (a) drops jax's
+persistent-cache WRITE thresholds (default: skip compiles <1s) so the
+~300 small helper jits get cached too, and (b) arms a guard that turns
+guarded runtime recompiles into request-500ing RuntimeErrors.
+  - fill/warm/validation runs (and after stack upgrades): set =1 —
+    complete cache writes + loud coverage regressions.
+  - PRODUCTION serving: set =0 / drop it. A shape you missed then costs
+    a one-time compile stall and self-heals (compiles >1s still persist);
+    cache READS are unaffected, warm startup is equally fast either way.
 
 after the first cold serve on a new jax/libtpu/config: run '$0 warm' against
 the live server (some sampler/RNG jit variants only materialize under real
