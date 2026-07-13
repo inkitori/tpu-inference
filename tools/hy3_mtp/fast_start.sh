@@ -90,14 +90,29 @@ prefetch() {
 ready. serve with (low-concurrency c<=8 MTP k=2 config; for c=16-32 use
 --max-num-seqs 32 and add --additional-config '{"compilation_sizes":[96]}'):
 
+  cd \$HOME/tpu-inference   # NOT ~: the ~/vllm checkout would shadow the vllm package
   SKIP_JAX_PRECOMPILE=0 ONEHOT_MOE_PERMUTE_THRESHOLD=1024 \\
   VLLM_XLA_CACHE_PATH=$XLA_DST \\
   VLLM_XLA_CHECK_RECOMPILATION=1 NUM_PRECOMPILE_WORKERS=4 \\
   ~/tpu-tooling/tpu-env.sh vllm serve $MODEL_DST \\
-    --tensor-parallel-size 8 --max-model-len 4096 --max-num-seqs 8 \\
+    --tensor-parallel-size 8 --max-model-len 32768 --max-num-seqs 8 \\
     --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 \\
+    --block-size 256 \\
     --trust-remote-code --enable-expert-parallel --async-scheduling \\
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+--block-size 256 is REQUIRED for max-model-len > 8192: the platform
+heuristic (flash_attn.py get_page_size, "temporary fix for vmem OOM")
+drops to 16-token pages above 8k, and the RPA kernel statically unrolls
+one DMA per page per kv block — 16x more pages meant ~46s of Pallas
+lowering per token bucket, EVERY startup (the persistent compile cache
+cannot skip lowering), i.e. ~20min startups. With 256 pages it's ~5s.
+Measured 2026-07-13 at 32k/bs256: no VMEM OOM, cold fill 373s.
+
+NOTE: --max-model-len and --block-size change block-table shapes, i.e.
+the backbone cache entries are keyed per (context size, page size). The
+bucket cache accumulates every config that ran fill+warm+save-cache; a
+new geometry compiles cold once, then is fast everywhere.
 
 VLLM_XLA_CHECK_RECOMPILATION=1 matters on BOTH the fill run and warm runs:
 it drops jax's persistent-cache thresholds (default: skip compiles <1s) so
