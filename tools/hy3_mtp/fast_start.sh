@@ -1,6 +1,13 @@
 #!/bin/bash
 # fast_start.sh — sub-5-minute Hy3 serving startup on a fresh v6e-8 node.
 #
+# Measured 2026-07-13 (warm bucket caches, this repo @ hy3): prefetch ~45s
+# (168GB weights ~40s + XLA cache ~5s) + serve-to-ready 202s = ~250s total,
+# with zero runtime XLA compiles (VLLM_XLA_CHECK_RECOMPILATION=1 verified).
+# Serve breakdown: ~40s imports+TPU init, 46s safetensors read, ~14s MoE
+# processing (expert-sharded device_put, 8-way parallel PCIe), 7s draft,
+# ~91s AOT precompile+warmup (fully persistent-cache-hit).
+#
 # Why this exists: serving straight off the gcsfuse mount reads the 168 GB
 # checkpoint at ~550 MB/s single-stream (~5 min just for weights, and the
 # 160 GB default file-cache cap means the model NEVER stays warm — LRU
