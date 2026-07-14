@@ -104,6 +104,36 @@ def moe_apply(
                 activation = "silu_and_mul_with_clamp"
         match moe_backend:
             case MoEBackend.FUSED_MOE:
+                # The fused kernel selects and weights experts from the same
+                # scores, so DeepSeek-style expert-bias routing (bias applied
+                # for selection only) is emulated by doing the biased top-k
+                # selection here and masking all non-selected experts out of
+                # the gating logits. The kernel's own top-k then recovers
+                # exactly the selected experts, with combine weights computed
+                # from the raw (unbiased) scores as required.
+                e_score_correction_bias = extra_backend_kwargs.pop(
+                    "e_score_correction_bias", None)
+                extra_backend_kwargs.pop("hash_based_topk_indices", None)
+                extra_backend_kwargs.pop("num_valid_tokens", None)
+                if e_score_correction_bias is not None:
+                    scores = gating_output.astype(jnp.float32)
+                    if layer.scoring_func == "sigmoid":
+                        scores = jax.nn.sigmoid(scores)
+                    else:
+                        scores = jax.nn.softmax(scores, axis=-1)
+                    selection_scores = scores + e_score_correction_bias.astype(
+                        jnp.float32)[None, :]
+                    _, selected = jax.lax.top_k(selection_scores, layer.top_k)
+                    keep = jnp.zeros_like(gating_output, dtype=bool)
+                    keep = jnp.put_along_axis(keep,
+                                              selected,
+                                              True,
+                                              axis=-1,
+                                              inplace=False)
+                    gating_output = jnp.where(
+                        keep, gating_output,
+                        jnp.finfo(gating_output.dtype).min)
+
                 subc_quant_w1_sz = None
                 subc_quant_w2_sz = None
                 if weights.w13_weight_scale is not None and weights.w2_weight_scale is not None:
