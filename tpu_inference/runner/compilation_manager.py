@@ -1246,8 +1246,16 @@ class CompilationManager:
                 bonus_token_ids = self._create_dummy_tensor((num_reqs, ),
                                                             jnp.int32)
 
-                for do_sampling in (False, True):
+                # (do_sampling, with draft_probs). Random sampling is compiled
+                # both without draft probs (startup / fallback) and with them
+                # (exact-q speculative sampling from the drafter).
+                for do_sampling, with_draft_probs in ((False, False),
+                                                      (True, False),
+                                                      (True, True)):
                     draft_probs = None
+                    if with_draft_probs:
+                        draft_probs = self._create_dummy_tensor(
+                            (num_logits, vocab_size), jnp.float32, sharding)
                     # Use a dummy tensor with a unique shape for each logprobs config.
                     # Currently logprobs=False for rejection_sampler.
                     logprobs_dummy = False
@@ -1259,6 +1267,8 @@ class CompilationManager:
 
                     if do_sampling:
                         compilation_name = "random_rejection_sampler"
+                        if with_draft_probs:
+                            compilation_name += "_qprobs"
                         temperature = self._create_dummy_tensor((num_reqs, ),
                                                                 np.float32)
                         top_k = self._create_dummy_tensor((num_reqs, ),
@@ -1359,7 +1369,7 @@ class CompilationManager:
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
                     new_args = (self.runner.kv_caches, ) + _args[1:]
-                    kv_caches, draft_token_ids = self.runner.drafter.propose(
+                    kv_caches, draft_token_ids, _ = self.runner.drafter.propose(
                         *new_args, **_call_kwargs)
                     self.runner.kv_caches = kv_caches
                     return draft_token_ids
@@ -1503,7 +1513,7 @@ class CompilationManager:
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
                     new_args = (self.runner.kv_caches, ) + _args[1:]
-                    kv_caches, draft_token_ids = self.runner.drafter.propose(
+                    kv_caches, draft_token_ids, _ = self.runner.drafter.propose(
                         *new_args, **_call_kwargs)
                     self.runner.kv_caches = kv_caches
                     return draft_token_ids
@@ -1524,6 +1534,37 @@ class CompilationManager:
                     attention_metadata,
                     last_token_indices,
                     draft_hidden_states,
+                    num_tokens=num_tokens,
+                    warmup_handler=drafter_propose_warmup,
+                )
+                # Sampled-draft variant (do_sampling batches): the drafter
+                # samples from its own processed distribution and returns the
+                # exact proposal probs for the rejection sampler.
+                _dummy_collision = device_array(
+                    self.runner.mesh, jnp.zeros((2, ), dtype=jnp.int32))
+                sampling_metadata = TPUSupportedSamplingMetadata(
+                    temperature=self._create_dummy_tensor(
+                        (self.runner.max_num_reqs, ), np.float32,
+                        dp_sharding),
+                    top_k=self._create_dummy_tensor(
+                        (self.runner.max_num_reqs, ), np.int32, dp_sharding),
+                    top_p=self._create_dummy_tensor(
+                        (self.runner.max_num_reqs, ), np.float32,
+                        dp_sharding),
+                    _cache_collision_dummy=_dummy_collision,
+                    do_sampling=True)
+                self._run_compilation(
+                    "drafter_propose_sampled",
+                    self.runner.drafter.propose,
+                    self.runner.kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    last_token_indices,
+                    draft_hidden_states,
+                    call_kwargs=dict(
+                        sampling_metadata=sampling_metadata,
+                        rng=self.runner.rng_params_for_sampling,
+                    ),
                     num_tokens=num_tokens,
                     warmup_handler=drafter_propose_warmup,
                 )
