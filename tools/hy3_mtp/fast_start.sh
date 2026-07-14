@@ -170,7 +170,7 @@ serve() {
       --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 \
       --block-size 256 \
       --trust-remote-code --enable-expert-parallel --async-scheduling \
-      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
       "$@"
 }
 
