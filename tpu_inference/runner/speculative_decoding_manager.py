@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
@@ -35,6 +36,25 @@ if TYPE_CHECKING:
     from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
+@jax.jit(static_argnames=("mesh", ))
+def _gather_draft_prob_rows(probs: jnp.ndarray, rows: jnp.ndarray,
+                            mesh) -> jnp.ndarray:
+    """probs [B, k, vocab] + row ids [N] (into the flattened [B*k]) -> [N, vocab].
+
+    The output is constrained to the same sharding the rejection sampler's
+    target logits use, so the (draft_probs, target_logits) jit signature
+    matches the AOT-precompiled variant.
+    """
+    flat = probs.reshape(-1, probs.shape[-1])
+    out = flat[rows]
+    return jax.lax.with_sharding_constraint(
+        out,
+        NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.MLP_DATA,
+                          ShardingAxisName.MLP_TENSOR)))
+
+
 class SpeculativeDecodingManager:
 
     def __init__(self, runner: TPUModelRunner):
@@ -42,6 +62,12 @@ class SpeculativeDecodingManager:
         # Cached draft tokens.
         self._draft_token_ids: Optional[list[list[int]]] = None
         self._req_indices_dp: Optional[dict] = None
+        # Device probs of the proposal distribution q for the drafts above:
+        # [num_rows, num_spec_tokens, vocab] f32, plus the req_id -> row map
+        # snapshot taken at propose time. Consumed by the NEXT step's
+        # rejection sampler (exact speculative sampling needs q).
+        self._draft_probs: Optional[jnp.ndarray] = None
+        self._draft_probs_req_row: Optional[dict[str, int]] = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
@@ -80,6 +106,8 @@ class SpeculativeDecodingManager:
         scheduler_output: Optional[VllmSchedulerOutput] = None,
         input_ids: Optional[jnp.ndarray] = None,
         hidden_states: Optional[jnp.ndarray] = None,
+        sampling_metadata=None,
+        rng: Optional[jnp.ndarray] = None,
     ) -> None:
         if async_scheduling:
             assert self.runner.speculative_config.use_eagle(
@@ -111,6 +139,8 @@ class SpeculativeDecodingManager:
                 input_ids,
                 async_scheduling,
                 hidden_states,
+                sampling_metadata,
+                rng,
             )
             self._req_indices_dp = spec_decode_metadata.req_indices_dp
         else:
@@ -130,6 +160,8 @@ class SpeculativeDecodingManager:
         input_ids: jnp.ndarray,
         async_scheduling: bool,
         hidden_states: jnp.ndarray,
+        sampling_metadata=None,
+        rng: Optional[jnp.ndarray] = None,
     ) -> list[list[int]] | jnp.ndarray:
         assert isinstance(self.runner.drafter, Eagle3Proposer)
         if isinstance(attn_metadata, dict):
@@ -195,13 +227,34 @@ class SpeculativeDecodingManager:
             num_reqs_dp,
         )
 
-        self.runner.kv_caches, draft_token_ids = self.runner.drafter.propose(
-            kv_caches=self.runner.kv_caches,
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            last_token_indices=last_token_indices,
-            target_hidden_states=target_hidden_states,
-        )
+        (self.runner.kv_caches, draft_token_ids,
+         draft_probs) = self.runner.drafter.propose(
+             kv_caches=self.runner.kv_caches,
+             input_ids=input_ids,
+             attn_metadata=attn_metadata,
+             last_token_indices=last_token_indices,
+             target_hidden_states=target_hidden_states,
+             sampling_metadata=sampling_metadata,
+             rng=rng,
+         )
+
+        # Snapshot the proposal distribution q and the req_id -> proposal-row
+        # map so the NEXT step's rejection sampler can gather exact draft
+        # probs (see gather_draft_probs_for_verify).
+        self._draft_probs = draft_probs
+        if draft_probs is not None:
+            req_row: dict[str, int] = {}
+            max_num_reqs_per_dp_rank = (self.runner.max_num_reqs //
+                                        self.runner.dp_size)
+            for rank in range(self.runner.dp_size):
+                for j, req_idx in enumerate(
+                        spec_decode_metadata.req_indices_dp[rank]):
+                    req_id = req_ids[req_idx]
+                    if req_id is not None:
+                        req_row[req_id] = j + rank * max_num_reqs_per_dp_rank
+            self._draft_probs_req_row = req_row
+        else:
+            self._draft_probs_req_row = None
 
         if async_scheduling:
             if jnp.ndim(draft_token_ids) == 1:
@@ -212,6 +265,57 @@ class SpeculativeDecodingManager:
             if draft_token_ids.ndim == 1:
                 draft_token_ids = np.expand_dims(draft_token_ids, axis=-1)
             return draft_token_ids.tolist()
+
+    def gather_draft_probs_for_verify(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        padded_logits_length_dp_rank: int,
+    ) -> Optional[jnp.ndarray]:
+        """Flattened draft probs [num_target_rows, vocab] for this step.
+
+        Maps each request's scheduled draft tokens back to the proposal rows
+        recorded at the previous step's propose() and gathers their q rows in
+        exactly the layout of spec_decode_metadata.target_logits_indices
+        (per-DP-rank concatenation with padding). Returns None when no probs
+        were recorded (greedy batches / startup) or a scheduled request is
+        missing from the snapshot (fall back to q=None, which is the old
+        conservative-but-exact behavior).
+        """
+        probs = self._draft_probs
+        req_row = self._draft_probs_req_row
+        if probs is None or req_row is None:
+            return None
+
+        runner = self.runner
+        num_spec = runner.speculative_config.num_speculative_tokens
+        dp_size = runner.dp_size
+        padded_num_reqs_per_rank = (
+            spec_decode_metadata.draft_lengths_cpu.shape[0] // dp_size)
+        req_ids = runner.input_batch.req_ids
+
+        rows = np.zeros(padded_logits_length_dp_rank * dp_size,
+                        dtype=np.int32)
+        for rank in range(dp_size):
+            out = rank * padded_logits_length_dp_rank
+            for j, req_idx in enumerate(
+                    spec_decode_metadata.req_indices_dp[rank]):
+                ndt = int(spec_decode_metadata.draft_lengths_cpu[
+                    rank * padded_num_reqs_per_rank + j])
+                if ndt == 0:
+                    continue
+                req_id = req_ids[req_idx]
+                base = req_row.get(req_id)
+                if base is None:
+                    return None
+                for t in range(ndt):
+                    rows[out] = base * num_spec + t
+                    out += 1
+
+        rows_dev = device_array(
+            runner.mesh, rows,
+            sharding=NamedSharding(runner.mesh,
+                                   PartitionSpec(ShardingAxisName.ATTN_DATA)))
+        return _gather_draft_prob_rows(probs, rows_dev, runner.mesh)
 
     def get_spec_decode_metadata(
         self,
