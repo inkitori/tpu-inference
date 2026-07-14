@@ -1679,17 +1679,32 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             draft_token_ids = self._extract_draft_token_ids(
                 input_ids, spec_decode_metadata.final_logits_indices,
                 spec_decode_metadata.target_logits_indices)
+            # Exact draft probs q recorded by the previous step's propose()
+            # (None for greedy batches / startup). Supplying q turns the
+            # accept rule into min(1, p/q) — the textbook lossless rejection
+            # sampler — instead of the far stricter p(argmax-draft).
+            draft_probs = None
+            if tpu_sampling_metadata.do_sampling:
+                draft_probs = (
+                    self.speculative_decoding_manager.
+                    gather_draft_probs_for_verify(
+                        spec_decode_metadata,
+                        target_logits.shape[0] // self.dp_size))
             next_tokens = self.rejection_sampler(
                 draft_token_ids=draft_token_ids,
                 num_draft_tokens=spec_decode_metadata.draft_lengths,
-                draft_probs=None,
+                draft_probs=draft_probs,
                 target_logits=target_logits,
                 bonus_token_ids=bonus_token_ids,
                 sampling_metadata=tpu_sampling_metadata,
                 key=rejection_rng,
             )
 
-        logits = logits.astype(jnp.float32)
+        # NOTE: do NOT eagerly cast `logits` to f32 here. The cast is an eager
+        # (non-jit) convert_element_type over [padded_tokens, vocab] that costs
+        # multiple ms of host time per decode step, and its result is only
+        # consumed by the logprobs paths below. bf16->f32 is exact, so casting
+        # lazily inside the branches that need it is bit-identical.
         if full_logits is not None:
             full_logits = full_logits.astype(jnp.float32)
         with self.maybe_forbid_compile:
@@ -1711,7 +1726,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 else:
                     logprobs_logits = (processed_logits
                                        if self.model_config.logprobs_mode
-                                       == "processed_logprobs" else logits)
+                                       == "processed_logprobs" else
+                                       logits.astype(jnp.float32))
                 logprobs = compute_and_gather_logprobs(
                     logprobs_logits, next_tokens,
                     self.model_config.max_logprobs)
@@ -1773,6 +1789,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.speculative_config.num_speculative_tokens,
                     self.input_batch.vocab_size,
                     self.max_num_reqs // self.dp_size, self.mesh)
+                # Draft sampling RNG: only consumed (and only split) for
+                # sampling batches, so greedy-batch replay stays untouched.
+                drafter_rng = None
+                if tpu_sampling_metadata.do_sampling:
+                    self.rng_params_for_sampling, drafter_rng = \
+                        jax.random.split(self.rng_params_for_sampling)
                 self.speculative_decoding_manager.propose_draft_token_ids(
                     next_tokens,
                     logits_indices_selector,
@@ -1786,6 +1808,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output,
                     input_ids,
                     full_hidden_states,
+                    sampling_metadata=tpu_sampling_metadata,
+                    rng=drafter_rng,
                 )
                 spec_decode_last_sampled_token_id = last_sampled_token_id
                 spec_decode_num_rejected_tokens = num_rejected_tokens
