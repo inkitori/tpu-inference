@@ -210,6 +210,7 @@ class Eagle3Proposer:
             out_specs=(data_spec, data_spec),
         )(query_start_loc, target_token_ids, next_token_ids, num_reqs)
 
+    @jax.jit(static_argnums=(0, ))
     def _update_inputs_for_loop_speculation(
         self, positions: jax.Array, seq_lens: jax.Array,
         block_tables: jax.Array
@@ -265,6 +266,7 @@ class Eagle3Proposer:
          )(positions, seq_lens, block_tables)
         return positions, clamped_positions, new_seq_lens, query_start_loc, new_block_tables
 
+    @jax.jit(static_argnums=(0, ))
     def _get_loop_query_start_loc(self, positions: jax.Array) -> jax.Array:
         """JIT-compiled helper for generating query_start_loc inside speculation loop."""
 
@@ -280,6 +282,7 @@ class Eagle3Proposer:
             out_specs=data_spec,
         )(positions)
 
+    @jax.jit(static_argnums=(0, ))
     def _stack_draft_token_ids(
             self, draft_token_ids_list: list[jax.Array]) -> jnp.ndarray:
         """JIT-compiled helper for stacking draft token IDs."""
@@ -507,6 +510,7 @@ class Eagle3Proposer:
 
         return target_hidden_states, input_ids, last_token_indices, attn_metadata
 
+    @jax.jit(static_argnums=(0, ))
     def _select_draft_token_ids(
         self,
         state_leaves: Any,
@@ -526,6 +530,7 @@ class Eagle3Proposer:
         )(hidden_states, last_token_indices)
         return self._get_draft_token_ids(state_leaves, sample_hidden_states)
 
+    @jax.jit(static_argnums=(0, ))
     def _get_draft_token_ids(self, state_leaves: Any,
                              hidden_states: jax.Array) -> jax.Array:
         lora_metadata = None
@@ -537,6 +542,7 @@ class Eagle3Proposer:
             NamedSharding(self.mesh,
                           PartitionSpec(ShardingAxisName.ATTN_DATA)))
 
+    @jax.jit(static_argnums=(0, ))
     def _select_inputs_for_loop_speculation(
             self, state_leaves: Any, positions: jax.Array, residual: jax.Array,
             hidden_states: jax.Array,
@@ -594,24 +600,6 @@ class Eagle3Proposer:
             layer_name_to_kvcache_index=tuple(
                 self.runner.layer_name_to_kvcache_index.items()))
 
-    @jax.jit(
-        donate_argnames=("kv_caches", ),
-        out_shardings=(
-            None,  # kv_caches - keep original sharding
-            None,  # draft_token_ids
-        ),
-        compiler_options={
-            "xla_tpu_all_gather_collective_matmul_mode":
-            "post_spmd_conservative",
-            "xla_tpu_reduce_scatter_collective_matmul_mode":
-            "post_spmd_conservative"
-        },
-        static_argnums=(
-            0,
-            7,
-            8,
-        ),
-    )
     def _propose(
         self,
         state_leaves: Any,
@@ -624,6 +612,17 @@ class Eagle3Proposer:
         layer_name_to_kvcache_index: tuple,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
         """Proposes draft tokens using the draft model.
+
+        NOTE: deliberately NOT one fused jit (backport of the tip fix).
+        Wrapping this whole function in a single donated jit (the previous
+        implementation) mis-executes the CHAINED draft pass on this stack:
+        the second MTP pass's logits argmax collapses to a constant token id
+        0 for every input, so position-1 drafts are never accepted (verified
+        with both the persistent XLA cache and a fresh one). Composing the
+        same already-jitted pieces eagerly produces correct chained drafts;
+        the extra per-step dispatch cost is small and the acceptance gain is
+        large. Do not re-fuse without re-checking per-position acceptance.
+
         Returns:
             A tuple containing the updated KV caches and a tensor of proposed
             draft token IDs.

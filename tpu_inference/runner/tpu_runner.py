@@ -1689,7 +1689,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 key=rejection_rng,
             )
 
-        logits = logits.astype(jnp.float32)
+        # NOTE: do NOT eagerly cast `logits` to f32 here. The cast is an eager
+        # (non-jit) convert_element_type over [padded_tokens, vocab] that costs
+        # multiple ms of host time per decode step, and its result is only
+        # consumed by the logprobs paths below. bf16->f32 is exact, so casting
+        # lazily inside the branches that need it is bit-identical.
         if full_logits is not None:
             full_logits = full_logits.astype(jnp.float32)
         with self.maybe_forbid_compile:
@@ -1711,7 +1715,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 else:
                     logprobs_logits = (processed_logits
                                        if self.model_config.logprobs_mode
-                                       == "processed_logprobs" else logits)
+                                       == "processed_logprobs" else
+                                       logits.astype(jnp.float32))
                 logprobs = compute_and_gather_logprobs(
                     logprobs_logits, next_tokens,
                     self.model_config.max_logprobs)
