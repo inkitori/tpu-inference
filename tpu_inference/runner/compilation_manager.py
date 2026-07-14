@@ -1372,6 +1372,14 @@ class CompilationManager:
                     kv_caches, draft_token_ids, _ = self.runner.drafter.propose(
                         *new_args, **_call_kwargs)
                     self.runner.kv_caches = kv_caches
+                    # With num_speculative_tokens == 1 propose returns a 1-D
+                    # array and SpeculativeDecodingManager expands it eagerly
+                    # at request time (async scheduling needs [batch, k]).
+                    # Warm that expand_dims on the runtime-exact aval so the
+                    # first spec-decode step doesn't lower a new op under the
+                    # ForbidCompile guard.
+                    if jnp.ndim(draft_token_ids) == 1:
+                        draft_token_ids = jnp.expand_dims(draft_token_ids, 1)
                     return draft_token_ids
 
                 draft_hidden_states = self._create_dummy_tensor(
@@ -1516,6 +1524,14 @@ class CompilationManager:
                     kv_caches, draft_token_ids, _ = self.runner.drafter.propose(
                         *new_args, **_call_kwargs)
                     self.runner.kv_caches = kv_caches
+                    # With num_speculative_tokens == 1 propose returns a 1-D
+                    # array and SpeculativeDecodingManager expands it eagerly
+                    # at request time (async scheduling needs [batch, k]).
+                    # Warm that expand_dims on the runtime-exact aval so the
+                    # first spec-decode step doesn't lower a new op under the
+                    # ForbidCompile guard.
+                    if jnp.ndim(draft_token_ids) == 1:
+                        draft_token_ids = jnp.expand_dims(draft_token_ids, 1)
                     return draft_token_ids
 
                 draft_hidden_states = self._create_dummy_tensor(
@@ -1537,37 +1553,56 @@ class CompilationManager:
                     num_tokens=num_tokens,
                     warmup_handler=drafter_propose_warmup,
                 )
-                # Sampled-draft variant (do_sampling batches): the drafter
-                # samples from its own processed distribution and returns the
-                # exact proposal probs for the rejection sampler.
-                _dummy_collision = device_array(
-                    self.runner.mesh, jnp.zeros((2, ), dtype=jnp.int32))
-                sampling_metadata = TPUSupportedSamplingMetadata(
-                    temperature=self._create_dummy_tensor(
-                        (self.runner.max_num_reqs, ), np.float32,
-                        dp_sharding),
-                    top_k=self._create_dummy_tensor(
-                        (self.runner.max_num_reqs, ), np.int32, dp_sharding),
-                    top_p=self._create_dummy_tensor(
-                        (self.runner.max_num_reqs, ), np.float32,
-                        dp_sharding),
-                    _cache_collision_dummy=_dummy_collision,
-                    do_sampling=True)
-                self._run_compilation(
-                    "drafter_propose_sampled",
-                    self.runner.drafter.propose,
-                    self.runner.kv_caches,
-                    input_ids,
-                    attention_metadata,
-                    last_token_indices,
-                    draft_hidden_states,
-                    call_kwargs=dict(
-                        sampling_metadata=sampling_metadata,
-                        rng=self.runner.rng_params_for_sampling,
-                    ),
-                    num_tokens=num_tokens,
-                    warmup_handler=drafter_propose_warmup,
-                )
+                # Sampling-metadata variants. The runtime metadata treedef
+                # differs per (do_sampling, logprobs) combo: both are meta
+                # fields, and from_input_batch gives greedy batches no
+                # temperature/top-k/top-p tensors and a (1,)-shaped collision
+                # dummy to logprobs batches — so each combo is a distinct
+                # propose trace. A combo missed here trips ForbidCompile
+                # mid-propose at runtime AFTER the draft model_fn has donated
+                # the KV caches; the queued next-step forward then dies on the
+                # dead buffers with an invalid-donation error.
+                for tag, do_sampling, logprobs in (
+                    ("sampled", True, False),
+                    ("sampled_logprobs", True, True),
+                    ("greedy", False, False),
+                    ("greedy_logprobs", False, True),
+                ):
+                    sampling_tensors = dict(
+                        temperature=self._create_dummy_tensor(
+                            (self.runner.max_num_reqs, ), np.float32,
+                            dp_sharding),
+                        top_k=self._create_dummy_tensor(
+                            (self.runner.max_num_reqs, ), np.int32,
+                            dp_sharding),
+                        top_p=self._create_dummy_tensor(
+                            (self.runner.max_num_reqs, ), np.float32,
+                            dp_sharding),
+                    ) if do_sampling else {}
+                    sampling_metadata = TPUSupportedSamplingMetadata(
+                        _cache_collision_dummy=device_array(
+                            self.runner.mesh,
+                            jnp.zeros((1, ) if logprobs else (2, ),
+                                      dtype=jnp.int32)),
+                        do_sampling=do_sampling,
+                        logprobs=logprobs,
+                        **sampling_tensors)
+                    self._run_compilation(
+                        f"drafter_propose_{tag}",
+                        self.runner.drafter.propose,
+                        self.runner.kv_caches,
+                        input_ids,
+                        attention_metadata,
+                        last_token_indices,
+                        draft_hidden_states,
+                        call_kwargs=dict(
+                            sampling_metadata=sampling_metadata,
+                            rng=(self.runner.rng_params_for_sampling
+                                 if do_sampling else None),
+                        ),
+                        num_tokens=num_tokens,
+                        warmup_handler=drafter_propose_warmup,
+                    )
 
                 aux_hidden_states = (self._create_dummy_tensor(
                     (num_tokens, target_hidden_size), jnp.bfloat16,
