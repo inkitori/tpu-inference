@@ -3,8 +3,10 @@
 #
 # Everything needed to go from empty node to serving lives in this script;
 # the only prerequisites are a vLLM/tpu-inference venv (TPU_VENV, default
-# ~/vllm_env), gcloud auth for prefetch/save-cache, and the checkpoint in
-# the bucket under vllm/models/$MODEL_NAME.
+# ~/vllm_env), gcloud auth for prefetch/save-cache, and the checkpoint
+# mirrored in the bucket under vllm/hub/ (HF-cache layout, keyed by
+# $HF_REPO — default enyoukai/Hy3-4bit-mtp-mlx, the released Hy3 4-bit
+# MLX quant with the MTP head restored).
 #
 #   $0 prefetch     (default) parallel-download checkpoint + XLA compile
 #                   cache into /dev/shm (~45s total when the bucket is warm)
@@ -46,15 +48,18 @@
 #     production: serve uses =0, so a missed shape stalls one request and
 #     self-heals. Cache reads are identical either way.
 #
-# Overridable env: TPU_VENV, GCS_BUCKET, TPU_GCS_MOUNT, MODEL_NAME,
+# Overridable env: TPU_VENV, GCS_BUCKET, TPU_GCS_MOUNT, HF_REPO,
 # CACHE_TAG, SHM_ROOT, SERVE_URL, OMP_NUM_THREADS, NUM_PRECOMPILE_WORKERS.
 set -euo pipefail
 
 MOUNT=${TPU_GCS_MOUNT:-/tmp/gcs/bucket}
-MODEL_NAME=${MODEL_NAME:-Hy3-preview-4bit-mtp}
+# HF repo id; the bucket mirrors it under vllm/hub in HF-cache layout
+# (models--org--name/{refs,snapshots}) with real files in snapshots/.
+HF_REPO=${HF_REPO:-enyoukai/Hy3-4bit-mtp-mlx}
+HUB_SLUG="models--${HF_REPO//\//--}"
 CACHE_TAG=${CACHE_TAG:-hy3-v6e8}
 SHM_ROOT=${SHM_ROOT:-/dev/shm}
-MODEL_DST="$SHM_ROOT/models/$MODEL_NAME"
+MODEL_DST="$SHM_ROOT/models/${HF_REPO##*/}"
 XLA_DST="$SHM_ROOT/xla_cache_hy3"
 
 # Bucket: explicit env > the mounted bucket > same-region auto-discovery.
@@ -70,7 +75,7 @@ resolve_bucket() {
                  | awk -v r="$region_uc" '$2 == r {print $1; exit}')
     fi
     [ -n "$BUCKET" ] || { echo "cannot determine bucket; set GCS_BUCKET" >&2; exit 1; }
-    MODEL_SRC="gs://$BUCKET/vllm/models/$MODEL_NAME"
+    HUB_SRC="gs://$BUCKET/vllm/hub/$HUB_SLUG"
     XLA_SRC="gs://$BUCKET/vllm/xla-cache/$CACHE_TAG"
 }
 
@@ -96,8 +101,13 @@ prefetch() {
         sudo chown -R "$(id -u)" "$SHM_ROOT/models" "$XLA_DST"
     }
 
-    echo "prefetching checkpoint $MODEL_SRC -> $MODEL_DST (~40s for 168GB)"
-    time gcloud storage rsync -r -q "$MODEL_SRC" "$MODEL_DST"
+    # resolve the snapshot commit via refs/main, then pull only that
+    # snapshot (real files; the mirror carries no blobs/ duplicates)
+    local sha
+    sha=$(gcloud storage cat "$HUB_SRC/refs/main" 2>/dev/null) \
+      || { echo "no $HUB_SRC/refs/main in bucket — mirror the HF repo first" >&2; exit 1; }
+    echo "prefetching checkpoint $HUB_SRC/snapshots/$sha -> $MODEL_DST (~40s for 168GB)"
+    time gcloud storage rsync -r -q "$HUB_SRC/snapshots/$sha" "$MODEL_DST"
 
     if gcloud storage ls "$XLA_SRC" >/dev/null 2>&1; then
         echo "restoring XLA cache $XLA_SRC -> $XLA_DST"
