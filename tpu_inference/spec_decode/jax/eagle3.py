@@ -26,12 +26,26 @@ from vllm.config import VllmConfig
 from tpu_inference import envs
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.binary_search import topk_mask, topp_mask
+from tpu_inference.layers.jax.sample.sampling_metadata import \
+    TPUSupportedSamplingMetadata
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.model_loader import (
     get_model, resolve_model_architecture)
 from tpu_inference.utils import device_array
 
 logger = init_logger(__name__)
+
+
+@jax.jit
+def _stack_draft_outputs(
+    draft_token_ids_list: list[jax.Array],
+    draft_probs_list: list[jax.Array] | None,
+) -> tuple[jax.Array, jax.Array | None]:
+    draft_token_ids = jnp.stack(draft_token_ids_list, axis=1)
+    draft_probs = (None if draft_probs_list is None else jnp.stack(
+        draft_probs_list, axis=1))
+    return draft_token_ids, draft_probs
 
 
 class Eagle3Proposer:
@@ -210,6 +224,7 @@ class Eagle3Proposer:
             out_specs=(data_spec, data_spec),
         )(query_start_loc, target_token_ids, next_token_ids, num_reqs)
 
+    @jax.jit(static_argnums=(0, ))
     def _update_inputs_for_loop_speculation(
         self, positions: jax.Array, seq_lens: jax.Array,
         block_tables: jax.Array
@@ -265,6 +280,7 @@ class Eagle3Proposer:
          )(positions, seq_lens, block_tables)
         return positions, clamped_positions, new_seq_lens, query_start_loc, new_block_tables
 
+    @jax.jit(static_argnums=(0, ))
     def _get_loop_query_start_loc(self, positions: jax.Array) -> jax.Array:
         """JIT-compiled helper for generating query_start_loc inside speculation loop."""
 
@@ -448,7 +464,28 @@ class Eagle3Proposer:
            attn_metadata.query_start_loc, attn_metadata.seq_lens, num_reqs,
            num_rejected_tokens, input_ids)
 
-        attn_metadata = replace(attn_metadata, block_tables=block_tables)
+        # Rebuild request_distribution as [0, 0, num_reqs] per DP rank. The
+        # inherited target-step value covers all padded slots; that is safe
+        # for the first draft pass (padded slots have zero-length queries)
+        # but NOT for the 1-token-per-request loop passes, where every padded
+        # slot would become a real query that WRITES its garbage K/V through
+        # a stale block table (corrupting pages now owned by live requests).
+        # Capping the kernel's sequence range at the real request count makes
+        # it skip padded slots entirely in both passes.
+        def _pad_safe_distribution(nr):
+            zeros = jnp.zeros((2, ), dtype=jnp.int32)
+            return jnp.concatenate([zeros, nr.astype(jnp.int32)])
+
+        request_distribution = jax.shard_map(
+            _pad_safe_distribution,
+            mesh=self.mesh,
+            in_specs=(data_spec, ),
+            out_specs=data_spec,
+        )(num_reqs)
+
+        attn_metadata = replace(attn_metadata,
+                                block_tables=block_tables,
+                                request_distribution=request_distribution)
         return self._filter_token_and_prepare_initial_inputs(
             state_leaves, token_indices, new_query_start_loc, new_seq_lens,
             input_ids, aux_hidden_states, attn_metadata, next_token_ids,
@@ -507,12 +544,15 @@ class Eagle3Proposer:
 
         return target_hidden_states, input_ids, last_token_indices, attn_metadata
 
+    @jax.jit(static_argnums=(0, ))
     def _select_draft_token_ids(
         self,
         state_leaves: Any,
         hidden_states: jax.Array,
         last_token_indices: jax.Array,
-    ) -> jax.Array:
+        sampling_metadata: TPUSupportedSamplingMetadata | None = None,
+        rng: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
 
         def _select(hidden_states, last_token_indices):
             return hidden_states[last_token_indices]
@@ -524,26 +564,87 @@ class Eagle3Proposer:
                       PartitionSpec(ShardingAxisName.ATTN_DATA)),
             out_specs=PartitionSpec(ShardingAxisName.ATTN_DATA),
         )(hidden_states, last_token_indices)
-        return self._get_draft_token_ids(state_leaves, sample_hidden_states)
+        return self._get_draft_token_ids(state_leaves, sample_hidden_states,
+                                         sampling_metadata, rng)
 
-    def _get_draft_token_ids(self, state_leaves: Any,
-                             hidden_states: jax.Array) -> jax.Array:
+    @jax.jit(static_argnums=(0, ))
+    def _get_draft_token_ids(
+        self,
+        state_leaves: Any,
+        hidden_states: jax.Array,
+        sampling_metadata: TPUSupportedSamplingMetadata | None = None,
+        rng: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """Pick one draft token per request from the drafter's logits.
+
+        Greedy batches (or callers that pass no sampling metadata) keep the
+        original argmax behavior and return probs=None.
+
+        Sampling batches SAMPLE the draft token from the drafter's own
+        distribution q — processed with the same per-request temperature /
+        top-k / top-p transform the rejection sampler applies to the target
+        logits (`_compute_probs`) — and return q so the verifier can run exact
+        speculative rejection sampling (accept prob min(1, p/q) instead of the
+        far smaller p(argmax) that q=None implies). This is lossless: the
+        rejection sampler preserves the target distribution for ANY proposal q
+        whose probs are reported exactly.
+        """
         lora_metadata = None
         logits = self.compute_logits_fn(state_leaves, hidden_states,
                                         lora_metadata)
-        draft_token_ids = jnp.argmax(logits, axis=-1)
-        return lax.with_sharding_constraint(
-            draft_token_ids,
-            NamedSharding(self.mesh,
-                          PartitionSpec(ShardingAxisName.ATTN_DATA)))
+        data_sharding = NamedSharding(self.mesh,
+                                      PartitionSpec(ShardingAxisName.ATTN_DATA))
 
+        if (sampling_metadata is None or not sampling_metadata.do_sampling
+                or rng is None):
+            draft_token_ids = jnp.argmax(logits, axis=-1)
+            return lax.with_sharding_constraint(draft_token_ids,
+                                                data_sharding), None
+
+        # Mirror rejection_sampler._compute_probs exactly (top-k mask, top-p
+        # mask, temperature scale, f32 softmax) so q == softmax(processed) is
+        # precisely the distribution we sample from below.
+        logits = logits.astype(jnp.float32)
+        top_k = sampling_metadata.top_k
+        top_p = sampling_metadata.top_p
+        temperature = sampling_metadata.temperature
+
+        should_apply_topk = jnp.expand_dims(top_k > 0, axis=-1)
+        topk_masked = topk_mask(logits, top_k, replace_val=-jnp.inf)
+        logits = jnp.where(should_apply_topk, topk_masked, logits)
+
+        should_apply_topp = jnp.expand_dims(top_p < 1.0, axis=-1)
+        topp_masked = topp_mask(logits, top_p, replace_val=-jnp.inf)
+        logits = jnp.where(should_apply_topp, topp_masked, logits)
+
+        processed_logits = logits / (jnp.expand_dims(temperature, axis=-1) +
+                                     1e-9)
+        draft_probs = jax.nn.softmax(processed_logits, axis=-1)
+
+        greedy_token_ids = jnp.argmax(processed_logits, axis=-1)
+        sampled_token_ids = jax.random.categorical(rng, processed_logits)
+        # Requests with ~zero temperature must stay exactly greedy (their q is
+        # numerically one-hot already, but the argmax avoids tie ambiguity).
+        is_greedy = temperature < 1e-5
+        draft_token_ids = jnp.where(is_greedy, greedy_token_ids,
+                                    sampled_token_ids)
+        return (lax.with_sharding_constraint(draft_token_ids, data_sharding),
+                draft_probs)
+
+    @jax.jit(static_argnums=(0, ))
     def _select_inputs_for_loop_speculation(
-            self, state_leaves: Any, positions: jax.Array, residual: jax.Array,
+            self,
+            state_leaves: Any,
+            positions: jax.Array,
+            residual: jax.Array,
             hidden_states: jax.Array,
-            last_token_indices: jax.Array) -> tuple[jax.Array, jax.Array]:
-        draft_token_ids = self._select_draft_token_ids(state_leaves,
-                                                       hidden_states,
-                                                       last_token_indices)
+            last_token_indices: jax.Array,
+            sampling_metadata: TPUSupportedSamplingMetadata | None = None,
+            rng: jax.Array | None = None
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+        draft_token_ids, draft_probs = self._select_draft_token_ids(
+            state_leaves, hidden_states, last_token_indices,
+            sampling_metadata, rng)
 
         def _select(positions, residual, hidden_states, last_token_indices):
             if self.method == "mtp":
@@ -573,7 +674,7 @@ class Eagle3Proposer:
             in_specs=(positions_spec, data_spec, data_spec, data_spec),
             out_specs=(positions_spec, data_spec),
         )(positions, residual, hidden_states, last_token_indices)
-        return positions, residual, draft_token_ids
+        return positions, residual, draft_token_ids, draft_probs
 
     def propose(
         self,
@@ -582,7 +683,9 @@ class Eagle3Proposer:
         attn_metadata: AttentionMetadata,
         last_token_indices,
         target_hidden_states,
-    ) -> tuple[list[jax.Array], jnp.ndarray]:
+        sampling_metadata: TPUSupportedSamplingMetadata | None = None,
+        rng: jax.Array | None = None,
+    ) -> tuple[list[jax.Array], jnp.ndarray, jnp.ndarray | None]:
         return self._propose(
             state_leaves=self.state_leaves,
             kv_caches=kv_caches,
@@ -592,26 +695,10 @@ class Eagle3Proposer:
             target_hidden_states=target_hidden_states,
             num_speculative_tokens=self.num_speculative_tokens,
             layer_name_to_kvcache_index=tuple(
-                self.runner.layer_name_to_kvcache_index.items()))
+                self.runner.layer_name_to_kvcache_index.items()),
+            sampling_metadata=sampling_metadata,
+            rng=rng)
 
-    @jax.jit(
-        donate_argnames=("kv_caches", ),
-        out_shardings=(
-            None,  # kv_caches - keep original sharding
-            None,  # draft_token_ids
-        ),
-        compiler_options={
-            "xla_tpu_all_gather_collective_matmul_mode":
-            "post_spmd_conservative",
-            "xla_tpu_reduce_scatter_collective_matmul_mode":
-            "post_spmd_conservative"
-        },
-        static_argnums=(
-            0,
-            7,
-            8,
-        ),
-    )
     def _propose(
         self,
         state_leaves: Any,
@@ -622,12 +709,29 @@ class Eagle3Proposer:
         target_hidden_states,
         num_speculative_tokens: int,
         layer_name_to_kvcache_index: tuple,
-    ) -> tuple[list[jax.Array], jnp.ndarray]:
+        sampling_metadata: TPUSupportedSamplingMetadata | None = None,
+        rng: jax.Array | None = None,
+    ) -> tuple[list[jax.Array], jnp.ndarray, jnp.ndarray | None]:
         """Proposes draft tokens using the draft model.
+
+        NOTE: deliberately NOT one fused jit. Wrapping this whole function in
+        a single donated jit (the previous implementation) mis-executes the
+        CHAINED draft pass on this stack: the second MTP pass's logits argmax
+        collapses to a constant token id 0 for every input, so position-1
+        drafts are never accepted (verified against greedy continuations,
+        with both the persistent XLA cache and a fresh one). Composing the
+        same already-jitted pieces eagerly produces correct chained drafts;
+        the extra per-step dispatch cost is small and the acceptance gain is
+        large. Do not re-fuse without re-checking per-position acceptance.
+
         Returns:
-            A tuple containing the updated KV caches and a tensor of proposed
-            draft token IDs.
+            A tuple of (updated KV caches, proposed draft token IDs
+            [batch, num_spec_tokens], draft probs
+            [batch, num_spec_tokens, vocab] or None for greedy batches).
         """
+        # One independent subkey per speculative position.
+        rngs = (jax.random.split(rng, num_speculative_tokens)
+                if rng is not None else [None] * num_speculative_tokens)
 
         kv_caches, hidden_states, residual, _ = self.model_fn(
             state_leaves,
@@ -640,13 +744,19 @@ class Eagle3Proposer:
         )
 
         if num_speculative_tokens == 1:
-            return kv_caches, self._select_draft_token_ids(
-                state_leaves, hidden_states, last_token_indices)
+            draft_token_ids, draft_probs = self._select_draft_token_ids(
+                state_leaves, hidden_states, last_token_indices,
+                sampling_metadata, rngs[0])
+            if draft_probs is not None:
+                draft_probs = draft_probs[:, None, :]
+            return kv_caches, draft_token_ids, draft_probs
 
-        positions, hidden_states, draft_token_ids = self._select_inputs_for_loop_speculation(
-            state_leaves, attn_metadata.input_positions, residual[0],
-            hidden_states, last_token_indices)
+        positions, hidden_states, draft_token_ids, draft_probs = \
+            self._select_inputs_for_loop_speculation(
+                state_leaves, attn_metadata.input_positions, residual[0],
+                hidden_states, last_token_indices, sampling_metadata, rngs[0])
         draft_token_ids_list = [draft_token_ids]
+        draft_probs_list = [draft_probs]
 
         for i in range(num_speculative_tokens - 1):
             input_ids_loop = draft_token_ids_list[-1]
@@ -680,11 +790,17 @@ class Eagle3Proposer:
                 spec_step_idx=i + 1,
             )
             hidden_states = residual[0]
-            draft_token_ids = self._get_draft_token_ids(
-                state_leaves, new_hidden_states)
+            draft_token_ids, draft_probs = self._get_draft_token_ids(
+                state_leaves, new_hidden_states, sampling_metadata,
+                rngs[i + 1])
             draft_token_ids_list.append(draft_token_ids)
+            draft_probs_list.append(draft_probs)
 
-        # [batch_size, num_speculative_tokens]
-        draft_token_ids = self._stack_draft_token_ids(draft_token_ids_list)
+        # [batch_size, num_speculative_tokens] (+ probs [b, k, vocab]); one
+        # small jit so the stacks are not eager per-step dispatches.
+        if any(p is None for p in draft_probs_list):
+            draft_probs_list = None
+        draft_token_ids, draft_probs = _stack_draft_outputs(
+            draft_token_ids_list, draft_probs_list)
 
-        return kv_caches, draft_token_ids
+        return kv_caches, draft_token_ids, draft_probs
