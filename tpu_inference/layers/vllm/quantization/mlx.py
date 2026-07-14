@@ -92,6 +92,12 @@ class VllmMLXConfig(QuantizationConfig, VllmQuantConfig):
             if not isinstance(val, dict):
                 continue
             if not key.endswith("mlp.router.gate"):
+                # Some MLX exporters (e.g. the released Hy3-4bit) restate the
+                # global (group_size, bits) per module. A redundant override
+                # is a no-op — only a DIFFERENT quantization is unsupported.
+                if (val.get("bits") == bits
+                        and val.get("group_size") == group_size):
+                    continue
                 raise ValueError(
                     f"Unsupported MLX per-module quant override for {key!r}: only "
                     "'*.mlp.router.gate' overrides are supported.")
