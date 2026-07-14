@@ -90,6 +90,21 @@ class UnquantizedLinearMethod:
         Returns:
             Output array of shape [..., total_output_dim].
         """
+        if getattr(self.linear_config, "defer_all_reduce", False):
+            # See _apply_fused: emit per-shard partial sums for
+            # RowParallelLinear with reduce_results=False.
+            assert bias_jax is None, (
+                "bias cannot be added to unreduced partial sums")
+            outs = [
+                sharded_matmul(x_jax,
+                               weight_jax,
+                               self.linear_config.weight_sharding,
+                               mesh=self.linear_config.mesh,
+                               defer_all_reduce=True)
+                for weight_jax in weights
+            ]
+            return jnp.concatenate(outs, axis=-1)
+
         outs = []
         for i, weight_jax in enumerate(weights):
             out = jnp.einsum("...k,kn->...n", x_jax, weight_jax)

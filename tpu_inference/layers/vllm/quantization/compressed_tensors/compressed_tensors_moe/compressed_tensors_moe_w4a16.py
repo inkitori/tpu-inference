@@ -19,7 +19,9 @@ from compressed_tensors.quantization import QuantizationArgs
 from jax.sharding import NamedSharding, PartitionSpec
 from torch.nn.parameter import Parameter
 from torchax.interop import torch_view
-from vllm.model_executor.layers.fused_moe import FusedMoEConfig, RoutedExperts
+from vllm.model_executor.layers.fused_moe import (FusedMoEConfig,
+                                                  FusedMoeWeightScaleSupported,
+                                                  RoutedExperts)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -76,6 +78,12 @@ class VllmCompressedTensorsW4A16MoEMethod(VllmCompressedTensorsW4A8MoEMethod):
         assert hidden_size % self.packed_factor == 0
         num_groups_w13 = hidden_size // self.group_size
         num_groups_w2 = intermediate_size_per_partition // self.group_size
+
+        # The parent updates its own copy of extra_weight_attrs with the
+        # GROUP quant method (kwargs are repacked across the super() call),
+        # so set it here as well for the zero-point params.
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value})
 
         # Zero points are packed along the output dim (dim 1 of the per-expert
         # tensors), matching the compressed-tensors pack-quantized layout.

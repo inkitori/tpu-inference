@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import jax.numpy as jnp
 import torch
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import is_forward_context_available
@@ -157,13 +158,26 @@ def vllm_moe_apply(layer: RoutedExperts,
                 "MOE_ROUTE_PADDING_TO_EXPERT0: failed to read num_valid_tokens "
                 "from attn metadata, skipping padding routing (%s)", e)
 
-    return torch_view(
-        moe_apply(
-            layer=layer,
-            x=jax_view(x),
-            gating_output=jax_view(router_logits),
-            weights=weights,
-            moe_backend=quant_method_instance.moe_backend,
-            mesh=quant_method_instance.mesh,
-            extra_backend_kwargs=extra_kwargs,
-        ))
+    output = moe_apply(
+        layer=layer,
+        x=jax_view(x),
+        gating_output=jax_view(router_logits),
+        weights=weights,
+        moe_backend=quant_method_instance.moe_backend,
+        mesh=quant_method_instance.mesh,
+        extra_backend_kwargs=extra_kwargs,
+    )
+
+    # The TPU kernels compute top-k weights from the raw router logits, which
+    # bypasses vLLM's router where routed_scaling_factor is normally folded
+    # into the top-k weights (e.g. DeepSeek/HunYuan-style MoEs). The combine
+    # step is linear in the top-k weights, so scaling the routed output is
+    # equivalent. Models using apply_routed_scale_to_output carry the factor
+    # on the runner instead and set the layer copy to 1.0, so this cannot
+    # double-apply.
+    routed_scaling_factor = getattr(layer, "routed_scaling_factor", None)
+    if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+        output = output * jnp.asarray(routed_scaling_factor,
+                                      dtype=output.dtype)
+
+    return torch_view(output)

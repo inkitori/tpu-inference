@@ -33,6 +33,7 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            PackedvLLMParameter)
 from vllm.scalar_type import scalar_types
 
+from tpu_inference.layers.common.linear import sharded_matmul
 from tpu_inference.layers.common.process_weights.linear_weights import (
     LinearWeights, process_linear_weights, shard_linear_weights,
     to_parameter_list)
@@ -282,6 +283,18 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
         x_jax = jax_view(x)
         weight = jax_view(layer.weight)
 
+        if getattr(self.linear_config, "defer_all_reduce", False):
+            # RowParallelLinear with reduce_results=False: emit per-shard
+            # partial sums; the caller reduces them later.
+            assert bias is None or layer.skip_bias_add, (
+                "bias cannot be added to unreduced partial sums")
+            return torch_view(
+                sharded_matmul(x_jax,
+                               weight,
+                               self.linear_config.weight_sharding,
+                               mesh=self.linear_config.mesh,
+                               defer_all_reduce=True))
+
         outs = jnp.einsum("bd,df->bf", x_jax, weight)
 
         if bias is not None and not layer.skip_bias_add:
@@ -296,6 +309,20 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
         assert isinstance(layer.weight, torch.nn.ParameterList)
 
         x_jax = jax_view(x)
+
+        if getattr(self.linear_config, "defer_all_reduce", False):
+            assert bias is None or layer.skip_bias_add, (
+                "bias cannot be added to unreduced partial sums")
+            outs = [
+                sharded_matmul(jax_view(x),
+                               jax_view(weight),
+                               self.linear_config.weight_sharding,
+                               mesh=self.linear_config.mesh,
+                               defer_all_reduce=True)
+                for weight in layer.weight
+            ]
+            return torch_view(jnp.concatenate(outs, axis=-1))
+
         outs = []
         for i, weight in enumerate(layer.weight):
             out = jnp.einsum("bd,df->bf", x_jax, jax_view(weight))
