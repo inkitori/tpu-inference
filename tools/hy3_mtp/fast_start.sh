@@ -175,15 +175,19 @@ serve() {
 }
 
 stop() {
-    local pat="vllm serve $MODEL_DST"
-    pgrep -f "$pat" >/dev/null || { echo "no serve process found"; return 0; }
-    pkill -f "$pat" || true
+    # Collect exact PIDs once, excluding ourselves: pkill/pgrep -f matches any
+    # command line containing the pattern, including a bash -c wrapper that
+    # embeds this very command — killing by resolved PID cannot self-match.
+    local pat="vllm serve $MODEL_DST" pids
+    pids=$(pgrep -f "$pat" | grep -vw "$$" || true)
+    [ -n "$pids" ] || { echo "no serve process found"; return 0; }
+    kill $pids 2>/dev/null || true
     for _ in $(seq 1 30); do
-        pgrep -f "$pat" >/dev/null || { echo "stopped."; return 0; }
+        pgrep -f "$pat" | grep -vwq "$$" || { echo "stopped."; return 0; }
         sleep 2
     done
     echo "still up after 60s — force-killing"
-    pkill -9 -f "$pat" || true
+    kill -9 $pids 2>/dev/null || true
     sleep 2
     echo "stopped."
 }
