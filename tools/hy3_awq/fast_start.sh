@@ -192,12 +192,18 @@ serve() {
     # "cannot import name 'SamplingParams'". The script's own dir is safe.
     cd "$(dirname "$(readlink -f "$0")")"
 
+    # Reasoning parser: splits Hy3's <think:opensource> trace into the OpenAI
+    # reasoning field (required for OpenRouter reasoning validation). Thinking
+    # itself is gated per-request by reasoning_effort (template default:
+    # no_think). The plugin lives next to this script; we already cd'd here.
     exec vllm serve "$MODEL_DST" \
       --served-model-name "${SERVED_MODEL_NAME:-tencent/Hy3}" \
       --tensor-parallel-size 8 --max-model-len 32768 --max-num-seqs 8 \
       --max-num-batched-tokens 8192 --gpu-memory-utilization 0.95 \
       --block-size 256 --kv-cache-dtype fp8 \
       --trust-remote-code --enable-expert-parallel --async-scheduling \
+      --reasoning-parser hy3 \
+      --reasoning-parser-plugin "$(pwd)/hy3_reasoning_parser.py" \
       "$@"
 }
 
