@@ -687,16 +687,40 @@ def fused_moe_func(
     def _process_tokens_locally(hidden_states_local, topk_indices_local):
         num_tokens_local = hidden_states_local.shape[0]
         topk_indices_flat = topk_indices_local.flatten()
-        topk_argsort_indices = jnp.argsort(topk_indices_flat)
+        num_pairs = topk_indices_flat.shape[0]
         token_indices = jnp.arange(num_tokens_local,
                                    dtype=jnp.int32).repeat(topk)
-        token_indices_sorted = token_indices[topk_argsort_indices]
         # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
         # length=global_num_experts) but is more performant.
-        group_sizes_local = jax.nn.one_hot(topk_indices_flat,
-                                           global_num_experts,
-                                           dtype=jnp.int32).sum(axis=0)
-        topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
+        expert_onehot = jax.nn.one_hot(topk_indices_flat,
+                                       global_num_experts,
+                                       dtype=jnp.float32)
+        group_sizes_local = expert_onehot.sum(axis=0).astype(jnp.int32)
+
+        use_onehot_permute = (use_ep and onehot_moe_permute_threshold > 0
+                              and num_pairs <= onehot_moe_permute_threshold)
+        if use_onehot_permute:
+            # Sort-free ranks. jnp.argsort is stable, so sorting pairs by
+            # expert orders them by (expert, pair index):
+            #   rank(i) = #pairs routed to a smaller expert
+            #           + #earlier pairs routed to the same expert.
+            # Both terms come from small matmuls on the one-hot matrix,
+            # which beats running two argsorts per layer at decode sizes.
+            # Counts are integers well below 2^24, so f32 matmuls are exact.
+            earlier = jnp.tril(
+                jnp.ones((num_pairs, num_pairs), dtype=jnp.float32), k=-1)
+            same_expert_earlier = ((earlier @ expert_onehot) *
+                                   expert_onehot).sum(axis=-1)
+            expert_offsets = (jnp.cumulative_sum(group_sizes_local) -
+                              group_sizes_local).astype(jnp.float32)
+            rank = same_expert_earlier + (expert_onehot *
+                                          expert_offsets[None, :]).sum(axis=-1)
+            topk_argsort_revert_indices = rank.astype(jnp.int32)
+            token_indices_sorted = None
+        else:
+            topk_argsort_indices = jnp.argsort(topk_indices_flat)
+            token_indices_sorted = token_indices[topk_argsort_indices]
+            topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
 
         if use_ep:
             num_ep_shard = get_mesh_shape_product(mesh,
@@ -710,13 +734,18 @@ def fused_moe_func(
                                                include_initial=True)
             shard_output_start = group_offsets[experts_start]
             shard_output_end = group_offsets[experts_end]
-            num_tokens = token_indices_sorted.shape[0]
-            if num_tokens <= onehot_moe_permute_threshold:
-                # Use one-hot matmul for permutation, which can be faster
-                # for small batch size
-                onehot = jax.nn.one_hot(token_indices_sorted,
-                                        hidden_states_local.shape[0],
-                                        dtype=hidden_states_local.dtype)
+            if use_onehot_permute:
+                # Use one-hot matmuls for permutation, which can be faster
+                # for small batch size. onehot[r, t] = 1 iff sorted row r is
+                # a copy of token t, built from rank without materializing
+                # token_indices_sorted.
+                scatter = jax.nn.one_hot(topk_argsort_revert_indices,
+                                         num_pairs,
+                                         dtype=hidden_states_local.dtype)
+                gather_t = jax.nn.one_hot(token_indices,
+                                          num_tokens_local,
+                                          dtype=hidden_states_local.dtype)
+                onehot = scatter.T @ gather_t
                 x = onehot @ hidden_states_local
             else:
                 x = ragged_gather(
