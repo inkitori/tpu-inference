@@ -271,6 +271,19 @@ def moe_gmm_local(x: jax.Array,
     else:
         mask = jnp.full((batch_size, ), True).reshape(-1, topk, 1)
 
+    if is_onehot:
+        # gmm is called with zero_initialize=False, so rows belonging to other
+        # shards' experts hold uninitialized memory (possibly NaN/Inf). The
+        # ragged_gather_reduce path never reads them, but the one-hot combine
+        # matmul touches every row and 0 * NaN = NaN, so zero them first.
+        rows_valid = valid_rows_mask(
+            batch_size,
+            group_sizes,
+            group_offset,
+            group_offset + local_group_size,
+        )
+        gmm2_res = jnp.where(rows_valid[:, None], gmm2_res, 0)
+
     out_list = []
 
     # Pipelining Loop
