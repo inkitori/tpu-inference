@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
     VERIFY_WEIGHTS: bool = False
+    RPA_DECODE_BKV_SIZE: int = 0
 
 
 def env_with_choices(
@@ -470,6 +471,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum max num of batched tokens.
     "MIN_TOKEN_BUCKET":
     lambda: int(os.getenv("MIN_TOKEN_BUCKET") or "16"),
+    # Override the decode-case KV block size (in tokens) of the RPA v3
+    # kernel. The default heuristic uses one DMA-bandwidth-optimal block
+    # (up to max_model_len), but masked flash-attention compute scales with
+    # the block size, which is wasteful when typical contexts are much
+    # shorter than max_model_len. 0 means use the kernel's default.
+    "RPA_DECODE_BKV_SIZE":
+    lambda: int(os.getenv("RPA_DECODE_BKV_SIZE") or "0"),
     # Route padding tokens to expert 0 instead of picking other experts, to
     # avoid activating unneeded experts and speed up the GMM kernel by not
     # loading unnecessary weights. Only applies when DP attention size is 1
