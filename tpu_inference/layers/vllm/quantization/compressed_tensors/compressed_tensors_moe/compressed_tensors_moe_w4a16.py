@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -37,6 +39,82 @@ from tpu_inference.logger import init_logger
 from tpu_inference.utils import t2j, to_jax_dtype
 
 logger = init_logger(__name__)
+
+
+def _host_put_sharded(t: torch.Tensor, sharding: NamedSharding) -> jax.Array:
+    """Host torch tensor -> jax array placed directly with ``sharding``.
+
+    t2j() lands the full tensor on a single device, so the ~150GB of packed
+    expert weights serialize through one chip's PCIe lane before
+    shard_moe_weights_to_tpu spreads them out. Putting the host array with
+    its target sharding up front slices on host and transfers every chip's
+    shard in parallel instead.
+
+    bf16 rides a bitcast trick (numpy has no bfloat16): view as uint16 on
+    host, reinterpret after the put — .view() is a local reinterpret, so
+    the sharding is preserved.
+    """
+    t = t.detach().cpu()
+    if t.dtype == torch.bfloat16:
+        if t.is_contiguous() and t.dim():
+            raw = t.view(torch.uint16).numpy()
+            return jax.device_put(raw, sharding).view(jnp.bfloat16)
+        return jax.device_put(t2j(t, use_dlpack=False), sharding)
+    return jax.device_put(t.numpy(), sharding)
+
+
+@functools.lru_cache(maxsize=None)
+def _unpack_process_fn(moe_backend, mesh, activation: str, group_size: int,
+                       desired_quant_dtype, requant_block_size: int):
+    """Shared jitted unpack/dequant/requant transform, one trace per config.
+
+    A per-layer inner ``@jax.jit`` would re-trace, re-lower and re-read the
+    persistent cache once per MoE layer (~80x) at load time.
+    """
+
+    @jax.jit
+    def unpack_and_process(
+        weights: FusedMoEWeights,
+        w13_zp_packed: jax.Array,
+        w2_zp_packed: jax.Array,
+    ) -> FusedMoEWeights:
+        # Both the weights and the zero points come out of u32_unpack_i4
+        # shifted by -8, so the offsets cancel in the subtraction and
+        # (w - zp) is exact in int8.
+        w13_unpacked = u32_unpack_i4(weights.w13_weight).astype(jnp.int8)
+        w2_unpacked = u32_unpack_i4(weights.w2_weight).astype(jnp.int8)
+        # Zero points: [E, out // pack_factor, num_groups], packed along
+        # the output dim -> [E, out, num_groups] after unpacking.
+        w13_zp = u32_unpack_i4(w13_zp_packed, axis=1).astype(jnp.int8)
+        w2_zp = u32_unpack_i4(w2_zp_packed, axis=1).astype(jnp.int8)
+
+        def subtract_group_zp(w: jax.Array, zp: jax.Array) -> jax.Array:
+            num_experts, out_size, in_size = w.shape
+            num_groups = zp.shape[-1]
+            w = w.reshape(num_experts, out_size, num_groups, -1)
+            w = w - zp[:, :, :, None]
+            return w.reshape(num_experts, out_size, in_size)
+
+        weights_unpacked = FusedMoEWeights(
+            w13_weight=subtract_group_zp(w13_unpacked, w13_zp),
+            w13_weight_scale=weights.w13_weight_scale,
+            w13_bias=weights.w13_bias,
+            w2_weight=subtract_group_zp(w2_unpacked, w2_zp),
+            w2_weight_scale=weights.w2_weight_scale,
+            w2_bias=weights.w2_bias,
+        )
+
+        return process_quantized_moe_weights(
+            weights=weights_unpacked,
+            moe_backend=moe_backend,
+            mesh=mesh,
+            activation=activation,
+            weight_block_size=(1, group_size),
+            desired_quant_dtype=desired_quant_dtype,
+            requant_block_size=requant_block_size,
+        )
+
+    return unpack_and_process
 
 
 class VllmCompressedTensorsW4A16MoEMethod(VllmCompressedTensorsW4A8MoEMethod):
@@ -117,19 +195,35 @@ class VllmCompressedTensorsW4A16MoEMethod(VllmCompressedTensorsW4A8MoEMethod):
 
         # Transfer packed weights directly to TPU, sharded by expert, so the
         # unpack/dequant/requant below runs in parallel across chips without
-        # materializing full-size tensors on a single device.
-        w13_weight_packed = t2j(layer.w13_weight_packed.view(torch.int32))
-        w13_weight_scale = t2j(layer.w13_weight_scale, use_dlpack=False)
+        # materializing full-size tensors on a single device. Put the host
+        # arrays with their target sharding up front (8 parallel PCIe
+        # streams); t2j would land everything on device 0 first and the
+        # ~150GB of packed experts would serialize through one lane.
+        shard_axis = _get_expert_shard_axis(self.mesh)
+        ep_sharding = NamedSharding(self.mesh, PartitionSpec(shard_axis))
+        axis_names = ((shard_axis, ) if isinstance(shard_axis, str) else
+                      tuple(shard_axis))
+        num_expert_shards = 1
+        for axis in axis_names:
+            num_expert_shards *= self.mesh.shape[axis]
+        num_experts = layer.w13_weight_packed.shape[0]
+        if num_experts % num_expert_shards == 0:
+            _put = functools.partial(_host_put_sharded, sharding=ep_sharding)
+        else:
+            _put = functools.partial(t2j, use_dlpack=False)
 
-        w2_weight_packed = t2j(layer.w2_weight_packed.view(torch.int32))
-        w2_weight_scale = t2j(layer.w2_weight_scale, use_dlpack=False)
+        w13_weight_packed = _put(layer.w13_weight_packed.view(torch.int32))
+        w13_weight_scale = _put(layer.w13_weight_scale)
 
-        w13_zp_packed = t2j(layer.w13_weight_zero_point.view(torch.int32))
-        w2_zp_packed = t2j(layer.w2_weight_zero_point.view(torch.int32))
+        w2_weight_packed = _put(layer.w2_weight_packed.view(torch.int32))
+        w2_weight_scale = _put(layer.w2_weight_scale)
+
+        w13_zp_packed = _put(layer.w13_weight_zero_point.view(torch.int32))
+        w2_zp_packed = _put(layer.w2_weight_zero_point.view(torch.int32))
 
         if self.moe.has_bias:
-            w13_bias = t2j(layer.w13_bias, use_dlpack=False)
-            w2_bias = t2j(layer.w2_bias, use_dlpack=False)
+            w13_bias = _put(layer.w13_bias)
+            w2_bias = _put(layer.w2_bias)
         else:
             w13_bias = w2_bias = None
 
@@ -164,58 +258,15 @@ class VllmCompressedTensorsW4A16MoEMethod(VllmCompressedTensorsW4A8MoEMethod):
 
         activation_str = "swigluoai" if layer.activation == MoEActivation.SWIGLUOAI else ""
 
-        @jax.jit(static_argnames=("desired_quant_dtype",
-                                  "requant_block_size"))
-        def unpack_and_process(
-            weights: FusedMoEWeights,
-            w13_zp_packed: jax.Array,
-            w2_zp_packed: jax.Array,
-            desired_quant_dtype: jnp.dtype,
-            requant_block_size: int,
-        ) -> FusedMoEWeights:
-            # Both the weights and the zero points come out of u32_unpack_i4
-            # shifted by -8, so the offsets cancel in the subtraction and
-            # (w - zp) is exact in int8.
-            w13_unpacked = u32_unpack_i4(weights.w13_weight).astype(jnp.int8)
-            w2_unpacked = u32_unpack_i4(weights.w2_weight).astype(jnp.int8)
-            # Zero points: [E, out // pack_factor, num_groups], packed along
-            # the output dim -> [E, out, num_groups] after unpacking.
-            w13_zp = u32_unpack_i4(w13_zp_packed, axis=1).astype(jnp.int8)
-            w2_zp = u32_unpack_i4(w2_zp_packed, axis=1).astype(jnp.int8)
-
-            def subtract_group_zp(w: jax.Array, zp: jax.Array) -> jax.Array:
-                num_experts, out_size, in_size = w.shape
-                num_groups = zp.shape[-1]
-                w = w.reshape(num_experts, out_size, num_groups, -1)
-                w = w - zp[:, :, :, None]
-                return w.reshape(num_experts, out_size, in_size)
-
-            weights_unpacked = FusedMoEWeights(
-                w13_weight=subtract_group_zp(w13_unpacked, w13_zp),
-                w13_weight_scale=weights.w13_weight_scale,
-                w13_bias=weights.w13_bias,
-                w2_weight=subtract_group_zp(w2_unpacked, w2_zp),
-                w2_weight_scale=weights.w2_weight_scale,
-                w2_bias=weights.w2_bias,
-            )
-
-            return process_quantized_moe_weights(
-                weights=weights_unpacked,
-                moe_backend=self.moe_backend,
-                mesh=self.mesh,
-                activation=activation_str,
-                weight_block_size=(1, self.group_size),
-                desired_quant_dtype=desired_quant_dtype,
-                requant_block_size=requant_block_size,
-            )
-
-        weights = unpack_and_process(
-            weights,
-            w13_zp_packed,
-            w2_zp_packed,
+        unpack_and_process = _unpack_process_fn(
+            self.moe_backend,
+            self.mesh,
+            activation_str,
+            self.group_size,
             desired_quant_dtype,
             requant_block_size,
         )
+        weights = unpack_and_process(weights, w13_zp_packed, w2_zp_packed)
 
         weights = torch_view(weights)
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Callable, Optional
 
 import jax
@@ -44,6 +45,55 @@ from tpu_inference.layers.vllm.quantization.configs import \
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _dequantize_wna16_fn(fuse_matmuls: bool, output_sizes: tuple[int, ...],
+                         n_shards: int):
+    """Shared jitted dequant transform, one trace per config.
+
+    A per-layer inner ``@jax.jit`` would re-trace, re-lower and re-read the
+    persistent cache once per linear layer (~O(100)x) at load time.
+    """
+    output_sizes_list = list(output_sizes)
+
+    @jax.jit
+    def dequantize_wna16_linear_weights(
+        uint_weight: jax.Array,
+        weight_scale: jax.Array,
+        uint_zero_point: jax.Array | None,
+        bias: jax.Array | None,
+    ) -> LinearWeights:
+        out_size, in_size = uint_weight.shape
+        num_groups = weight_scale.shape[-1]
+
+        # dequant = (w_u - zp_u) * scale, with w_u/zp_u in [0, 15].
+        # For symmetric checkpoints the implicit zero point is 8.
+        weight = uint_weight.reshape(out_size, num_groups, -1)
+        if uint_zero_point is None:
+            weight = weight - 8
+        else:
+            weight = weight - uint_zero_point[:, :, None]
+        weight = weight.astype(weight_scale.dtype)
+        weight = weight * weight_scale[:, :, None]
+        weight = weight.reshape(out_size, in_size)
+
+        # [out, in] -> [in, out], as expected by the matmul below.
+        weight = jnp.transpose(weight)
+
+        return process_linear_weights(
+            LinearWeights(
+                weight=weight,
+                weight_scale=None,
+                zero_point=None,
+                bias=bias,
+            ),
+            fused=fuse_matmuls,
+            output_sizes=output_sizes_list,
+            reorder_size=n_shards,
+        )
+
+    return dequantize_wna16_linear_weights
 
 
 class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
@@ -215,44 +265,12 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
         else:
             bias = None
 
-        @jax.jit
-        def dequantize_wna16_linear_weights(
-            uint_weight: jax.Array,
-            weight_scale: jax.Array,
-            uint_zero_point: jax.Array | None,
-            bias: jax.Array | None,
-        ) -> LinearWeights:
-            out_size, in_size = uint_weight.shape
-            num_groups = weight_scale.shape[-1]
-
-            # dequant = (w_u - zp_u) * scale, with w_u/zp_u in [0, 15].
-            # For symmetric checkpoints the implicit zero point is 8.
-            weight = uint_weight.reshape(out_size, num_groups, -1)
-            if uint_zero_point is None:
-                weight = weight - 8
-            else:
-                weight = weight - uint_zero_point[:, :, None]
-            weight = weight.astype(weight_scale.dtype)
-            weight = weight * weight_scale[:, :, None]
-            weight = weight.reshape(out_size, in_size)
-
-            # [out, in] -> [in, out], as expected by the matmul below.
-            weight = jnp.transpose(weight)
-
-            return process_linear_weights(
-                LinearWeights(
-                    weight=weight,
-                    weight_scale=None,
-                    zero_point=None,
-                    bias=bias,
-                ),
-                fused=self.linear_config.fuse_matmuls,
-                output_sizes=self.linear_config.output_sizes,
-                reorder_size=self.linear_config.n_shards,
-            )
-
-        weights = dequantize_wna16_linear_weights(uint_weight, weight_scale,
-                                                  uint_zero_point, bias)
+        dequantize = _dequantize_wna16_fn(
+            self.linear_config.fuse_matmuls,
+            tuple(self.linear_config.output_sizes),
+            self.linear_config.n_shards,
+        )
+        weights = dequantize(uint_weight, weight_scale, uint_zero_point, bias)
         weights = torch_view(
             shard_linear_weights(
                 weights,
