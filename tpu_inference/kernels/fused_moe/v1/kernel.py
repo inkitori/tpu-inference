@@ -1545,7 +1545,10 @@ def fused_ep_moe(
                 pltpu.VMEM((top_k, bt, t_packing, hidden_size // t_packing),
                            t_dtype),
                 # b_gating_x2_vmem
-                pltpu.VMEM((2, bt, padded_num_experts), t_dtype),
+                # Use the gating tensor's own dtype: routers that score in
+                # fp32 (e.g. HY3) would otherwise fail Mosaic DMA
+                # verification (f32 HBM source into a bf16 VMEM target).
+                pltpu.VMEM((2, bt, padded_num_experts), gating_output.dtype),
                 # b_output_x2_vmem
                 pltpu.VMEM((2, bt, hidden_size), t_dtype),
                 # b_w1_x2_vmem
