@@ -172,14 +172,15 @@ serve() {
     export VLLM_XLA_CHECK_RECOMPILATION="$check"
     export NUM_PRECOMPILE_WORKERS="${NUM_PRECOMPILE_WORKERS:-4}"
 
-    # Decode-tuned stack for this checkpoint (see branch bench history:
-    # 41.8 -> 76.7 tok/s/user at 32k/conc-8):
-    #   * requant block 256: gmm_v2 dequantizes after the matmul (scale on
-    #     the accumulator) instead of elementwise-dequantizing every weight
-    #     tile; also the fused-kernel alignment requirement.
+    # Decode-tuned stack for this checkpoint:
     #   * one-hot permute + padding-to-expert0 + 8-token buckets: decode
     #     MoE runs matmul-only routing with no padding rows.
-    export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-256}"
+    #   * MOE_REQUANTIZE_BLOCK_SIZE is deliberately NOT set: the default
+    #     keeps the checkpoint's group-32 granularity. Setting 256 puts
+    #     gmm_v2 on its dequant-after-matmul fast path (~+10 tok/s/user at
+    #     32k/conc-8) but coarsens the expert requant 8x, measured at
+    #     -6.0pp GSM8K (96.6% -> 90.6%, n=500 paired, p=9e-6, 2026-07-15).
+    #     Do not enable without re-running that eval.
     export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-128}"
     export MOE_ROUTE_PADDING_TO_EXPERT0="${MOE_ROUTE_PADDING_TO_EXPERT0:-1}"
     export MIN_TOKEN_BUCKET="${MIN_TOKEN_BUCKET:-8}"
