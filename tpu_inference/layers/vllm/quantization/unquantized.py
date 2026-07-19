@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, UnquantizedEmbeddingMethod, VocabParallelEmbedding)
 
+from tpu_inference import envs
 from tpu_inference.layers.common.moe import MoEBackend
 from tpu_inference.layers.common.process_weights.linear_weights import (
     LinearWeights, process_linear_weights, shard_linear_weights,
@@ -61,6 +62,20 @@ from tpu_inference.utils import to_jax_dtype
 P = PartitionSpec
 
 logger = init_logger(__name__)
+
+
+def _release_cpu_storage(tensor: torch.Tensor) -> None:
+    """Best-effort eager free of a weight's CPU storage.
+
+    After the sharded-put fast path exports the storage to numpy, torch marks
+    it non-resizable (the transfer may still be reading the host buffer, so
+    freeing it early would corrupt the copy); the memory is instead released
+    when the last reference drops after `delattr`.
+    """
+    try:
+        tensor.untyped_storage().resize_(0)
+    except RuntimeError:
+        pass
 
 
 def _load_weight_for_layer(
@@ -100,6 +115,29 @@ def _load_weight_for_layer(
             tensor = new_param
 
     if not vllm_envs.VLLM_TPU_USING_PATHWAYS:
+        if envs.TPU_SHARDED_WEIGHT_PUT and tensor.dim(
+        ) and tensor.device.type == "cpu":
+            # Put the raw host tensor on the mesh with its loading sharding:
+            # each chip pulls only its own slice, so the transfer runs over
+            # all PCIe lanes in parallel instead of funneling the full tensor
+            # through the JAX CPU device (t2j additionally round-trips
+            # bfloat16 through float32 since numpy has no bfloat16 — that is
+            # ~3x full-tensor memory traffic before the device even sees it).
+            # numpy views/bitcasts below are zero-copy; .view(bfloat16) after
+            # the put is a local reinterpret, so sharding is preserved and
+            # the resulting bits are identical to the t2j path.
+            try:
+                t = tensor.detach()
+                if not t.is_contiguous():
+                    t = t.contiguous()
+                if t.dtype == torch.bfloat16:
+                    raw = t.view(torch.uint16).numpy()
+                    return jax.device_put(raw, sharding).view(jnp.bfloat16)
+                return jax.device_put(t.numpy(), sharding)
+            except (TypeError, ValueError) as e:
+                logger.warning_once(
+                    "Sharded weight put failed for %s (%s); falling back to "
+                    "t2j.", param_name, e)
         return t2j(tensor, use_dlpack=False)
 
     if is_pathways_dummy_load():
@@ -264,7 +302,7 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
         weight = jnp.transpose(weight)
 
         # Free CPU memory immediately
-        layer.weight.untyped_storage().resize_(0)
+        _release_cpu_storage(layer.weight)
         delattr(layer, 'weight')
         if layer.bias is not None and not layer.skip_bias_add:
             if layer.return_bias:
@@ -272,7 +310,7 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
             bias_sharding = NamedSharding(self.linear_config.mesh,
                                           self.linear_config.bias_sharding)
             bias = _load_weight_for_layer(layer, "bias", bias_sharding)
-            layer.bias.untyped_storage().resize_(0)
+            _release_cpu_storage(layer.bias)
             delattr(layer, 'bias')
         else:
             bias = None
@@ -400,16 +438,16 @@ class VllmUnquantizedFusedMoEMethod(
         w13_weight = _load_weight_for_layer(layer, "w13_weight", ep_sharding)
         w2_weight = _load_weight_for_layer(layer, "w2_weight", ep_sharding)
         # Free CPU memory immediately
-        layer.w13_weight.untyped_storage().resize_(0)
-        layer.w2_weight.untyped_storage().resize_(0)
+        _release_cpu_storage(layer.w13_weight)
+        _release_cpu_storage(layer.w2_weight)
         delattr(layer, 'w13_weight')
         delattr(layer, 'w2_weight')
 
         if self.moe.has_bias:
             w13_bias = _load_weight_for_layer(layer, "w13_bias", ep_sharding)
             w2_bias = _load_weight_for_layer(layer, "w2_bias", ep_sharding)
-            layer.w13_bias.untyped_storage().resize_(0)
-            layer.w2_bias.untyped_storage().resize_(0)
+            _release_cpu_storage(layer.w13_bias)
+            _release_cpu_storage(layer.w2_bias)
             delattr(layer, 'w13_bias')
             delattr(layer, 'w2_bias')
         else:

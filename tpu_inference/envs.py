@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     LORA_MODULE_PATH: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
     SLICE_ROPE_CACHE: bool = False
+    TPU_SHARDED_WEIGHT_PUT: bool = True
     MIN_TOKEN_BUCKET: int = 16
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
 
@@ -413,6 +414,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # positions can exceed max_model_len.
     "SLICE_ROPE_CACHE":
     env_bool("SLICE_ROPE_CACHE", default=False),
+    # Load-time weight transfer: device_put raw host tensors directly with
+    # their target (loading) sharding so every chip pulls its own slice in
+    # parallel, instead of t2j landing the full tensor on the JAX CPU device
+    # (with a float32 round-trip for bfloat16) and resharding afterwards.
+    # Pure data movement — bit-identical weights; set to 0 to restore the
+    # legacy t2j path.
+    "TPU_SHARDED_WEIGHT_PUT":
+    env_bool("TPU_SHARDED_WEIGHT_PUT", default=True),
     "MLA_TRANSPOSE_KV_CACHE":
     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
     # Minimum max num of batched tokens.
