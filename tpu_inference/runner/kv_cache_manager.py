@@ -380,11 +380,20 @@ class KVCacheManager:
         # defensive against an empty mesh shape that produces 0.
         divisor = max(divisor, 1)
 
-        # Mamba slot budget: one per persistent-batch slot plus the null
-        # block, rounded up to the sharding divisor. `runner.max_num_reqs`
-        # already includes the DP multiplier
+        # Mamba slot budget: one slot *group* per persistent-batch slot plus
+        # the null block, rounded up to the sharding divisor.
+        # `runner.max_num_reqs` already includes the DP multiplier
         # (= `dp_size × scheduler_config.max_num_seqs`).
-        mamba_num_blocks = self.runner.max_num_reqs + 1
+        # With speculative decoding each request owns `num_spec + 1`
+        # consecutive slots so the GDN kernel can checkpoint the state after
+        # every speculative window position (see
+        # `InputBatch.mamba_state_indices_cpu` for the rollback scheme).
+        num_spec = 0
+        if self.runner.vllm_config.speculative_config is not None:
+            num_spec = (self.runner.vllm_config.speculative_config.
+                        num_speculative_tokens)
+        mamba_slot_stride = num_spec + 1
+        mamba_num_blocks = self.runner.max_num_reqs * mamba_slot_stride + 1
         mamba_num_blocks = (
             (mamba_num_blocks + divisor - 1) // divisor) * divisor
 
@@ -443,7 +452,7 @@ class KVCacheManager:
         # TODO(xiang): this hack tricks engine core to init successfully
 
         # NOTE(weiyu0824): Pass raw block_size (size before any parallelization).
-        # vLLM applies dcp_size scaling internally; pre-multiplying block size causes a dcp_size miscalculation.
+        # vLLM applies dcp_size and pcp_size scaling internally; pre-multiplying block size causes a dcp_size * pcp_size miscalculation.
         block_size = self.runner.cache_config.block_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
@@ -679,9 +688,9 @@ class KVCacheManager:
         # kv_cache_spec.block_size is the raw block size.
         # The block table must use the physical size: one page covers block_size * dcp_size
         # tokens globally.
-        # Read dcp_size from the mesh (CONTEXT axis) to stay consistent with get_kv_cache_shape_with_mesh.
+        # Read dcp_size and pcp_size from the mesh (KV_CONTEXT axis) to stay consistent with get_kv_cache_shape_with_mesh.
         context_cnt = utils.get_mesh_shape_product(self.runner.mesh,
-                                                   ShardingAxisName.CONTEXT)
+                                                   ShardingAxisName.KV_CONTEXT)
         block_sizes = [
             kv_cache_group.kv_cache_spec.block_size * context_cnt
             for kv_cache_group in kv_cache_config.kv_cache_groups

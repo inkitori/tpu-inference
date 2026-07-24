@@ -31,6 +31,9 @@ class TestTPUJaxRunnerDPInputsLightweight:
 
         # Basic DP configuration
         self.runner.dp_size = 2
+        # PCP is off in these DP tests; without this the MagicMock auto-attr
+        # fails the `prefill_cp_size > 1` comparison in _prepare_inputs.
+        self.runner.vllm_config.sharding_config.prefill_cp_size = 1
         self.runner.max_num_tokens = 64
         self.runner.max_num_reqs = 8
         self.runner.max_num_blocks_per_req = 8
@@ -183,7 +186,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
 
         result = self.runner._prepare_inputs(scheduler_output)
 
-        assert len(result) == 11
+        assert len(result) == 12
 
     @patch('jax.device_put', side_effect=lambda x, y: x)
     @patch('tpu_inference.runner.tpu_runner.NamedSharding')
@@ -210,11 +213,11 @@ class TestTPUJaxRunnerDPInputsLightweight:
         result = self.runner._prepare_inputs(scheduler_output)
 
         # Basic assertions
-        assert len(result) == 11
+        assert len(result) == 12
         (input_ids, positions, attention_metadata, sampling_metadata,
          logits_indices, spec_decode_metadata, logits_indices_selector,
          padded_num_reqs, req_ids_dp, padded_num_scheduled_tokens_per_dp_rank,
-         tokens_indices_selector) = result
+         tokens_indices_selector, shared_attn_metadata) = result
 
         # Verify utility functions were called
         mock_runner_utils.get_padded_token_len.assert_called()
@@ -275,11 +278,11 @@ class TestTPUJaxRunnerDPInputsLightweight:
         result = self.runner._prepare_inputs(scheduler_output)
 
         # Basic assertions
-        assert len(result) == 11
+        assert len(result) == 12
         (input_ids, positions, attention_metadata, sampling_metadata,
          logits_indices, spec_decode_metadata, logits_indices_selector,
          padded_num_reqs, req_ids_dp, padded_num_scheduled_tokens_per_dp_rank,
-         tokens_indices_selector) = result
+         tokens_indices_selector, shared_attn_metadata) = result
 
         # Verify utility functions were called
         mock_runner_utils.get_padded_token_len.assert_called()
@@ -600,7 +603,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         (input_ids, positions, attention_metadata, sampling_metadata,
          logits_indices, spec_decode_metadata, logits_indices_selector,
          padded_num_reqs, req_ids_dp, padded_num_scheduled_tokens_per_dp_rank,
-         tokens_indices_selector) = result
+         tokens_indices_selector, shared_attn_metadata) = result
         # 1. Verify input_ids content
         expected_input_ids = np.zeros(16, dtype=np.int32)
         expected_input_ids[:2] = [1006, 1007]
@@ -697,7 +700,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         (input_ids, positions, attention_metadata, sampling_metadata,
          logits_indices, spec_decode_metadata, logits_indices_selector,
          padded_num_reqs, req_ids_dp, padded_num_scheduled_tokens_per_dp_rank,
-         tokens_indices_selector) = result
+         tokens_indices_selector, shared_attn_metadata) = result
 
         # 1. Verify input_ids
         expected_input_ids = np.zeros(16, dtype=np.int32)
@@ -791,7 +794,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         (input_ids, positions, attention_metadata, sampling_metadata,
          logits_indices, spec_decode_metadata, logits_indices_selector,
          padded_num_reqs, req_ids_dp, padded_num_scheduled_tokens_per_dp_rank,
-         tokens_indices_selector) = result
+         tokens_indices_selector, shared_attn_metadata) = result
 
         # Verify request_distribution
         # DP rank 0: req1 (decode), req2 (decode) -> [2, 2, 2]
@@ -854,7 +857,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         (input_ids, positions, attention_metadata, sampling_metadata,
          logits_indices, spec_decode_metadata, logits_indices_selector,
          padded_num_reqs, req_ids_dp, padded_num_scheduled_tokens_per_dp_rank,
-         tokens_indices_selector) = result
+         tokens_indices_selector, shared_attn_metadata) = result
 
         # Verify request_distribution
         # Both ranks have only decode requests
@@ -1285,6 +1288,7 @@ class TestSamplingMetadataPassthrough:
 
         runner = MagicMock()
         runner.dp_size = 2
+        runner.vllm_config.sharding_config.prefill_cp_size = 1
         runner.max_num_reqs = 8
         runner.max_num_blocks_per_req = 8
         runner.speculative_config = None
